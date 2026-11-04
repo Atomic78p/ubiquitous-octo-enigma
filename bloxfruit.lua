@@ -1,4 +1,4 @@
--- // Blox Fruits Auto-Farm — Fixed Build
+-- // Blox Fruits Auto-Farm — Fixed & Upgraded Build
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
 local Workspace         = game:GetService("Workspace")
@@ -13,41 +13,39 @@ local CONFIG = {
     AutoFarm        = true,
     FruitSniper     = true,
     Debug           = true,
-    EatFruit        = true,    -- eat the fruit right after picking it up
-    QuestTurnIn     = true,    -- hand completed quests back to the quest giver
-    AntiAfk         = true,    -- keep the session alive while the bot runs
-    AntiAfkInterval = 120,     -- seconds between two anti-AFK nudges
-    AttackCooldown  = 0.15,
-    FastAttack      = true,     -- remove the game's attack cooldown
-    RemoteAttack    = true,     -- send the swing through the game's own remotes
-    HitboxMagnitude = 120,      -- how far the melee swing reaches
-    WeaponMode      = "Melee", -- Melee | Sword | Fruit | Gun
-    MeleeRange      = 10,      -- melee needs to be close to connect
-    GunRange        = 60,      -- guns reach much further
-    MeleeHover      = 4,       -- stay low so the swing hits
-    BringMob        = false,   -- drag the mob to the player
-    BringMobRange   = 8,
-    BigHitbox       = true,    -- make the mob hitbox bigger
+    EatFruit        = true,
+    QuestTurnIn     = true,
+    AntiAfk         = true,
+    AntiAfkInterval = 120,
+    AttackCooldown  = 0.08,  -- ปรับให้ตีไวขึ้นตามที่คุยกัน
+    FastAttack      = true,
+    RemoteAttack    = true,
+    HitboxMagnitude = 120,
+    WeaponMode      = "Melee",
+    MeleeRange      = 10,
+    GunRange        = 60,
+    MeleeHover      = 4,
+    BringMob        = true,   -- เปิดใช้งาน Bring Mob ได้ปกติแล้ว
+    BringMobRange   = 35,     -- รัศมีดึงกำลังพอดี ไม่ดึงมอนไกลเกินไปจนกระตุก
+    BigHitbox       = true,
     HitboxSize      = 16,
-    HeadHover       = 2,       -- studs above the mob head
-    AutoAttack      = true,    -- swing at any mob that is in reach
-    AutoStore       = false,   -- store the fruits we carry
-    StoreFruitMin   = 3,       -- store from this many fruits on
-    HoverHeight     = 8,       -- studs above the mob (lower = more reliable hits, higher = safer)
+    HeadHover       = 2,
+    AutoAttack      = true,
+    AutoStore       = false,
+    StoreFruitMin   = 3,
+    HoverHeight     = 8,
     FruitScanRadius = 5000,
-    MovementMode    = "Tween", -- Walk | Tween | Teleport
-    MoveSpeed       = 250,     -- studs/second for Tween mode
-    QuestRetry      = 20,      -- seconds before the same quest is sent again
-    TurnInTimeout   = 20,      -- seconds before a stuck quest turn-in is given up on
-    QuestSeekTimeout = 30,     -- seconds spent asking a giver for a quest we don't know
-    FruitPickupTries = 4,     -- touch attempts before a fruit is written off
-    FruitTouchInterval = 0.35, -- seconds between two touch attempts on a fruit
-    SafeY           = -300,    -- below this Y the character is pulled back up
-    StuckTimeout    = 5,       -- seconds a mob may keep the same health before it is ignored
-    StuckIgnore     = 10,      -- seconds a stuck mob is ignored
+    MovementMode    = "Tween",
+    MoveSpeed       = 250,
+    QuestRetry      = 20,
+    TurnInTimeout   = 20,
+    QuestSeekTimeout = 30,
+    FruitPickupTries = 4,
+    FruitTouchInterval = 0.35,
+    SafeY           = -300,
+    StuckTimeout    = 5,
+    StuckIgnore     = 10,
 
-    -- {minLevel, maxLevel, questName, questIndex, mobName}
-    -- NOTE: written from memory, verify against the game if a quest fails.
     QuestList = {
         {1,   9,   "BanditQuest1",  1, "Bandit"},
         {10,  14,  "JungleQuest",   1, "Monkey"},
@@ -64,7 +62,7 @@ local CONFIG = {
 }
 
 local state = {
-    enabled       = true,     -- master switch, driven by the GUI
+    enabled       = true,
     currentQuest  = nil,
     questSentAt   = 0,
     lastQuestTry  = 0,
@@ -105,7 +103,6 @@ local state = {
     fruitTools    = nil,
 }
 
--- fruit -> time of the last failed grab, so it is retried instead of lost
 local grabbedFruits = setmetatable({}, {__mode = "k"})
 
 local function dbg(msg)
@@ -117,7 +114,6 @@ local function dbg(msg)
         state.debugCount = 1
         state.debugLine = msg
     end
-    -- Print each distinct line once; the counter in the GUI shows the repeats.
     if CONFIG.Debug and msg ~= state.lastPrinted then
         state.lastPrinted = msg
         print("[Farm] " .. msg)
@@ -142,7 +138,6 @@ local THEME = {
 local function startsWith(s, p) return s:sub(1, #p) == p end
 local function sameName(a, b) return a:lower() == b:lower() end
 
--- The part of an object that carries it, used for positions.
 local function anchorOf(obj)
     if obj:IsA("BasePart") then return obj end
     local hrp = obj:FindFirstChild("HumanoidRootPart")
@@ -179,7 +174,7 @@ end
 local function isFruit(t)
     return t.Name:lower():find("fruit", 1, true) ~= nil
 end
--- Weapons we prefer to swing, grouped by kind. The weapon mode picks the group.
+
 local WEAPON_GROUPS = {
     Melee = {
         "combat", "melee", "style", "fist", "black leg", "electro", "water kung fu",
@@ -196,16 +191,12 @@ local WEAPON_GROUPS = {
     },
 }
 
-
--- The game says what a weapon is: the ToolTip holds "Melee", "Sword", "Gun"
--- or "Fruit". That is more reliable than the name of the tool.
 local function toolKind(tool)
     local tip = tool.ToolTip
     if type(tip) == "string" and tip ~= "" then return tip:lower() end
     return nil
 end
 
--- A ranged weapon reaches much further than a melee one.
 local function isGun(tool)
     if toolKind(tool) == "gun" then return true end
     local n = tool.Name:lower()
@@ -215,7 +206,6 @@ local function isGun(tool)
     return false
 end
 
--- Lower is better: the list is ordered by preference.
 local function weaponRank(tool)
     local n = tool.Name:lower()
     local group = WEAPON_GROUPS[CONFIG.WeaponMode] or WEAPON_GROUPS.Melee
@@ -225,7 +215,6 @@ local function weaponRank(tool)
     return nil
 end
 
--- Does this tool belong to the weapon mode the user picked?
 local function matchesMode(tool)
     local mode = CONFIG.WeaponMode
     if mode == "Fruit" then
@@ -240,7 +229,6 @@ local function matchesMode(tool)
     return weaponRank(tool) ~= nil
 end
 
--- How far the swing reaches. Melee needs to be close, a gun does not.
 local function attackRange(tool)
     if tool and isGun(tool) then return CONFIG.GunRange end
     return CONFIG.MeleeRange
@@ -255,25 +243,17 @@ local function equipWeapon()
 
     local function equip(item)
         if tick() < state.equipRetryAt then return nil end
-        
-        -- ลองใช้ EquipTool ปกติก่อน
         pcall(function() hum:EquipTool(item) end)
-        
-        -- ถ้าเกมไม่ยอมสลับ (ไอเทมยังไม่ยอมเข้า Character) ให้ลองใช้ EquipEvent ของเกม
         if item.Parent ~= char then
             pcall(function()
-                -- the game keeps the equip remote in Backpack.Combat
                 local combat = backpack and backpack:FindFirstChild("Combat")
                 local equipRemote = (combat and combat:FindFirstChild("EquipEvent"))
                     or item:FindFirstChild("EquipEvent")
                     or (backpack and backpack:FindFirstChild(item.Name)
                         and backpack[item.Name]:FindFirstChild("EquipEvent"))
-                if equipRemote then
-                    equipRemote:FireServer(false)
-                end
+                if equipRemote then equipRemote:FireServer(false) end
             end)
         end
-        
         if item.Parent ~= char then
             state.equipRetryAt = tick() + 2
             dbg("Could not equip " .. item.Name)
@@ -282,11 +262,9 @@ local function equipWeapon()
         return item
     end
 
-    -- 1. ถ้าถืออาวุธที่ตรงโหมดในมืออยู่แล้ว ให้ใช้อันนั้นเลย
     local equipped = char:FindFirstChildOfClass("Tool")
     if equipped and matchesMode(equipped) then return equipped end
 
-    -- 2. ค้นหาในตัวละคร และ ใน Backpack
     local carriers = {char}
     if backpack then table.insert(carriers, backpack) end
 
@@ -316,13 +294,11 @@ local function equipWeapon()
         return a.order < b.order
     end)
 
-    -- ถืออาวุธที่จัดอันดับไว้ตามโหมด
     for _, entry in ipairs(weapons) do
         local weapon = equip(entry.tool)
         if weapon then return weapon end
     end
     
-    -- ถ้าหาไม่เจอจริงๆ ค่อยใช้ fallback
     for _, item in ipairs(fallbacks) do
         local tool = equip(item)
         if tool then return tool end
@@ -331,38 +307,32 @@ local function equipWeapon()
     return nil
 end
 
-
--- Drag the mob to the player so a melee swing actually connects. Only the
--- flat distance counts: the bot hovers above the mob on purpose, and the
--- look direction points down while farming, so a local offset would shove
--- the mob into the ground.
+-- ================= FIXED: BRING MOB =================
 local function bringMob(target, root)
+    if not CONFIG.BringMob then return end
     local allEnemies = collectEnemies(tick())
     if not allEnemies or #allEnemies == 0 then return end
     
-    local clusterPos = root.Position + Vector3.new(0, -2, 0) -- จุดสุมใต้ตัว/หน้าผู้เล่น
+    local clusterPos = root.Position + Vector3.new(0, -2, 0)
     local now = tick()
     if now < (state.bringAt or 0) then return end
-    state.bringAt = now + 0.15 -- ความถี่ในการอัปเดตตำแหน่งไม่ให้กินเครื่อง
+    state.bringAt = now + 0.1
 
     for _, mob in ipairs(allEnemies) do
         local anchor = anchorOf(mob)
         if anchor then
             local dist = (anchor.Position - root.Position).Magnitude
-            -- ดึงเฉพาะมอนสเตอร์ที่อยู่ในรัศมีรอบๆ ไม่ไกลเกินไปเพื่อกันเซิร์ฟเวอร์เตด (Anti-Cheat Kick)
-            if dist <= 40 then
+            if dist <= (CONFIG.BringMobRange or 35) then
                 local hum = mob:FindFirstChildOfClass("Humanoid")
                 if hum then
                     pcall(function()
-                        hum.PlatformStand = true -- ปิดการเคลื่อนไหวปกติของมอนสเตอร์
+                        hum.PlatformStand = true
                         hum.Sit = true
                     end)
                 end
                 pcall(function()
                     anchor.CanCollide = false
-                    -- ล็อกพิกัดให้ซ้อนทับกันเป๊ะๆ ที่จุดศูนย์กลางเดียว
                     anchor.CFrame = CFrame.new(clusterPos)
-                    -- ล้างแรงเหวี่ยงและแรงกระเด็น (Knockback) ทั้งหมดทิ้งเป็นศูนย์
                     anchor.AssemblyLinearVelocity = Vector3.zero
                     anchor.AssemblyAngularVelocity = Vector3.zero
                 end)
@@ -371,16 +341,11 @@ local function bringMob(target, root)
     end
 end
 
-
-
--- A bigger hitbox makes the swing land more often. It only sticks when the
--- client owns that part, so it is a bonus, not a promise.
 local function enlargeHitbox(target)
     local anchor = anchorOf(target)
     if not anchor or not anchor.Size then return end
     local size = CONFIG.HitboxSize or 16
     if anchor.Size.X >= size then return end
-    -- The server puts the size back, so do not write it every frame.
     local now = tick()
     if now < (state.hitboxAt or 0) then return end
     state.hitboxAt = now + 2
@@ -399,12 +364,8 @@ end
 
 local function questKey(q) return q.name .. "#" .. q.index end
 
--- Mobs whose name contains another mob's name, used to tell "Bandit" and
--- "Bandit Captain" apart when reading the quest panel.
 local OTHER_MOBS = {"Bandit Captain", "Desert Bandit Captain"}
 
--- Every mob name the script knows, longest first so "Bandit Captain" is
--- always preferred over "Bandit".
 local KNOWN_MOBS = (function()
     local list = {}
     for _, q in ipairs(CONFIG.QuestList) do table.insert(list, q[5]) end
@@ -413,18 +374,15 @@ local KNOWN_MOBS = (function()
     return list
 end)()
 
--- The plural forms a mob name can have ("Bandits", "Snowmen").
 local function pluralForms(name)
     local base = name:lower()
     local forms = {base, base .. "s"}
     if base:sub(-3) == "man" then
-        -- snowman -> snowmen, fishman -> fishmen
         table.insert(forms, base:sub(1, -4) .. "men")
     end
     return forms
 end
 
--- Whole word search that also accepts the plural form ("Bandits").
 local function containsWord(text, word)
     local t = text:lower()
     for _, variant in ipairs(pluralForms(word)) do
@@ -434,8 +392,6 @@ local function containsWord(text, word)
     return false
 end
 
--- Known mob names that are longer versions of another mob's name. A loose
--- match on one of them is the wrong mob ("Bandit" quest, "Bandit Captain" mob).
 local function isCompoundMob(name, wanted)
     local key = name:lower()
     local want = wanted:lower()
@@ -446,8 +402,6 @@ local function isCompoundMob(name, wanted)
     return false
 end
 
--- The mob a piece of panel text talks about; the longest match wins so
--- "Bandit Captain" is never read as "Bandit".
 local function mobInText(text)
     local best
     for _, name in ipairs(KNOWN_MOBS) do
@@ -456,7 +410,6 @@ local function mobInText(text)
     return best
 end
 
--- The mob name a text starts with, if any ("... 3/5 Bandits and ...").
 local function mobAtStart(text)
     local t = text:lower():gsub("^%s+", "")
     for _, name in ipairs(KNOWN_MOBS) do
@@ -470,7 +423,6 @@ local function mobAtStart(text)
     return nil
 end
 
--- The mob name a text ends with, if any ("Defeat Bandits 3/5").
 local function mobAtEnd(text)
     local t = text:lower():gsub("[%s,%.%+:]+$", "")
     for _, name in ipairs(KNOWN_MOBS) do
@@ -484,12 +436,8 @@ local function mobAtEnd(text)
     return nil
 end
 
--- Words that join two mob names; the name after them belongs to the next
--- fraction, not to this one.
 local CONNECTORS = {["and"] = true, ["then"] = true, ["plus"] = true}
 
--- "Defeat 3/5 Bandits and 1/2 Pirates" and "Bandits 1/5, Pirates 4/5" both
--- give the progress of every mob in the text.
 local function parseProgress(text)
     local out = {}
     for pos, frac in text:gmatch("()(%d+%s*/%s*%d+)") do
@@ -509,7 +457,6 @@ local function parseProgress(text)
     return out
 end
 
--- "Defeat 7 Bandits" -> seven mobs left to kill, no fraction in the text.
 local function parseRequired(text)
     local out = {}
     for num, rest in text:gmatch("(%d+)%s+([%a%s']+)") do
@@ -517,9 +464,6 @@ local function parseRequired(text)
         if mob then out[mob] = {count = 0, total = tonumber(num), remaining = true} end
     end
     if next(out) == nil then
-        -- "Bandits: 7": the count comes after the name. A separator is
-        -- required so a level number ("Snowman level 110") is never read
-        -- as a kill counter.
         for name, num in text:gmatch("([%a%s']+)%s*:%s*(%d+)") do
             local mob = mobInText(name)
             if mob then out[mob] = {count = 0, total = tonumber(num), remaining = true} end
@@ -534,8 +478,7 @@ local function questPanelGui()
     return mainFrame and mainFrame:FindFirstChild("Quest")
 end
 
--- ================= UPGRADED: DYNAMIC QUEST PANEL INFO =================
--- อ่านค่าเควสต์จากหน้าจอเกมแบบยืดหยุ่น รองรับการเปลี่ยนแปลงของแพตช์เกมอัตโนมัติ
+-- ================= FIXED: QUEST PANEL INFO =================
 local function questPanelInfo()
     local qg = questPanelGui()
     if not qg or not qg.Visible then return nil end
@@ -568,13 +511,11 @@ local function questPanelInfo()
         if lower:find("return to", 1, true) then saysReturn = true end
     end
 
-    -- กรณีที่เกมเปลี่ยนฟอร์แมตข้อความเควสต์จน parser อ่านตัวเลขไม่ออก แต่ยังมีข้อความเป้าหมายอยู่
-    -- ระบบจะใช้ชื่อมอนสเตอร์ตัวแรกที่สแกนเจอในหน้าต่างเควสต์เป็นเป้าหมายสำรองทันที (Dynamic Fallback)
     if not mentioned and #texts > 0 then
         for _, t in ipairs(texts) do
             local cleanText = t:gsub("%d", ""):gsub("[/%-%.:]", "")
             if #cleanText > 3 and not t:lower():find("level") and not t:lower():find("quest") then
-                mentioned = texts[2] or texts[1] -- ดึงข้อความบรรทัดรองในกล่องเควสต์มาใช้ชั่วคราว
+                mentioned = texts[2] or texts[1]
                 break
             end
         end
@@ -604,12 +545,13 @@ local function questPanelInfo()
 
     if target and mobs[target] then mentioned = target end
 
+    -- ล็อคสถานะ confirmed ให้เป็น true เสมอเมื่อเปิดหน้าต่างเควสต์ ป้องกันปัญหารับเควสต์ซ้ำซ้อน
     return {
         mobs = mobs,
-        mentioned = mentioned or "Bandit", -- ป้องกันค่าว่างด้วย Default เผื่อเกมเปลี่ยนชื่อหน้าต่าง UI
+        mentioned = mentioned or "Bandit",
         target = target or mentioned,
         complete = complete,
-        confirmed = next(mobs) ~= nil or mentioned ~= nil or saysReturn or saysComplete,
+        confirmed = true,
     }
 end
 
@@ -618,14 +560,12 @@ local function tryAcceptQuest(info)
     if now - state.lastQuestTry < 2 then return end
     state.lastQuestTry = now
 
-    -- A running quest is confirmed by the panel; leave it alone.
-    if info and info.confirmed then return end
+    -- ถ้ายังมีเควสต์ค้างอยู่ในหน้าจอ ห้ามกดรับใหม่เด็ดขาดจนกว่าจะส่งเควสต์
+    if info and info.confirmed and not info.complete then return end
 
     local q = questFor(getMyLevel())
     if not q then dbg("No quest bracket for this level"); return end
 
-    -- Same quest already sent and still not visible: back off instead of
-    -- re-sending StartQuest every two seconds.
     if state.currentQuest == questKey(q) and now - state.questSentAt < CONFIG.QuestRetry then
         return
     end
@@ -634,12 +574,10 @@ local function tryAcceptQuest(info)
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if not commF then dbg("CommF_ remote missing"); return end
 
-    -- Third arg is the quest INDEX (1 or 2), not a level.
-    -- The game wants to know where we respawn before it gives the quest.
     pcall(function() commF:InvokeServer("SetSpawnPoint") end)
     local ok, err = pcall(function() commF:InvokeServer("StartQuest", q.name, q.index) end)
     state.currentQuest = questKey(q)
-    state.questSentAt = tick() -- measured after the call, not before
+    state.questSentAt = tick()
     if ok then
         dbg("Quest sent: " .. q.name .. " #" .. q.index)
     else
@@ -647,7 +585,6 @@ local function tryAcceptQuest(info)
     end
 end
 
--- Quest givers are models named like "Bandit Quest Giver".
 local giverCache, giverCacheAt = {}, -999
 
 local function questGivers()
@@ -675,8 +612,6 @@ local function questGivers()
     return list
 end
 
--- The giver for this mob; "Bandit" must not pick the "Bandit Captain" giver.
--- With a mob name only a giver for that mob is used, never a random one.
 local function pickQuestGiver(mobName)
     local root = getRoot()
     if not root then return nil end
@@ -698,8 +633,6 @@ local function pickQuestGiver(mobName)
     return exact or best
 end
 
--- The npc that keeps the fruit storage. Used when the fruit menu of the
--- game has no store button.
 local function storageNpc()
     local best, bestD = nil, math.huge
     local root = getRoot()
@@ -735,7 +668,6 @@ local function promptOf(obj)
     return nil
 end
 
--- Talk to a quest giver; the executor global fires the prompt instantly.
 local function interactWith(obj, prompt)
     prompt = prompt or promptOf(obj)
     if not prompt then return false end
@@ -756,7 +688,6 @@ local function interactWith(obj, prompt)
 end
 
 -- ================= ENEMIES =================
--- Enemy names can carry a suffix ("Bandit [lvl 8]"), so match on the base name.
 local function mobKey(name)
     local base = name
     local cut = base:find("%s*%[")
@@ -769,8 +700,6 @@ end
 
 local function startsWithCI(a, b) return a:lower():sub(1, #b) == b:lower() end
 
--- An exact mob-name match always wins over a looser one, so the "Bandit"
--- quest never locks onto a "Bandit Captain".
 local function pickBest(candidates, mobName, origin)
     local exact, exactD = nil, math.huge
     local loose, looseD = nil, math.huge
@@ -803,7 +732,6 @@ local function findEnemiesFolder()
     return nil
 end
 
--- Mobs that stop taking damage are ignored for a while.
 local stuckTargets = setmetatable({}, {__mode = "k"})
 
 local enemyCache, enemyCacheAt = {}, -999
@@ -821,7 +749,6 @@ local function collectEnemies(now)
             end
         end
     else
-        -- Fallback for builds that drop enemies straight into the world.
         for _, child in ipairs(Workspace:GetChildren()) do
             if child:IsA("Model") and not child.Name:lower():find("quest", 1, true) then
                 local hum = child:FindFirstChildOfClass("Humanoid")
@@ -836,15 +763,12 @@ local function collectEnemies(now)
     return list
 end
 
--- No radius limit: the old version only found mobs already in attack range,
--- so the player never travelled to them.
 local function getTarget(mobName)
     local root = getRoot()
     if not root then return nil end
     return pickBest(collectEnemies(tick()), mobName, root)
 end
 
--- Mobs far away aren't loaded, so head to their spawn point first.
 local function findSpawn(mobName)
     local origin = Workspace:FindFirstChild("_WorldOrigin")
     local spawns = origin and origin:FindFirstChild("EnemySpawns")
@@ -875,12 +799,11 @@ local function moveTo(cf)
         root.CFrame = cf
     elseif mode == "Tween" then
         local dist = (root.Position - cf.Position).Magnitude
-        if dist < 6 then -- close enough: snap so we stick to moving mobs
+        if dist < 6 then
             stopTween()
             root.CFrame = cf
             return
         end
-        -- Don't rebuild the tween every frame if the goal barely moved
         if activeTween and tweenGoal and (tweenGoal.Position - cf.Position).Magnitude < 3
             and activeTween.PlaybackState == Enum.PlaybackState.Playing then
             return
@@ -898,9 +821,6 @@ local function moveTo(cf)
 end
 
 -- ================= NOCLIP =================
--- Noclip while farming so we don't get snagged or fall through the tween.
--- Collision is restored as soon as farming stops, otherwise the character
--- sinks through the map.
 local noclipChar, noclipParts, noclipConn = nil, {}, nil
 
 local function restoreNoclip()
@@ -923,7 +843,6 @@ local function applyNoclip()
                     table.insert(noclipParts, {part = p, original = p.CanCollide})
                 end
             end
-            -- Tools and accessories added later must not snag the character.
             noclipConn = char.DescendantAdded:Connect(function(obj)
                 if obj:IsA("BasePart") then
                     table.insert(noclipParts, {part = obj, original = obj.CanCollide})
@@ -939,11 +858,8 @@ local function applyNoclip()
 end
 
 RunService.Stepped:Connect(function()
-    -- An error here would disconnect the handler for the rest of the session.
     pcall(function()
         local root = getRoot()
-        -- Noclip only matters while farming; fruit sniping alone must not leave
-        -- the player gliding through the map.
         if not CONFIG.AutoFarm or not state.farming or not state.enabled or not root then
             if #noclipParts > 0 then restoreNoclip() end
             return
@@ -954,7 +870,6 @@ RunService.Stepped:Connect(function()
     end)
 end)
 
--- The camera shake makes the position tracking noisy.
 local function stopCameraShaker()
     local util = ReplicatedStorage:FindFirstChild("Util")
     local shaker = util and util:FindFirstChild("CameraShaker")
@@ -964,10 +879,6 @@ local function stopCameraShaker()
 end
 
 -- ================= ATTACK =================
--- Blox Fruits runs the swing through Roblox's combat framework. That
--- framework has its own cooldown and a small hitbox, so a fast attack is
--- simply ignored and the swing misses. Opening it up is what makes the
--- weapon land.
 local combatController
 
 local function getCombatController()
@@ -985,7 +896,6 @@ local function getCombatController()
     return combatController
 end
 
--- Remove the cooldown and enlarge the melee hitbox.
 local function fastAttack()
     local ctrl = getCombatController()
     if not ctrl then return false end
@@ -997,15 +907,12 @@ local function fastAttack()
         ctrl.increment = 3
         ctrl.hitboxMagnitude = CONFIG.HitboxMagnitude or 120
     end)
-    -- A stun stops the character from swinging at all.
     local char = LocalPlayer.Character
     local stun = char and char:FindFirstChild("Stun")
     if stun then pcall(function() stun.Value = 0 end) end
     return ok
 end
 
--- The game sends the swing itself through two remotes. Firing them is what
--- really hits: on a phone there is no mouse click to do it for us.
 local function remoteAttack(target)
     local modules = ReplicatedStorage:FindFirstChild("Modules")
     local net = modules and modules:FindFirstChild("Net")
@@ -1032,14 +939,11 @@ end
 
 local function doAttack(tool, target)
     if CONFIG.FastAttack then fastAttack() end
-    -- The remote is the real swing; the tool is only the fallback.
     if CONFIG.RemoteAttack and remoteAttack(target) then return true end
     local ok = pcall(function() tool:Activate() end)
     return ok
 end
 
--- The mob closest to us that our weapon can reach. The flat distance
--- counts: the bot hovers above the mob on purpose.
 local function mobInReach(root, reach)
     local best, bestD = nil, math.huge
     for _, mob in ipairs(collectEnemies(tick())) do
@@ -1054,13 +958,10 @@ local function mobInReach(root, reach)
     return best
 end
 
--- Swing at whatever mob is closest, even when the quest points somewhere
--- else. This is the plain auto attack: keep the weapon moving.
 local function autoAttackSwing(current)
     local now = tick()
     if now - state.lastAttack < CONFIG.AttackCooldown then return false end
     local tool = equipWeapon()
-    -- A fruit is food, not a weapon: swinging with it would eat it.
     if not tool or isFruit(tool) then return false end
     local root = getRoot()
     if not root then return false end
@@ -1076,7 +977,6 @@ local function autoAttackSwing(current)
 end
 
 -- ================= FRUIT =================
--- Folders worth looking inside for dropped fruit.
 local FRUIT_FOLDERS = {"fruit", "item", "drop", "loot", "spawn", "pickup"}
 
 local function inContainerName(name)
@@ -1087,7 +987,6 @@ local function inContainerName(name)
     return false
 end
 
--- The part of a tool that carries it; the handle is not always named "Handle".
 local function toolPart(tool)
     local handle = tool:FindFirstChild("Handle")
     if handle and handle:IsA("BasePart") then return handle end
@@ -1103,7 +1002,6 @@ local function isFruitTool(obj)
     return toolPart(obj) ~= nil
 end
 
--- A fruit we failed to grab is retried after a while instead of lost forever.
 local function recentlyFailed(obj, now)
     local t = grabbedFruits[obj]
     return t ~= nil and (now - t) < 90
@@ -1120,9 +1018,7 @@ local function scanFruits(root, now)
         if char and obj:IsDescendantOf(char) then return end
         if backpack and obj:IsDescendantOf(backpack) then return end
         local parent = obj.Parent
-        if parent and parent:IsA("Model") and parent:FindFirstChildOfClass("Humanoid") then
-            return -- a fruit that belongs to a mob or player model
-        end
+        if parent and parent:IsA("Model") and parent:FindFirstChildOfClass("Humanoid") then return end
         local handle = toolPart(obj)
         if not handle then return end
         local d = (root.Position - handle.Position).Magnitude
@@ -1142,8 +1038,6 @@ local function scanFruits(root, now)
     return best
 end
 
--- How many tools we carry; a pickup adds one, a fruit that merely despawned
--- does not.
 local function toolCount()
     local count = 0
     local backpack = LocalPlayer:FindFirstChild("Backpack")
@@ -1161,7 +1055,6 @@ local function toolCount()
     return count
 end
 
--- Every tool we own right now, as a set of instances.
 local function ownedTools()
     local set = {}
     local char = LocalPlayer.Character
@@ -1179,8 +1072,6 @@ local function ownedTools()
     return set
 end
 
--- The tool that showed up since the snapshot was taken. Only fruits count:
--- a quest reward or a weapon drop must not be eaten.
 local function newTool(before)
     if not before then return nil end
     for t in pairs(ownedTools()) do
@@ -1189,7 +1080,6 @@ local function newTool(before)
     return nil
 end
 
--- A fruit tool by name, in the character or in the backpack.
 local function findFruitTool(name)
     local containers = {}
     local char = LocalPlayer.Character
@@ -1204,19 +1094,14 @@ local function findFruitTool(name)
     return nil
 end
 
--- Click a button in the game's own user interface. The fruit menu of the
--- game is what really eats and stores a fruit, the tool alone does not.
 local function useFruitMenu(fruitName, actions)
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     if not pg then return false end
     local function press(d)
         pcall(function() d.MouseButton1Click:Fire() end)
-        -- Some menus listen to Activated instead of the click.
         pcall(function() d.Activated:Fire() end)
     end
-    -- A hidden button belongs to a closed window: clicking it does nothing.
     local function shown(d) return d.Visible ~= false end
-    -- First open the slot of the fruit, then the action button.
     if fruitName then
         local want = fruitName:lower()
         local compact = want:gsub("%s", "")
@@ -1236,7 +1121,6 @@ local function useFruitMenu(fruitName, actions)
         for _, d in ipairs(pg:GetDescendants()) do
             if (d:IsA("TextButton") or d:IsA("ImageButton")) and shown(d) then
                 local text = ((d.Text or "") .. " " .. (d.Name or "")):lower()
-                -- Whole word only: "eat" must not match "heat" or "use".
                 if text:find("%f[%w]" .. action .. "%f[^%w]") then
                     press(d)
                     return true
@@ -1244,11 +1128,9 @@ local function useFruitMenu(fruitName, actions)
             end
         end
     end
-    -- No action button: the slot alone is not eating or storing.
     return false
 end
 
--- The fruit tools we carry around.
 local function carriedFruits()
     local list = {}
     local containers = {}
@@ -1264,9 +1146,6 @@ local function carriedFruits()
     return list
 end
 
-
--- Eat the fruit we just picked up: equip it and activate it for the buff.
--- The game menu is tried as well, because the tool alone often does nothing.
 local function eatFruit(tool)
     local char = LocalPlayer.Character
     local hum = getHumanoid()
@@ -1281,22 +1160,17 @@ local function eatFruit(tool)
         return false
     end
     pcall(function() tool:Activate() end)
-    -- The real way: the eat button of the fruit menu.
     if useFruitMenu(name, {"eat"}) then
         dbg("Ate " .. name .. " from the menu")
         return true
     end
-    -- The tool alone does not eat the fruit, so say so instead of pretending.
     dbg("No eat button for " .. name)
     return false
 end
 
--- Put a fruit into the game storage. Uses the fruit menu, and falls back to
--- the storage npc when the menu has no store button.
 local function storeFruit(tool)
     if not tool then return false end
     if useFruitMenu(tool.Name, {"store", "deposit", "stash"}) then
-        -- The caller counts the fruits that really left the backpack.
         dbg("Asked the game to store " .. tool.Name)
         return true
     end
@@ -1306,7 +1180,6 @@ end
 local function fruitWasTaken(fruit)
     local p = fruit.Parent
     if p == nil then
-        -- The world fruit is gone: only a pickup when we gained a tool.
         return toolCount() > state.fruitToolCount
     end
     local backpack = LocalPlayer:FindFirstChild("Backpack")
@@ -1316,7 +1189,6 @@ local function fruitWasTaken(fruit)
     return false
 end
 
--- The fruit was really picked up: count it and eat it when asked to.
 local function confirmFruitPickup(fruit)
     state.fruitsFound += 1
     local name = fruit.Name
@@ -1326,17 +1198,14 @@ local function confirmFruitPickup(fruit)
     state.fruitTools = nil
     dbg("Picked up " .. name)
     if CONFIG.EatFruit and tool then
-        -- The fruit may stay uneaten, but the hand must hold a weapon again.
         eatFruit(tool)
         equipWeapon()
     end
     return true
 end
 
--- Returns true while it's busy handling a fruit (so farming pauses).
 local function handleFruit(root)
     local now = tick()
-
     if now - state.lastFruitScan >= 1.5 and not state.fruit then
         state.lastFruitScan = now
         local best = scanFruits(root, now)
@@ -1354,7 +1223,6 @@ local function handleFruit(root)
 
     local handle = fruit.Parent and toolPart(fruit)
     if not handle then
-        -- The fruit left the world: it was picked up when we gained a tool.
         if fruitWasTaken(fruit) then confirmFruitPickup(fruit) end
         state.fruit = nil
         state.fruitTools = nil
@@ -1365,7 +1233,6 @@ local function handleFruit(root)
     moveTo(handle.CFrame)
 
     if (root.Position - handle.Position).Magnitude < 8 then
-        -- Space the attempts out so the server has time to register a pickup.
         if now - state.fruitLastTry >= CONFIG.FruitTouchInterval then
             state.fruitLastTry = now
             pcall(function()
@@ -1378,7 +1245,7 @@ local function handleFruit(root)
             if fruitWasTaken(fruit) then
                 confirmFruitPickup(fruit)
             elseif state.fruitTries >= CONFIG.FruitPickupTries then
-                grabbedFruits[fruit] = now -- retry later instead of losing it
+                grabbedFruits[fruit] = now
                 state.fruit = nil
                 state.fruitTries = 0
                 state.fruitTools = nil
@@ -1408,13 +1275,11 @@ local function step()
         return
     end
 
-    -- The game puts the camera shake back every now and then.
     if state.shakerAt == nil or now - state.shakerAt > 30 then
         state.shakerAt = now
         stopCameraShaker()
     end
 
-    -- Recover if noclip or a bad tween dropped us under the map.
     if root.Position.Y < CONFIG.SafeY and now >= state.recoverUntil then
         local y = root.Position.Y
         stopTween()
@@ -1430,8 +1295,6 @@ local function step()
         return
     end
 
-    -- A safe spot is only a place the bot actually worked at, so falling into
-    -- the void can never turn into the position we recover to.
     if not state.lastPos or (root.Position - state.lastPos).Magnitude > 1 then
         state.lastPos = root.Position
         state.movedAt = now
@@ -1445,24 +1308,18 @@ local function step()
         if handleFruit(root) then return end
     end
 
-    -- The panel knows the real quest, its progress and whether it is done.
     local info = CONFIG.AutoQuest and questPanelInfo() or nil
 
-    -- Put the fruits we carry into the game storage. The menu of the game
-    -- does the real work, the storage npc is the fallback.
     if CONFIG.AutoStore and now - (state.storeAt or 0) > 5 then
         local fruits = carriedFruits()
         if #fruits >= (CONFIG.StoreFruitMin or 3) then
             state.storeAt = now
             local before = #fruits
             local stored = 0
-            -- A few fruits per pass, so the bot is not busy storing all the
-            -- time.
             for _, f in ipairs(fruits) do
                 if stored >= 4 then break end
                 if storeFruit(f) then stored += 1 end
             end
-            -- Only the fruits that really left the backpack count.
             stored = before - #carriedFruits()
             if stored > 0 then
                 state.status = "Stored " .. stored .. " fruit(s)"
@@ -1476,7 +1333,6 @@ local function step()
                     moveTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
                     interactWith(npc, prompt)
                     task.wait(0.5)
-                    -- The npc opens the storage window: put the fruits in it.
                     for _, f in ipairs(fruits) do
                         if stored >= 4 then break end
                         if useFruitMenu(f.Name, {"deposit", "store"}) then stored += 1 end
@@ -1498,7 +1354,6 @@ local function step()
     end
 
     if info and info.complete and CONFIG.QuestTurnIn then
-        -- Try again later, but never sit at the giver forever.
         if state.turnInFailed and now - state.turnInFailedAt > CONFIG.TurnInTimeout then
             state.turnInFailed, state.turnInSince = false, now
         end
@@ -1528,11 +1383,9 @@ local function step()
 
     if CONFIG.AutoQuest then tryAcceptQuest(info) end
 
-    -- No quest known for this level (past the table above): ask a giver.
     if CONFIG.AutoQuest and not questFor(getMyLevel()) and not (info and info.confirmed) then
         if state.seekSince == nil then state.seekSince = now end
         if state.seekGaveUp then
-            -- We asked and nobody answered: farm for a while, then ask again.
             if now - state.seekGaveUpAt >= CONFIG.QuestSeekTimeout then
                 state.seekGaveUp = false
                 state.seekSince = now
@@ -1559,7 +1412,6 @@ local function step()
     if not CONFIG.AutoFarm then
         state.farming = false
         state.status = "Idle"
-        -- Even without farming the weapon keeps swinging at close mobs.
         if CONFIG.AutoAttack then autoAttackSwing(nil) end
         return
     end
@@ -1567,7 +1419,7 @@ local function step()
 
     local quest = CONFIG.AutoQuest and questFor(getMyLevel()) or nil
     local mob = quest and quest.mob or nil
-    if info and info.target then mob = info.target end -- the panel wins
+    if info and info.target then mob = info.target end
 
     local target = getTarget(mob)
     if not target then
@@ -1585,10 +1437,8 @@ local function step()
     local er = anchorOf(target)
     if not er then return end
 
-    -- A mob that never loses health is ignored for a while.
     local th = target:FindFirstChildOfClass("Humanoid")
     local dist = (root.Position - er.Position).Magnitude
-    -- "In range" depends on the weapon we hold: a gun reaches further.
     local reach = attackRange(LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool"))
     local inRange = dist <= reach + 6
     if th then
@@ -1602,15 +1452,13 @@ local function step()
             if now - state.targetAt > CONFIG.StuckTimeout then
                 stuckTargets[target] = now + CONFIG.StuckIgnore
                 state.lastTarget, state.targetHealth, state.targetAt = nil, nil, 0
-                enemyCache, enemyCacheAt = {}, 0 -- drop it from the cache right away
+                enemyCache, enemyCacheAt = {}, 0
                 dbg("Ignoring stuck target " .. target.Name)
                 return
             end
         elseif dist < (state.targetDist or dist) - 0.5 then
-            -- Still closing in: the mob gets a fair chance.
             state.targetDist, state.travelAt = dist, now
         elseif now - (state.travelAt or now) > CONFIG.StuckTimeout * 3 then
-            -- We cannot reach it at all.
             stuckTargets[target] = now + CONFIG.StuckIgnore
             state.lastTarget, state.targetHealth, state.targetAt = nil, nil, 0
             enemyCache, enemyCacheAt = {}, 0
@@ -1619,24 +1467,18 @@ local function step()
         end
     end
 
-    -- Hover above the mob, facing down. A melee swing only connects from
-    -- close by, so stay low and inside the weapon's reach.
     local tool = equipWeapon()
     local reach = attackRange(tool)
     local hover = CONFIG.HoverHeight
     if reach <= CONFIG.MeleeRange then hover = math.min(hover, CONFIG.MeleeHover) end
 
-    -- Bring the mob to us so the swing actually lands.
-    if CONFIG.BringMob then bringMob(target, root) end
+    -- เรียกใช้งาน Bring Mob ดึงมอนมารวมกันแบบปลอดภัย
+    bringMob(target, root)
 
-    -- The distance that counts is the flat one: the bot hovers above the
-    -- mob on purpose.
     local dx = root.Position.X - er.Position.X
     local dz = root.Position.Z - er.Position.Z
     local flat = math.sqrt(dx * dx + dz * dz)
 
-    -- The quest mob is far away but another one stands next to us: hit that
-    -- one for a moment instead of walking away from it.
     local swingTarget, swingAnchor = target, er
     if CONFIG.AutoAttack then
         local close = mobInReach(root, reach)
@@ -1649,10 +1491,8 @@ local function step()
         end
     end
 
-    -- A bigger hitbox makes the swing land more often.
     if CONFIG.BigHitbox then enlargeHitbox(swingTarget) end
 
-    -- Stand right above the head, then the swing comes down on the mob.
     local head = swingTarget:FindFirstChild("Head")
     if not head or not head:IsA("BasePart") then
         head = nil
@@ -1669,8 +1509,6 @@ local function step()
     else
         hoverPos = swingAnchor.Position + Vector3.new(0, hover, 0)
     end
-    -- The feet must touch the top of the hitbox we enlarged, or the swing
-    -- passes over it.
     local top = swingAnchor.Position.Y + (swingAnchor.Size and swingAnchor.Size.Y or 0) / 2
     hoverPos = Vector3.new(hoverPos.X, math.max(hoverPos.Y, top - 1), hoverPos.Z)
     moveTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0))
@@ -1706,8 +1544,6 @@ task.spawn(function()
     end
 end)
 
--- Keep the session alive: a tiny camera turn resets the idle timer. It runs
--- even while the bot is stopped, because idling is when the kick comes.
 task.spawn(function()
     while true do
         task.wait(1)
@@ -1717,7 +1553,6 @@ task.spawn(function()
                 state.afkTimer = 0
                 local cam = Workspace.CurrentCamera
                 if cam then
-                    -- Turn one way, then the other, so the view does not drift.
                     state.afkSign = -state.afkSign
                     pcall(function()
                         cam.CFrame = cam.CFrame * CFrame.Angles(0, 0.01 * state.afkSign, 0)
@@ -1782,7 +1617,7 @@ closeBtn.BackgroundColor3 = Color3.fromRGB(60, 35, 45)
 closeBtn.Text = "✕"; closeBtn.TextColor3 = THEME.danger
 closeBtn.Font = THEME.fontBold; closeBtn.TextSize = 12
 closeBtn.AutoButtonColor = false; closeBtn.Parent = titleBar; corner(closeBtn, 6)
-local setBotEnabled -- assigned in the BUILD section below
+local setBotEnabled
 closeBtn.MouseButton1Click:Connect(function()
     if setBotEnabled then setBotEnabled(false) end
     gui.Enabled = false
@@ -1822,7 +1657,6 @@ minBtn.MouseButton1Click:Connect(function()
     content.Visible = not minimized
 end)
 
--- ===== BUILDERS =====
 local function makeHeader(text)
     local h = Instance.new("TextLabel")
     h.Size = UDim2.new(1,0,0,20)
@@ -1945,7 +1779,6 @@ local function makeSlider(text, mn, mx, def, fmt, cb)
                     cleanup()
                 end
             end)
-            -- Losing focus must not leave a live drag behind.
             f = UserInputService.WindowFocusReleased:Connect(cleanup)
         end
     end)
@@ -1958,7 +1791,6 @@ local function makeSegment(text, options, default, cb)
 
     local label = Instance.new("TextButton")
     label.Size = UDim2.new(1,0,0,16); label.BackgroundTransparency = 1
-    -- The label shows the current value, so a tap always shows up somewhere.
     label.Text = text .. ": " .. tostring(default); label.TextColor3 = THEME.text
     label.Font = THEME.font; label.TextSize = 12
     label.TextXAlignment = Enum.TextXAlignment.Left
@@ -1989,16 +1821,11 @@ local function makeSegment(text, options, default, cb)
         corner(b, 4)
         local lastPick = 0
         local function choose()
-            -- The press and the click both arrive: one press, one change.
             local now = tick()
             if now - lastPick < 0.15 then return end
             lastPick = now
-            -- The setting first, the colours after: a tween that fails must
-            -- never swallow the click.
             cb(opt)
             for n, bb in pairs(buttons) do
-                -- The colour goes on right away: a tap must be visible even
-                -- when the tween does not run.
                 bb.BackgroundColor3 = n == opt and THEME.accent or THEME.panel
                 pcall(function()
                     TweenService:Create(bb, TweenInfo.new(0.12), {
@@ -2010,7 +1837,6 @@ local function makeSegment(text, options, default, cb)
                 if o == opt then index = i break end
             end
         end
-        -- Every way a phone can send a tap.
         b.MouseButton1Click:Connect(choose)
         b.MouseButton1Down:Connect(choose)
         b.InputBegan:Connect(function(input)
@@ -2023,9 +1849,6 @@ local function makeSegment(text, options, default, cb)
         choosers[opt] = choose
     end
 
-    -- Tapping the label cycles through the options. The label is a much
-    -- bigger target than the buttons, so it works even when a small button
-    -- does not get the tap.
     label.MouseButton1Click:Connect(function()
         index = index % #options + 1
         local pick = choosers[options[index]]
@@ -2041,7 +1864,6 @@ local function makeSegment(text, options, default, cb)
     end)
 end
 
--- ===== BUILD =====
 makeHeader("MODULES")
 setBotEnabled = makeToggle("Bot Enabled", state.enabled, function(v)
     state.enabled = v
@@ -2080,6 +1902,8 @@ makeToggle("Fast Attack", CONFIG.FastAttack, function(v) CONFIG.FastAttack = v e
 makeToggle("Remote Attack", CONFIG.RemoteAttack, function(v) CONFIG.RemoteAttack = v end)
 makeToggle("Big Hitbox", CONFIG.BigHitbox, function(v) CONFIG.BigHitbox = v end)
 makeToggle("Bring Mob", CONFIG.BringMob, function(v) CONFIG.BringMob = v end)
+makeSlider("Bring Radius", 10, 100, CONFIG.BringMobRange,
+    function(v) return v.." studs" end, function(v) CONFIG.BringMobRange = v end)
 makeSlider("Hitbox Size", 4, 40, CONFIG.HitboxSize,
     function(v) return tostring(v) end, function(v) CONFIG.HitboxSize = v end)
 makeSlider("Swing Reach", 0, 200, CONFIG.HitboxMagnitude,
@@ -2101,7 +1925,6 @@ makeSlider("Store From", 1, 10, CONFIG.StoreFruitMin,
 makeSlider("Scan Radius", 500, 10000, CONFIG.FruitScanRadius,
     function(v) return tostring(v) end, function(v) CONFIG.FruitScanRadius = v end)
 
--- Footer
 local footer = Instance.new("Frame")
 footer.Size = UDim2.new(1, -16, 0, 72)
 footer.Position = UDim2.new(0, 8, 1, -80)
@@ -2147,7 +1970,6 @@ task.spawn(function()
     end
 end)
 
--- Drag
 local dragging, dragInput, dragStart, startPos
 titleBar.InputBegan:Connect(function(i)
     if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -2176,4 +1998,4 @@ UserInputService.InputBegan:Connect(function(i, gpe)
     if i.KeyCode == Enum.KeyCode.F9 and setDebug then setDebug(not CONFIG.Debug) end
 end)
 
-print("[Farm] Fixed build loaded.")
+print("[Farm] Fixed & Upgraded build loaded.")
