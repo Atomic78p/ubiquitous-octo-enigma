@@ -197,8 +197,17 @@ local WEAPON_GROUPS = {
 }
 
 
+-- The game says what a weapon is: the ToolTip holds "Melee", "Sword", "Gun"
+-- or "Fruit". That is more reliable than the name of the tool.
+local function toolKind(tool)
+    local tip = tool.ToolTip
+    if type(tip) == "string" and tip ~= "" then return tip:lower() end
+    return nil
+end
+
 -- A ranged weapon reaches much further than a melee one.
 local function isGun(tool)
+    if toolKind(tool) == "gun" then return true end
     local n = tool.Name:lower()
     for _, w in ipairs(WEAPON_GROUPS.Gun) do
         if n:find(w, 1, true) then return true end
@@ -218,7 +227,16 @@ end
 
 -- Does this tool belong to the weapon mode the user picked?
 local function matchesMode(tool)
-    if CONFIG.WeaponMode == "Fruit" then return isFruit(tool) end
+    local mode = CONFIG.WeaponMode
+    if mode == "Fruit" then
+        return toolKind(tool) == "fruit" or isFruit(tool)
+    end
+    local kind = toolKind(tool)
+    if kind then
+        if mode == "Melee" and kind == "melee" then return true end
+        if mode == "Sword" and kind == "sword" then return true end
+        if mode == "Gun" and kind == "gun" then return true end
+    end
     return weaponRank(tool) ~= nil
 end
 
@@ -244,10 +262,14 @@ local function equipWeapon()
         -- ถ้าเกมไม่ยอมสลับ (ไอเทมยังไม่ยอมเข้า Character) ให้ลองใช้ EquipEvent ของเกม
         if item.Parent ~= char then
             pcall(function()
-                local equipRemote = item:FindFirstChild("EquipEvent") 
-                    or (backpack and backpack:FindFirstChild(item.Name) and backpack[item.Name]:FindFirstChild("EquipEvent"))
+                -- the game keeps the equip remote in Backpack.Combat
+                local combat = backpack and backpack:FindFirstChild("Combat")
+                local equipRemote = (combat and combat:FindFirstChild("EquipEvent"))
+                    or item:FindFirstChild("EquipEvent")
+                    or (backpack and backpack:FindFirstChild(item.Name)
+                        and backpack[item.Name]:FindFirstChild("EquipEvent"))
                 if equipRemote then
-                    equipRemote:FireServer(true)
+                    equipRemote:FireServer(false)
                 end
             end)
         end
@@ -279,8 +301,8 @@ local function equipWeapon()
                     end
                 elseif not isFruit(item) then
                     local rank = weaponRank(item)
-                    if rank then
-                        table.insert(weapons, {tool = item, rank = rank, order = order})
+                    if matchesMode(item) then
+                        table.insert(weapons, {tool = item, rank = rank or 99, order = order})
                     else
                         table.insert(fallbacks, item)
                     end
@@ -315,25 +337,41 @@ end
 -- look direction points down while farming, so a local offset would shove
 -- the mob into the ground.
 local function bringMob(target, root)
-    local anchor = anchorOf(target)
-    if not anchor then return end
-    local dx = root.Position.X - anchor.Position.X
-    local dz = root.Position.Z - anchor.Position.Z
-    if math.sqrt(dx * dx + dz * dz) <= CONFIG.BringMobRange then return end
+    local allEnemies = collectEnemies(tick())
+    if not allEnemies or #allEnemies == 0 then return end
+    
+    local clusterPos = root.Position + Vector3.new(0, -2, 0) -- จุดสุมใต้ตัว/หน้าผู้เล่น
     local now = tick()
-    if now < (state.bringAt or 0) then return end -- do not spam the write
-    state.bringAt = now + 0.2
-    -- Freeze the mob, so it cannot fight back while it is dragged over.
-    local hum = target:FindFirstChildOfClass("Humanoid")
-    if hum then
-        pcall(function() hum.PlatformStand = true end)
-        pcall(function() hum.Sit = true end)
+    if now < (state.bringAt or 0) then return end
+    state.bringAt = now + 0.15 -- ความถี่ในการอัปเดตตำแหน่งไม่ให้กินเครื่อง
+
+    for _, mob in ipairs(allEnemies) do
+        local anchor = anchorOf(mob)
+        if anchor then
+            local dist = (anchor.Position - root.Position).Magnitude
+            -- ดึงเฉพาะมอนสเตอร์ที่อยู่ในรัศมีรอบๆ ไม่ไกลเกินไปเพื่อกันเซิร์ฟเวอร์เตด (Anti-Cheat Kick)
+            if dist <= 40 then
+                local hum = mob:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    pcall(function()
+                        hum.PlatformStand = true -- ปิดการเคลื่อนไหวปกติของมอนสเตอร์
+                        hum.Sit = true
+                    end)
+                end
+                pcall(function()
+                    anchor.CanCollide = false
+                    -- ล็อกพิกัดให้ซ้อนทับกันเป๊ะๆ ที่จุดศูนย์กลางเดียว
+                    anchor.CFrame = CFrame.new(clusterPos)
+                    -- ล้างแรงเหวี่ยงและแรงกระเด็น (Knockback) ทั้งหมดทิ้งเป็นศูนย์
+                    anchor.AssemblyLinearVelocity = Vector3.zero
+                    anchor.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
     end
-    pcall(function() anchor.CanCollide = false end)
-    -- Keep the mob's own height so it stays on the ground it spawned on.
-    local goal = Vector3.new(root.Position.X, anchor.Position.Y, root.Position.Z)
-    pcall(function() anchor.CFrame = CFrame.new(goal) end)
 end
+
+
 
 -- A bigger hitbox makes the swing land more often. It only sticks when the
 -- client owns that part, so it is a bonus, not a promise.
@@ -496,8 +534,8 @@ local function questPanelGui()
     return mainFrame and mainFrame:FindFirstChild("Quest")
 end
 
--- Everything the panel tells us about the current quest: which mob to hunt,
--- how far along we are and whether it is done.
+-- ================= UPGRADED: DYNAMIC QUEST PANEL INFO =================
+-- อ่านค่าเควสต์จากหน้าจอเกมแบบยืดหยุ่น รองรับการเปลี่ยนแปลงของแพตช์เกมอัตโนมัติ
 local function questPanelInfo()
     local qg = questPanelGui()
     if not qg or not qg.Visible then return nil end
@@ -514,25 +552,36 @@ local function questPanelInfo()
     for _, t in ipairs(texts) do
         local found = parseProgress(t)
         for mob, prog in pairs(found) do mobs[mob] = prog end
-        -- Plain counters can sit next to a fraction in the same line
-        -- ("Defeat 3/5 Bandits and 7 Pirates"): track what is missing.
+        
         for mob, prog in pairs(parseRequired(t)) do
             if not found[mob] and not mobs[mob] then mobs[mob] = prog end
         end
+        
         local m = mobInText(t)
         local lower = t:lower()
         local giverText = lower:find("quest giver", 1, true) ~= nil
-        -- A text about a giver does not tell us which mob to hunt.
-        if m and not giverText and (not mentioned or #m > #mentioned) then mentioned = m end
+        
+        if m and not giverText and (not mentioned or #m > #mentioned) then 
+            mentioned = m 
+        end
         if lower:find("complete", 1, true) then saysComplete = true end
         if lower:find("return to", 1, true) then saysReturn = true end
     end
-    if not mentioned and not saysComplete and not saysReturn and next(mobs) == nil then return nil end
 
-    -- Hunt the mob the quest still needs the most of.
+    -- กรณีที่เกมเปลี่ยนฟอร์แมตข้อความเควสต์จน parser อ่านตัวเลขไม่ออก แต่ยังมีข้อความเป้าหมายอยู่
+    -- ระบบจะใช้ชื่อมอนสเตอร์ตัวแรกที่สแกนเจอในหน้าต่างเควสต์เป็นเป้าหมายสำรองทันที (Dynamic Fallback)
+    if not mentioned and #texts > 0 then
+        for _, t in ipairs(texts) do
+            local cleanText = t:gsub("%d", ""):gsub("[/%-%.:]", "")
+            if #cleanText > 3 and not t:lower():find("level") and not t:lower():find("quest") then
+                mentioned = texts[2] or texts[1] -- ดึงข้อความบรรทัดรองในกล่องเควสต์มาใช้ชั่วคราว
+                break
+            end
+        end
+    end
+
     local target, worst = nil, 2
     local allDone = next(mobs) ~= nil
-    -- Sorted names keep the choice stable when two mobs are equally far from done.
     local names = {}
     for mob in pairs(mobs) do table.insert(names, mob) end
     table.sort(names)
@@ -540,7 +589,6 @@ local function questPanelInfo()
         local prog = mobs[mob]
         local ratio
         if prog.remaining then
-            -- the number is what is left, so zero left means the quest is done
             ratio = prog.total > 0 and 0 or 1
         else
             ratio = prog.total > 0 and (prog.count / prog.total) or 0
@@ -550,22 +598,17 @@ local function questPanelInfo()
     end
     if next(mobs) == nil then target = mentioned end
 
-    -- With progress on screen the counters decide, not the word "complete".
     local complete = saysComplete
     if next(mobs) ~= nil then complete = allDone end
-    -- "Return to the giver" only ends a quest that shows no counters left.
     if saysReturn and next(mobs) == nil then complete = true end
 
-    -- The giver we need is the one for the mob we are actually hunting.
     if target and mobs[target] then mentioned = target end
 
     return {
         mobs = mobs,
-        mentioned = mentioned,
-        target = target,
+        mentioned = mentioned or "Bandit", -- ป้องกันค่าว่างด้วย Default เผื่อเกมเปลี่ยนชื่อหน้าต่าง UI
+        target = target or mentioned,
         complete = complete,
-        -- Any sign that a quest is running means: do not ask for it again.
-        -- Asking again can wipe the progress we already made.
         confirmed = next(mobs) ~= nil or mentioned ~= nil or saysReturn or saysComplete,
     }
 end

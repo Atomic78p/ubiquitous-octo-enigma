@@ -197,8 +197,17 @@ local WEAPON_GROUPS = {
 }
 
 
+-- The game says what a weapon is: the ToolTip holds "Melee", "Sword", "Gun"
+-- or "Fruit". That is more reliable than the name of the tool.
+local function toolKind(tool)
+    local tip = tool.ToolTip
+    if type(tip) == "string" and tip ~= "" then return tip:lower() end
+    return nil
+end
+
 -- A ranged weapon reaches much further than a melee one.
 local function isGun(tool)
+    if toolKind(tool) == "gun" then return true end
     local n = tool.Name:lower()
     for _, w in ipairs(WEAPON_GROUPS.Gun) do
         if n:find(w, 1, true) then return true end
@@ -218,7 +227,16 @@ end
 
 -- Does this tool belong to the weapon mode the user picked?
 local function matchesMode(tool)
-    if CONFIG.WeaponMode == "Fruit" then return isFruit(tool) end
+    local mode = CONFIG.WeaponMode
+    if mode == "Fruit" then
+        return toolKind(tool) == "fruit" or isFruit(tool)
+    end
+    local kind = toolKind(tool)
+    if kind then
+        if mode == "Melee" and kind == "melee" then return true end
+        if mode == "Sword" and kind == "sword" then return true end
+        if mode == "Gun" and kind == "gun" then return true end
+    end
     return weaponRank(tool) ~= nil
 end
 
@@ -237,43 +255,54 @@ local function equipWeapon()
 
     local function equip(item)
         if tick() < state.equipRetryAt then return nil end
+        
+        -- ลองใช้ EquipTool ปกติก่อน
         pcall(function() hum:EquipTool(item) end)
+        
+        -- ถ้าเกมไม่ยอมสลับ (ไอเทมยังไม่ยอมเข้า Character) ให้ลองใช้ EquipEvent ของเกม
         if item.Parent ~= char then
-            -- The game refused it; do not spam the equip call every tick.
-            state.equipRetryAt = tick() + 5
+            pcall(function()
+                -- the game keeps the equip remote in Backpack.Combat
+                local combat = backpack and backpack:FindFirstChild("Combat")
+                local equipRemote = (combat and combat:FindFirstChild("EquipEvent"))
+                    or item:FindFirstChild("EquipEvent")
+                    or (backpack and backpack:FindFirstChild(item.Name)
+                        and backpack[item.Name]:FindFirstChild("EquipEvent"))
+                if equipRemote then
+                    equipRemote:FireServer(false)
+                end
+            end)
+        end
+        
+        if item.Parent ~= char then
+            state.equipRetryAt = tick() + 2
             dbg("Could not equip " .. item.Name)
             return nil
         end
         return item
     end
 
-    -- A tool already in hand is the best case when it fits the mode.
+    -- 1. ถ้าถืออาวุธที่ตรงโหมดในมืออยู่แล้ว ให้ใช้อันนั้นเลย
     local equipped = char:FindFirstChildOfClass("Tool")
     if equipped and matchesMode(equipped) then return equipped end
 
-    -- Then the tools we carry: the character first, the backpack after.
-    local carriers = {}
-    table.insert(carriers, char)
+    -- 2. ค้นหาในตัวละคร และ ใน Backpack
+    local carriers = {char}
     if backpack then table.insert(carriers, backpack) end
 
     local weapons, fallbacks, order = {}, {}, 0
     for _, container in ipairs(carriers) do
         for _, item in ipairs(container:GetChildren()) do
             if item:IsA("Tool") then
-                order += 1
+                order = order + 1
                 if CONFIG.WeaponMode == "Fruit" then
-                    -- Fruit mode fights with the fruit itself.
                     if isFruit(item) then
                         table.insert(weapons, {tool = item, rank = 1, order = order})
-                    else
-                        table.insert(fallbacks, item)
                     end
-                elseif isFruit(item) then
-                    -- never swing a fruit: activating one would eat it
-                else
+                elseif not isFruit(item) then
                     local rank = weaponRank(item)
-                    if rank then
-                        table.insert(weapons, {tool = item, rank = rank, order = order})
+                    if matchesMode(item) then
+                        table.insert(weapons, {tool = item, rank = rank or 99, order = order})
                     else
                         table.insert(fallbacks, item)
                     end
@@ -281,22 +310,27 @@ local function equipWeapon()
             end
         end
     end
+
     table.sort(weapons, function(a, b)
         if a.rank ~= b.rank then return a.rank < b.rank end
         return a.order < b.order
     end)
 
+    -- ถืออาวุธที่จัดอันดับไว้ตามโหมด
     for _, entry in ipairs(weapons) do
         local weapon = equip(entry.tool)
         if weapon then return weapon end
     end
+    
+    -- ถ้าหาไม่เจอจริงๆ ค่อยใช้ fallback
     for _, item in ipairs(fallbacks) do
         local tool = equip(item)
         if tool then return tool end
     end
-    if equipped and not isFruit(equipped) then return equipped end
+
     return nil
 end
+
 
 -- Drag the mob to the player so a melee swing actually connects. Only the
 -- flat distance counts: the bot hovers above the mob on purpose, and the
