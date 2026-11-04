@@ -2090,7 +2090,7 @@ makeSlider("Melee Range", 4, 30, CONFIG.MeleeRange,
     function(v) return v.." studs" end, function(v) CONFIG.MeleeRange = v end)
 makeSlider("Gun Range", 20, 120, CONFIG.GunRange,
     function(v) return v.." studs" end, function(v) CONFIG.GunRange = v end)
-makeSlider("Attack Cooldown", 5, 100, math.floor(CONFIG.AttackCooldown*100),
+makeSlider("Attack Cooldown", 0, 100, math.floor(CONFIG.AttackCooldown*100),
     function(v) return string.format("%.2fs", v/100) end,
     function(v) CONFIG.AttackCooldown = v/100 end)
 
