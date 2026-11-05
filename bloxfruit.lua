@@ -7,6 +7,14 @@ local UserInputService  = game:GetService("UserInputService")
 local TweenService      = game:GetService("TweenService")
 local LocalPlayer       = Players.LocalPlayer
 
+-- Roblox streams far away content out of the client. A mob that is not
+-- loaded does not exist for us at all, so the bot walks around an empty
+-- world and never finds anything to attack. The game hubs switch streaming
+-- off for exactly this reason.
+pcall(function() Workspace.StreamingEnabled = false end)
+pcall(function() Workspace.StreamingMinRadius = 1e8 end)
+pcall(function() Workspace.StreamingTargetRadius = 1e8 end)
+
 -- ================= CONFIG =================
 local CONFIG = {
     AutoQuest       = true,
@@ -99,6 +107,17 @@ local state = {
     -- can disappear, and a new quest would wipe the finished one.
     questDone     = false,
     questDoneMob  = nil,
+    -- The quest we asked the game for and whether it was confirmed.
+    questAsked    = nil,
+    questAskedAt  = 0,
+    questIndexTry = nil,
+    questVerified = false,
+    questGaveUp   = false,
+    -- Hits the game confirmed on the target we are fighting.
+    hitsConfirmed = 0,
+    hitRemoteHooked = false,
+    statsHooked   = false,
+    attackSpeed   = 1,
     turnInFailed  = false,
     turnInFailedAt = 0,
     seekSince     = nil,
@@ -405,8 +424,89 @@ local function enlargeHitbox(target)
     pcall(function() anchor.Size = Vector3.new(size, size, size) end)
 end
 
+-- The quest code walks to the giver, the movement code needs the quest info:
+-- moveTo is declared here and defined further down.
+local moveTo
+
+-- ================= GAME QUEST DATA =================
+-- The game ships its own quest list: ReplicatedStorage.Quests holds the
+-- tasks (which mob, how many) and ReplicatedStorage.GuideModule holds the
+-- givers with the level and the place each quest is given. Reading that is
+-- far better than a table written from memory.
+local gameQuests
+
+local function loadGameQuests()
+    local okQuests, quests = pcall(function()
+        return require(ReplicatedStorage:WaitForChild("Quests", 5))
+    end)
+    if not okQuests or type(quests) ~= "table" then return nil end
+    local okGuide, guide = pcall(function()
+        return require(ReplicatedStorage:WaitForChild("GuideModule", 5))
+    end)
+    if not okGuide or type(guide) ~= "table" then return nil end
+    local npcList = guide.Data and guide.Data.NPCList
+    if type(npcList) ~= "table" then return nil end
+
+    local list = {}
+    for npcKey, npc in pairs(npcList) do
+        if type(npc) == "table" and npc.InternalQuestName and type(npc.Levels) == "table" then
+            local questSet = quests[npc.InternalQuestName]
+            -- Levels maps the id of the quest to the level it is given at.
+            for id, level in pairs(npc.Levels) do
+                local quest = questSet and questSet[id]
+                if type(quest) == "table" and type(quest.Task) == "table" then
+                    local mob, count
+                    for mobName, n in pairs(quest.Task) do
+                        if mob == nil or (type(n) == "number" and n > count) then
+                            mob, count = mobName, n
+                        end
+                    end
+                    if mob then
+                        table.insert(list, {
+                            name = npc.InternalQuestName,
+                            index = id,
+                            mob = mob,
+                            count = count,
+                            level = level,
+                            levelReq = quest.LevelReq,
+                            npc = npc.NPCName or npcKey,
+                            pos = npc.Position,
+                        })
+                    end
+                end
+            end
+        end
+    end
+    if #list == 0 then return nil end
+    table.sort(list, function(a, b) return (a.level or 0) < (b.level or 0) end)
+    return list
+end
+
+-- Read the quest data of the game in the background; the bot keeps working
+-- with the table in the config until it is there.
+task.spawn(function()
+    local list = loadGameQuests()
+    if list then
+        gameQuests = list
+        dbg("Game quest data: " .. #list .. " quests")
+    end
+end)
+
 -- ================= QUEST =================
 local function questFor(level)
+    -- The game's own data wins over the table in the config.
+    if gameQuests and #gameQuests > 0 then
+        local best
+        for _, q in ipairs(gameQuests) do
+            if type(q.level) == "number" and q.level <= level then
+                if not best or q.level > best.level then best = q end
+            end
+        end
+        if best then
+            return {name = best.name, index = best.index, mob = best.mob,
+                    pos = best.pos, npc = best.npc}
+        end
+    end
     for _, q in ipairs(CONFIG.QuestList) do
         if level >= q[1] and level <= q[2] then
             return {name = q[3], index = q[4], mob = q[5]}
@@ -546,17 +646,175 @@ local function parseRequired(text)
     return out
 end
 
+-- The game tells us the quest itself through Remotes.QuestUpdate: the task
+-- (how many of each mob) and the progress (how many we already killed).
+-- That is the real state, the panel is only a picture of it.
+local questRemote, questRemoteState, questRemoteHooked = nil, nil, false
+
+local function hookQuestRemote()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local q = remotes and remotes:FindFirstChild("QuestUpdate")
+    if not q then return nil end
+    questRemote = q
+    if questRemoteHooked or not q.OnClientEvent then return q end
+    questRemoteHooked = true
+    pcall(function()
+        q.OnClientEvent:Connect(function(data, update)
+            if data == nil then
+                -- the game cleared the quest: the turn-in worked
+                questRemoteState = nil
+                state.questDone = false
+                state.questDoneMob = nil
+                state.currentQuest = nil
+                state.questSentAt = 0
+                state.questAsked = nil
+                state.questVerified = false
+                state.questGaveUp = false
+                dbg("Quest cleared by the game")
+                return
+            end
+            questRemoteState = data
+            if type(update) == "table" and update.Context == "Complete" then
+                dbg("Quest progress complete: " .. tostring(update.Name))
+            end
+            -- The game answered: this is the quest we really have.
+            state.questVerified = true
+            state.questGaveUp = false
+            if state.questAsked and data.InternalQuestName ~= state.questAsked then
+                dbg("The game gave us " .. tostring(data.InternalQuestName)
+                    .. " instead of " .. tostring(state.questAsked))
+            end
+        end)
+    end)
+    return q
+end
+
+-- The quest of the game in the same shape the panel gives us.
+local function remoteQuestInfo()
+    local s = questRemoteState
+    if not s or not s.Info then return nil end
+    local task = s.Info.Task or {}
+    local progress = s.Progress or {}
+    local mobs, any = {}, false
+    for mob, need in pairs(task) do
+        any = true
+        mobs[mob] = {count = progress[mob] or 0, total = need, remaining = false}
+    end
+    if not any then return nil end
+    -- Hunt the mob the quest still needs the most of.
+    local target, worst = nil, 2
+    local names = {}
+    for mob in pairs(mobs) do table.insert(names, mob) end
+    table.sort(names)
+    for _, mob in ipairs(names) do
+        local prog = mobs[mob]
+        local ratio = prog.total > 0 and (prog.count / prog.total) or 1
+        if ratio < 1 then
+            if ratio < worst then worst, target = ratio, mob end
+        end
+    end
+    local complete = true
+    for _, prog in pairs(mobs) do
+        if prog.count < prog.total then complete = false break end
+    end
+    return {
+        mobs = mobs,
+        mentioned = s.Info.Name,
+        target = target,
+        complete = complete,
+        -- The game sent the quest, so it is running: never ask for it again.
+        confirmed = true,
+        questName = s.InternalQuestName,
+    }
+end
+
+-- The game tells us when a hit really landed: RE/ReceivedHit comes back from
+-- the server for every confirmed hit. That is the truth about the fight.
+local function hookHitRemote()
+    if state.hitRemoteHooked then return end
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local net = modules and modules:FindFirstChild("Net")
+    local hit = net and net:FindFirstChild("RE/ReceivedHit")
+    if not hit or not hit.OnClientEvent then return end
+    state.hitRemoteHooked = true
+    pcall(function()
+        hit.OnClientEvent:Connect(function(player, mob, kind, weapon, part)
+            state.hitsConfirmed = state.hitsConfirmed + 1
+            state.lastHitAt = tick()
+            if mob then state.lastHitMob = mob.Name end
+        end)
+    end)
+end
+
+-- The game sends the attack speed of the player: with a buff the swings come
+-- faster, and the bot should not swing slower than the game allows.
+local function hookStatsRemote()
+    if state.statsHooked then return end
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local stats = remotes and remotes:FindFirstChild("Stats")
+    if not stats or not stats.OnClientEvent then return end
+    state.statsHooked = true
+    pcall(function()
+        stats.OnClientEvent:Connect(function(player, key, value)
+            if key == "AttackSpeedMultiplier" and type(value) == "number" and value > 0 then
+                state.attackSpeed = value
+            end
+        end)
+    end)
+end
+
+-- The quest as the game counts it: "Bandit 3/8".
+local function questProgressText()
+    local s = questRemoteState
+    if not s or not s.Info then return tostring(state.currentQuest) end
+    local task = s.Info.Task or {}
+    local progress = s.Progress or {}
+    local parts = {}
+    for mob, need in pairs(task) do
+        table.insert(parts, mob .. " " .. tostring(progress[mob] or 0) .. "/" .. tostring(need))
+    end
+    if #parts == 0 then return tostring(s.InternalQuestName or state.currentQuest) end
+    table.sort(parts)
+    return table.concat(parts, ", ")
+end
+
 local function questPanelGui()
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    local mainFrame = pg and pg:FindFirstChild("Main")
-    return mainFrame and mainFrame:FindFirstChild("Quest")
+    if not pg then return nil end
+    local mainFrame = pg:FindFirstChild("Main")
+    local panel = mainFrame and mainFrame:FindFirstChild("Quest")
+    if panel and panel.Visible then return panel end
+    -- Newer builds show the tracked quest in their own frame.
+    local tracked = pg:FindFirstChild("TrackedQuestFrame")
+    if tracked then
+        local on = false
+        pcall(function()
+            on = (tracked:IsA("ScreenGui") and tracked.Enabled)
+                or (tracked:IsA("GuiObject") and tracked.Visible)
+        end)
+        if on then
+            local frame = tracked:FindFirstChild("Frame")
+            return frame or tracked
+        end
+    end
+    return panel
+end
+
+-- A gui is shown when it is visible; screen frames use "Enabled" instead.
+local function guiShown(gui)
+    if gui == nil then return false end
+    local ok, v = pcall(function() return gui.Visible end)
+    if ok and v ~= nil then return v end
+    local ok2, e = pcall(function() return gui.Enabled end)
+    if ok2 and e ~= nil then return e end
+    return true
 end
 
 -- Everything the panel tells us about the current quest: which mob to hunt,
 -- how far along we are and whether it is done.
 local function questPanelInfo()
     local qg = questPanelGui()
-    if not qg or not qg.Visible then return nil end
+    if not guiShown(qg) then return nil end
 
     local texts = {}
     for _, d in ipairs(qg:GetDescendants()) do
@@ -628,6 +886,18 @@ end
 
 local function tryAcceptQuest(info)
     local now = tick()
+    state.seekingQuestGiver = false
+
+    -- A running quest is confirmed by the panel; leave it alone. The panel
+    -- of the game blinks while it updates, so the confirmation is kept a
+    -- moment longer: asking again in the middle of that would throw the
+    -- quest we just got away.
+    if info and info.confirmed then
+        state.questSeenUntil = now + 1
+        return
+    end
+    if now < (state.questSeenUntil or 0) then return end
+
     if now - state.lastQuestTry < 2 then return end
     state.lastQuestTry = now
 
@@ -635,30 +905,66 @@ local function tryAcceptQuest(info)
     -- game would drop the progress we just made.
     if state.questDone then return end
 
-    -- A running quest is confirmed by the panel; leave it alone.
-    if info and info.confirmed then return end
-
     local q = questFor(getMyLevel())
     if not q then dbg("No quest bracket for this level"); return end
 
-    -- Same quest already sent and still not visible: back off instead of
-    -- re-sending StartQuest every two seconds.
-    if state.currentQuest == questKey(q) and now - state.questSentAt < CONFIG.QuestRetry then
-        return
+    -- We asked for a quest and the game never answered: it did not take it.
+    -- Try the other index of the same quest before walking to a giver.
+    if state.questAsked and not state.questVerified then
+        if now - state.questAskedAt < 6 then return end
+        if state.questIndexTry == q.index then
+            dbg("The game did not take " .. state.questAsked .. " #" .. q.index)
+            state.questIndexTry = (q.index == 1) and 2 or 1
+            state.currentQuest = nil
+            state.questAskedAt = now
+        else
+            dbg("The game took no quest of this level, asking a giver")
+            state.questGaveUp = true
+            state.currentQuest = nil
+            return
+        end
     end
+    if state.questGaveUp then return end
 
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if not commF then dbg("CommF_ remote missing"); return end
 
-    -- Third arg is the quest INDEX (1 or 2), not a level.
+    -- The game only hands out a quest when the player stands at the giver.
+    -- The place comes from the guide data of the game itself.
+    local goal = nil
+    if q.pos then
+        goal = CFrame.new(q.pos) * CFrame.new(0, 4, 2)
+    end
+    if goal then
+        local root = getRoot()
+        if root and (root.Position - goal.Position).Magnitude > 8 then
+            state.status = "Going to the quest giver"
+            state.seekingQuestGiver = true
+            moveTo(goal)
+            return
+        end
+    end
+
+    -- The index is the slot of the quest at this level (1 or 2).
+    local index = state.questIndexTry or q.index
+
     -- The game wants to know where we respawn before it gives the quest.
-    pcall(function() commF:InvokeServer("SetSpawnPoint") end)
-    local ok, err = pcall(function() commF:InvokeServer("StartQuest", q.name, q.index) end)
+    pcall(function() commF:InvokeServer("SetLastSpawnPoint", "Town") end)
+    -- An old quest has to go first, the game does the same when the player
+    -- takes a new quest from the giver.
+    if questRemoteState then
+        pcall(function() commF:InvokeServer("AbandonQuest") end)
+    end
+    local ok, err = pcall(function() commF:InvokeServer("StartQuest", q.name, index) end)
     state.currentQuest = questKey(q)
     state.questSentAt = tick() -- measured after the call, not before
+    state.questAsked = q.name
+    state.questAskedAt = tick()
+    state.questVerified = false
+    state.questIndexTry = index
     if ok then
-        dbg("Quest sent: " .. q.name .. " #" .. q.index)
+        dbg("Quest sent: " .. q.name .. " #" .. index)
     else
         dbg("Quest FAIL: " .. tostring(err))
     end
@@ -776,6 +1082,8 @@ end
 -- Enemy names can carry a suffix ("Bandit [lvl 8]"), so match on the base name.
 local function mobKey(name)
     local base = name
+    -- the game labels its mobs "Lv. 30 Bandit" or "Bandit (Lv. 30)"
+    base = base:gsub("^Lv%.%s*%d+%s*", "")
     local cut = base:find("%s*%[")
     if cut then base = base:sub(1, cut - 1) end
     cut = base:find("%s*%(")
@@ -795,7 +1103,10 @@ local function pickBest(candidates, mobName, origin)
         local anchor = anchorOf(obj)
         if anchor then
             local d = (origin.Position - anchor.Position).Magnitude
-            local key = mobKey(obj.Name)
+            -- the display name of the game carries the level of the mob
+            local display = nil
+            pcall(function() display = obj:GetAttribute("DisplayName") end)
+            local key = mobKey(display or obj.Name)
             if not mobName then
                 if d < exactD then exact, exactD = obj, d end
             elseif sameName(key, mobName) then
@@ -883,7 +1194,7 @@ local function stopTween()
     tweenGoal = nil
 end
 
-local function moveTo(cf)
+function moveTo(cf)
     local root = getRoot()
     if not root then return end
     local mode = CONFIG.MovementMode
@@ -1021,9 +1332,55 @@ local function fastAttack()
     return ok
 end
 
+-- The game keeps track of the weapon state itself: whether the weapon can
+-- swing right now and how long the swing takes.
+local function combatUtilModule()
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local util = modules and modules:FindFirstChild("CombatUtil")
+    if not util then return nil end
+    local ok, combatUtil = pcall(require, util)
+    if not ok or not combatUtil then return nil end
+    return combatUtil
+end
+
+-- The game tells us how long the swing animation lasts. The server uses
+-- that number to time the hit, so a fixed number is only right at normal
+-- attack speed.
+local function attackAnimLength(tool)
+    local combatUtil = combatUtilModule()
+    if not combatUtil or not tool then return 0.5 end
+    local length = 0.5
+    pcall(function()
+        local weaponName = combatUtil:GetWeaponName(tool)
+        local cache = combatUtil:GetMovesetAnimCache(weaponName)
+        local pure = combatUtil:GetPureWeaponName(weaponName)
+        local track = cache and cache[pure .. "-basic1"]
+        if track then
+            local speed = track:GetAttribute("SpeedMult") or 1
+            if track.Length and speed > 0 then length = track.Length / speed end
+        end
+    end)
+    return length
+end
+
+-- The game says when the weapon may not swing yet. Swinging anyway only
+-- wastes the attack, the server throws it away.
+local function canAttack(tool)
+    local combatUtil = combatUtilModule()
+    if not combatUtil or not tool then return true end
+    local allowed = true
+    pcall(function()
+        local weaponName = combatUtil:GetWeaponName(tool)
+        local data = combatUtil:GetWeaponData(weaponName)
+        local weaponType = (data and data.WeaponType) or "Melee"
+        allowed = combatUtil:CanAttack(LocalPlayer.Character, weaponType)
+    end)
+    return allowed ~= false
+end
+
 -- The game sends the swing itself through two remotes. Firing them is what
 -- really hits: on a phone there is no mouse click to do it for us.
-local function remoteAttack(target)
+local function remoteAttack(target, tool)
     local modules = ReplicatedStorage:FindFirstChild("Modules")
     local net = modules and modules:FindFirstChild("Net")
     if not net then return false end
@@ -1038,7 +1395,7 @@ local function remoteAttack(target)
     end
     if not part then return false end
     local id = nil
-    pcall(function() id = regAttack:FireServer(0.5, 1) end)
+    pcall(function() id = regAttack:FireServer(attackAnimLength(tool), 1) end)
     if type(id) ~= "string" then
         state.attackId = (state.attackId or 0) + 1
         id = string.format("%08x", state.attackId)
@@ -1049,8 +1406,16 @@ end
 
 local function doAttack(tool, target)
     if CONFIG.FastAttack then fastAttack() end
+    -- A stunned character cannot swing at all.
+    local char = LocalPlayer.Character
+    local stun = char and char:FindFirstChild("Stun")
+    local stunned = false
+    pcall(function() stunned = (stun and stun.Value and stun.Value ~= 0) end)
+    if stunned then return false end
+    -- The game may forbid the swing right now.
+    if not canAttack(tool) then return false end
     -- The remote is the real swing; the tool is only the fallback.
-    if CONFIG.RemoteAttack and remoteAttack(target) then return true end
+    if CONFIG.RemoteAttack and remoteAttack(target, tool) then return true end
     local ok = pcall(function() tool:Activate() end)
     return ok
 end
@@ -1465,6 +1830,16 @@ local function step()
     -- The panel knows the real quest, its progress and whether it is done.
     local info = CONFIG.AutoQuest and questPanelInfo() or nil
 
+    -- The remote of the game is the better source: it counts the kills even
+    -- when the panel is hidden or shows something else.
+    if CONFIG.AutoQuest then
+        hookQuestRemote()
+        local remoteInfo = remoteQuestInfo()
+        if remoteInfo then info = remoteInfo end
+    end
+    hookHitRemote()
+    hookStatsRemote()
+
     -- Remember a finished quest. The panel of the game hides itself once the
     -- quest is done, and without this the bot would ask for a new quest and
     -- throw the finished one away.
@@ -1562,8 +1937,14 @@ local function step()
 
     if CONFIG.AutoQuest then tryAcceptQuest(info) end
 
-    -- No quest known for this level (past the table above): ask a giver.
-    if CONFIG.AutoQuest and not questFor(getMyLevel()) and not (info and info.confirmed) then
+    -- While we walk to the giver of the quest we must not run to a mob.
+    if state.seekingQuestGiver then return end
+
+    -- No quest known for this level (past the table above), or the game did
+    -- not take the quest we asked for: go to a giver and let the game give
+    -- us the quest it wants.
+    local needGiver = not questFor(getMyLevel()) or state.questGaveUp
+    if CONFIG.AutoQuest and needGiver and not (info and info.confirmed) then
         if state.seekSince == nil then state.seekSince = now end
         if state.seekGaveUp then
             -- We asked and nobody answered: farm for a while, then ask again.
@@ -1628,6 +2009,8 @@ local function step()
     if th then
         if target ~= state.lastTarget then
             state.lastTarget, state.targetHealth, state.targetAt = target, th.Health, now
+            -- A new target starts the hit count over.
+            state.hitsConfirmed = 0
             state.targetDist, state.travelAt = dist, now
         elseif th.Health < (state.targetHealth or th.Health) then
             state.targetHealth, state.targetAt = th.Health, now
@@ -1718,7 +2101,7 @@ local function step()
         if doAttack(tool, swingTarget) then
             state.lastAttack = now
             if swingTarget == target then
-                state.status = "Hitting " .. target.Name
+                state.status = "Hitting " .. target.Name .. " (" .. state.hitsConfirmed .. " hits)"
             else
                 state.status = "Attacking " .. swingTarget.Name
             end
@@ -2175,8 +2558,9 @@ task.spawn(function()
     while gui.Parent do
         statusLabel.Text = state.enabled and state.status or "Stopped"
         debugLabel.Text = state.debugLine == "" and "Ready" or state.debugLine
-        infoLabel.Text = string.format("Lv %d • Fruits: %d • Quest: %s",
-            getMyLevel(), state.fruitsFound, tostring(state.currentQuest))
+        infoLabel.Text = string.format("Lv %d • Fruits: %d • Quest: %s • Spd %s",
+            getMyLevel(), state.fruitsFound, questProgressText(),
+            tostring(state.attackSpeed))
         task.wait(0.4)
     end
 end)
