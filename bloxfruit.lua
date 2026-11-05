@@ -424,10 +424,6 @@ local function enlargeHitbox(target)
     pcall(function() anchor.Size = Vector3.new(size, size, size) end)
 end
 
--- The quest code walks to the giver, the movement code needs the quest info:
--- moveTo is declared here and defined further down.
-local moveTo
-
 -- ================= GAME QUEST DATA =================
 -- The game ships its own quest list: ReplicatedStorage.Quests holds the
 -- tasks (which mob, how many) and ReplicatedStorage.GuideModule holds the
@@ -886,7 +882,6 @@ end
 
 local function tryAcceptQuest(info)
     local now = tick()
-    state.seekingQuestGiver = false
 
     -- A running quest is confirmed by the panel; leave it alone. The panel
     -- of the game blinks while it updates, so the confirmation is kept a
@@ -899,14 +894,16 @@ local function tryAcceptQuest(info)
     if now < (state.questSeenUntil or 0) then return end
 
     if now - state.lastQuestTry < 2 then return end
-    state.lastQuestTry = now
 
     -- A quest that is finished but not handed in must not be replaced: the
     -- game would drop the progress we just made.
     if state.questDone then return end
 
     local q = questFor(getMyLevel())
-    if not q then dbg("No quest bracket for this level"); return end
+    if not q then
+        dbg("No quest bracket for this level")
+        return
+    end
 
     -- We asked for a quest and the game never answered: it did not take it.
     -- Try the other index of the same quest before walking to a giver.
@@ -930,22 +927,8 @@ local function tryAcceptQuest(info)
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if not commF then dbg("CommF_ remote missing"); return end
 
-    -- The game only hands out a quest when the player stands at the giver.
-    -- The place comes from the guide data of the game itself.
-    local goal = nil
-    if q.pos then
-        goal = CFrame.new(q.pos) * CFrame.new(0, 4, 2)
-    end
-    if goal then
-        local root = getRoot()
-        if root and (root.Position - goal.Position).Magnitude > 8 then
-            state.status = "Going to the quest giver"
-            state.seekingQuestGiver = true
-            moveTo(goal)
-            return
-        end
-    end
-
+    -- The quest is asked for right here: walking to the giver first only
+    -- wastes time, the game takes the quest from anywhere.
     -- The index is the slot of the quest at this level (1 or 2).
     local index = state.questIndexTry or q.index
 
@@ -1194,7 +1177,7 @@ local function stopTween()
     tweenGoal = nil
 end
 
-function moveTo(cf)
+local function moveTo(cf)
     local root = getRoot()
     if not root then return end
     local mode = CONFIG.MovementMode
@@ -1936,9 +1919,6 @@ local function step()
     end
 
     if CONFIG.AutoQuest then tryAcceptQuest(info) end
-
-    -- While we walk to the giver of the quest we must not run to a mob.
-    if state.seekingQuestGiver then return end
 
     -- No quest known for this level (past the table above), or the game did
     -- not take the quest we asked for: go to a giver and let the game give
