@@ -111,6 +111,9 @@ local state = {
     questAsked    = nil,
     questAskedAt  = 0,
     questIndexTry = nil,
+    questTried    = {},
+    questTryKey   = nil,
+    questNpc      = nil,
     questVerified = false,
     questGaveUp   = false,
     -- Hits the game confirmed on the target we are fighting.
@@ -428,80 +431,189 @@ end
 -- The game ships its own quest list: ReplicatedStorage.Quests holds the
 -- tasks (which mob, how many) and ReplicatedStorage.GuideModule holds the
 -- givers with the level and the place each quest is given. Reading that is
--- far better than a table written from memory.
+-- far better than a table written from memory: the list of the game has
+-- every level, the table in the config only the first ones.
 local gameQuests
+local gameGuideQuests
+local gameLevelQuests
+local gameGuideNames
+local gameQuestIndexes
+local gameQuestCache, gameQuestCacheAt
 
+-- Quests of the game that are no normal quest to farm.
+local QUEST_SKIP = {
+    BartiloQuest = true,
+    Trainees = true,
+    MarineQuest = true,
+    CitizenQuest = true,
+}
+
+-- The mob of a task: the one the quest asks for the most.
+local function taskMob(task)
+    if type(task) ~= "table" then return nil, 0 end
+    local mob, count
+    for name, n in pairs(task) do
+        if type(n) == "number" and (mob == nil or n > count or (n == count and name < mob)) then
+            mob, count = name, n
+        end
+    end
+    return mob, count or 0
+end
+
+-- Read the quest data of the game. The quest list of the game has the task
+-- and the level of every quest; the guide of the game adds the giver, the
+-- place of a quest and the level it is given at.
 local function loadGameQuests()
     local okQuests, quests = pcall(function()
         return require(ReplicatedStorage:WaitForChild("Quests", 5))
     end)
     if not okQuests or type(quests) ~= "table" then return nil end
+
     local okGuide, guide = pcall(function()
         return require(ReplicatedStorage:WaitForChild("GuideModule", 5))
     end)
-    if not okGuide or type(guide) ~= "table" then return nil end
-    local npcList = guide.Data and guide.Data.NPCList
-    if type(npcList) ~= "table" then return nil end
+    local npcList = nil
+    if okGuide and type(guide) == "table" and type(guide.Data) == "table" then
+        npcList = guide.Data.NPCList
+    end
+    if type(npcList) ~= "table" then npcList = nil end
 
-    local list = {}
-    for npcKey, npc in pairs(npcList) do
-        if type(npc) == "table" and npc.InternalQuestName and type(npc.Levels) == "table" then
-            local questSet = quests[npc.InternalQuestName]
-            -- Levels maps the id of the quest to the level it is given at.
-            for id, level in pairs(npc.Levels) do
-                local quest = questSet and questSet[id]
-                if type(quest) == "table" and type(quest.Task) == "table" then
-                    local mob, count
-                    for mobName, n in pairs(quest.Task) do
-                        if mob == nil or (type(n) == "number" and n > count) then
-                            mob, count = mobName, n
-                        end
-                    end
+    local data = {quests = {}, guide = {}, levels = {}, guideNames = {}, indexes = {}}
+
+    -- The quest list of the game: name -> id -> {LevelReq, Task}.
+    for questName, questSet in pairs(quests) do
+        if type(questSet) == "table" and not QUEST_SKIP[questName] then
+            for index, quest in pairs(questSet) do
+                if type(quest) == "table" then
+                    local mob, count = taskMob(quest.Task)
                     if mob then
-                        table.insert(list, {
-                            name = npc.InternalQuestName,
-                            index = id,
+                        local req = quest.LevelReq
+                        local level = 0
+                        if type(req) == "number" then level = req end
+                        local entry = {
+                            name = questName,
+                            index = index,
                             mob = mob,
                             count = count,
                             level = level,
-                            levelReq = quest.LevelReq,
-                            npc = npc.NPCName or npcKey,
-                            pos = npc.Position,
-                        })
+                        }
+                        table.insert(data.quests, entry)
+                        -- Only a quest with a level can be picked by it.
+                        if type(req) == "number" then
+                            table.insert(data.levels, entry)
+                        end
+                        -- Every id of the quest, also the ones without a
+                        -- level: the game can refuse one id and take another.
+                        local ids = data.indexes[questName]
+                        if not ids then
+                            ids = {}
+                            data.indexes[questName] = ids
+                        end
+                        table.insert(ids, {index = index, level = level})
                     end
                 end
             end
         end
     end
-    if #list == 0 then return nil end
-    table.sort(list, function(a, b) return (a.level or 0) < (b.level or 0) end)
-    return list
-end
+    if #data.quests == 0 then return nil end
 
--- Read the quest data of the game in the background; the bot keeps working
--- with the table in the config until it is there.
-task.spawn(function()
-    local list = loadGameQuests()
-    if list then
-        gameQuests = list
-        dbg("Game quest data: " .. #list .. " quests")
-    end
-end)
-
--- ================= QUEST =================
-local function questFor(level)
-    -- The game's own data wins over the table in the config.
-    if gameQuests and #gameQuests > 0 then
-        local best
-        for _, q in ipairs(gameQuests) do
-            if type(q.level) == "number" and q.level <= level then
-                if not best or q.level > best.level then best = q end
+    -- The guide says which giver gives which quest and at which level.
+    if npcList then
+        for npcKey, npc in pairs(npcList) do
+            if type(npc) == "table" and type(npc.InternalQuestName) == "string"
+                and type(npc.Levels) == "table" and not QUEST_SKIP[npc.InternalQuestName] then
+                local questSet = quests[npc.InternalQuestName]
+                local known = false
+                for index, level in pairs(npc.Levels) do
+                    local quest = questSet and questSet[index]
+                    if type(quest) == "table" and type(level) == "number" then
+                        local mob, count = taskMob(quest.Task)
+                        if mob then
+                            -- The quest is only good when the level of the
+                            -- quest and the level of the giver both allow it.
+                            local need = quest.LevelReq
+                            if type(need) ~= "number" or need < level then need = level end
+                            table.insert(data.guide, {
+                                name = npc.InternalQuestName,
+                                index = index,
+                                mob = mob,
+                                count = count,
+                                level = need,
+                                npc = npc.NPCName or npcKey,
+                                pos = npc.Position,
+                            })
+                            for _, id in ipairs(data.indexes[npc.InternalQuestName] or {}) do
+                                if id.index == index and id.level < need then id.level = need end
+                            end
+                            known = true
+                        end
+                    end
+                end
+                -- Only a quest the guide really gives is a known quest.
+                if known then data.guideNames[npc.InternalQuestName] = true end
             end
         end
-        if best then
-            return {name = best.name, index = best.index, mob = best.mob,
-                    pos = best.pos, npc = best.npc}
+    end
+    for _, ids in pairs(data.indexes) do
+        table.sort(ids, function(a, b) return a.index < b.index end)
+    end
+    -- The same level must always give the same quest.
+    local function byLevel(a, b)
+        if a.level ~= b.level then return a.level < b.level end
+        if a.name ~= b.name then return a.name < b.name end
+        return a.index < b.index
+    end
+    table.sort(data.levels, byLevel)
+    table.sort(data.guide, byLevel)
+    return data
+end
+
+-- ================= QUEST =================
+-- The quest of the game that fits the level best: the highest one the
+-- player may take. A quest with more than one kill is preferred, those are
+-- the normal quests.
+local function pickQuest(list, level, only)
+    local best, fallback, bestLevel, fallbackLevel
+    for _, q in ipairs(list) do
+        if type(q.level) == "number" and q.level <= level and (not only or only[q.name]) then
+            if (q.count or 0) > 1 then
+                if bestLevel == nil or q.level > bestLevel then
+                    best, bestLevel = q, q.level
+                end
+            elseif (q.count or 0) >= 1 then
+                if fallbackLevel == nil or q.level > fallbackLevel then
+                    fallback, fallbackLevel = q, q.level
+                end
+            end
         end
+    end
+    return best or fallback
+end
+
+-- The quest of the game for this level. The guide comes first: it knows
+-- which quest is really given at this level. The quest list of the game is
+-- the backup, and then only for quests the guide knows.
+local function gameQuestFor(level)
+    if gameQuestCacheAt == level then return gameQuestCache end
+    local best = nil
+    if gameGuideQuests and #gameGuideQuests > 0 then
+        best = pickQuest(gameGuideQuests, level, nil)
+        if not best and gameLevelQuests and #gameLevelQuests > 0 then
+            best = pickQuest(gameLevelQuests, level, gameGuideNames)
+        end
+    elseif gameLevelQuests and #gameLevelQuests > 0 then
+        best = pickQuest(gameLevelQuests, level, nil)
+    end
+    gameQuestCache, gameQuestCacheAt = best, level
+    return best
+end
+
+local function questFor(level)
+    -- The game's own data wins over the table in the config.
+    local best = gameQuestFor(level)
+    if best then
+        return {name = best.name, index = best.index, mob = best.mob,
+                pos = best.pos, npc = best.npc}
     end
     for _, q in ipairs(CONFIG.QuestList) do
         if level >= q[1] and level <= q[2] then
@@ -513,19 +625,44 @@ end
 
 local function questKey(q) return q.name .. "#" .. q.index end
 
+-- The other id of the same quest: the game gives a quest under more than
+-- one id and only one of them fits this level.
+local function nextQuestIndex(q, level, tried)
+    local ids = gameQuestIndexes and gameQuestIndexes[q.name]
+    if not ids or #ids == 0 then
+        -- A quest of the config has the two slots 1 and 2.
+        ids = {{index = 1, level = 0}, {index = 2, level = 0}}
+    end
+    local best, bestLevel = nil, nil
+    for _, id in ipairs(ids) do
+        if not tried[id.index] then
+            local lv = id.level or 0
+            -- An id the player is too low for is of no use.
+            if lv <= level then
+                if bestLevel == nil or lv > bestLevel then
+                    best, bestLevel = id.index, lv
+                end
+            end
+        end
+    end
+    return best
+end
+
 -- Mobs whose name contains another mob's name, used to tell "Bandit" and
 -- "Bandit Captain" apart when reading the quest panel.
 local OTHER_MOBS = {"Bandit Captain", "Desert Bandit Captain"}
 
 -- Every mob name the script knows, longest first so "Bandit Captain" is
--- always preferred over "Bandit".
-local KNOWN_MOBS = (function()
-    local list = {}
-    for _, q in ipairs(CONFIG.QuestList) do table.insert(list, q[5]) end
-    for _, m in ipairs(OTHER_MOBS) do table.insert(list, m) end
-    table.sort(list, function(a, b) return #a > #b end)
-    return list
-end)()
+-- always preferred over "Bandit". The list grows when the quest data of
+-- the game is there.
+local KNOWN_MOBS = {}
+-- The plural forms of every known mob, made once so that reading the text
+-- of the quest panel does not build them again and again.
+local KNOWN_MOB_FORMS = {}
+-- The same forms, ready for a pattern search.
+local KNOWN_MOB_PATTERNS = {}
+-- The lower case names of the known mobs, longest first.
+local KNOWN_MOB_LOWER = {}
 
 -- The plural forms a mob name can have ("Bandits", "Snowmen").
 local function pluralForms(name)
@@ -538,11 +675,50 @@ local function pluralForms(name)
     return forms
 end
 
+local function refreshKnownMobs()
+    local seen, list = {}, {}
+    local function add(name)
+        if type(name) == "string" and name ~= "" and not seen[name] then
+            seen[name] = true
+            table.insert(list, name)
+        end
+    end
+    for _, q in ipairs(CONFIG.QuestList) do add(q[5]) end
+    for _, m in ipairs(OTHER_MOBS) do add(m) end
+    for _, q in ipairs(gameQuests or {}) do add(q.mob) end
+    table.sort(list, function(a, b)
+        if #a ~= #b then return #a > #b end
+        return a < b
+    end)
+    local forms, patterns, lower = {}, {}, {}
+    for _, name in ipairs(list) do
+        local raw = pluralForms(name)
+        local escaped = {}
+        for _, variant in ipairs(raw) do
+            table.insert(escaped, (variant:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%1")))
+        end
+        forms[name] = raw
+        patterns[name] = escaped
+        table.insert(lower, name:lower())
+    end
+    KNOWN_MOBS = list
+    KNOWN_MOB_FORMS = forms
+    KNOWN_MOB_PATTERNS = patterns
+    KNOWN_MOB_LOWER = lower
+end
+refreshKnownMobs()
+
 -- Whole word search that also accepts the plural form ("Bandits").
 local function containsWord(text, word)
     local t = text:lower()
-    for _, variant in ipairs(pluralForms(word)) do
-        local escaped = variant:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%1")
+    local patterns = KNOWN_MOB_PATTERNS[word]
+    if not patterns then
+        patterns = {}
+        for _, variant in ipairs(pluralForms(word)) do
+            table.insert(patterns, (variant:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%1")))
+        end
+    end
+    for _, escaped in ipairs(patterns) do
         if t:find("%f[%w]" .. escaped .. "%f[^%w]") then return true end
     end
     return false
@@ -553,8 +729,7 @@ end
 local function isCompoundMob(name, wanted)
     local key = name:lower()
     local want = wanted:lower()
-    for _, m in ipairs(KNOWN_MOBS) do
-        local mob = m:lower()
+    for _, mob in ipairs(KNOWN_MOB_LOWER) do
         if #mob > #want and key:find(mob, 1, true) then return true end
     end
     return false
@@ -574,7 +749,7 @@ end
 local function mobAtStart(text)
     local t = text:lower():gsub("^%s+", "")
     for _, name in ipairs(KNOWN_MOBS) do
-        for _, variant in ipairs(pluralForms(name)) do
+        for _, variant in ipairs(KNOWN_MOB_FORMS[name]) do
             if t:sub(1, #variant) == variant then
                 local rest = t:sub(#variant + 1)
                 if rest == "" or rest:match("^[%s,%.%+]") then return name end
@@ -588,7 +763,7 @@ end
 local function mobAtEnd(text)
     local t = text:lower():gsub("[%s,%.%+:]+$", "")
     for _, name in ipairs(KNOWN_MOBS) do
-        for _, variant in ipairs(pluralForms(name)) do
+        for _, variant in ipairs(KNOWN_MOB_FORMS[name]) do
             if #t >= #variant and t:sub(-#variant) == variant then
                 local before = t:sub(1, #t - #variant)
                 if before == "" or before:match("[%s,%.%+]$") then return name end
@@ -597,6 +772,27 @@ local function mobAtEnd(text)
     end
     return nil
 end
+
+-- Read the quest data of the game in the background; the bot keeps working
+-- with the table in the config until it is there.
+task.spawn(function()
+    local data = loadGameQuests()
+    if data then
+        gameQuests = data.quests
+        gameGuideQuests = data.guide
+        gameLevelQuests = data.levels
+        gameGuideNames = data.guideNames
+        gameQuestIndexes = data.indexes
+        gameQuestCache, gameQuestCacheAt = nil, nil
+        -- The ids of the quests come from the game now, the old tries are
+        -- of no use.
+        state.questTried = {}
+        state.questTryKey = nil
+        state.questIndexTry = nil
+        refreshKnownMobs()
+        dbg("Game quest data: " .. #gameQuests .. " quests")
+    end
+end)
 
 -- Words that join two mob names; the name after them belongs to the next
 -- fraction, not to this one.
@@ -666,6 +862,10 @@ local function hookQuestRemote()
                 state.questAsked = nil
                 state.questVerified = false
                 state.questGaveUp = false
+                state.questTried = {}
+                state.questTryKey = nil
+                state.questIndexTry = nil
+                state.questNpc = nil
                 dbg("Quest cleared by the game")
                 return
             end
@@ -676,6 +876,9 @@ local function hookQuestRemote()
             -- The game answered: this is the quest we really have.
             state.questVerified = true
             state.questGaveUp = false
+            -- The quest is taken: the ids we tried are of no use now.
+            state.questTried = {}
+            state.questIndexTry = nil
             if state.questAsked and data.InternalQuestName ~= state.questAsked then
                 dbg("The game gave us " .. tostring(data.InternalQuestName)
                     .. " instead of " .. tostring(state.questAsked))
@@ -905,13 +1108,24 @@ local function tryAcceptQuest(info)
         return
     end
 
+    -- A new quest needs a fresh set of ids to try. The level is part of the
+    -- key: a new level means a new quest.
+    local key = questKey(q) .. "@" .. tostring(getMyLevel())
+    if state.questTryKey ~= key then
+        state.questTryKey = key
+        state.questTried = {}
+        state.questIndexTry = nil
+        state.questGaveUp = false
+    end
+
     -- We asked for a quest and the game never answered: it did not take it.
-    -- Try the other index of the same quest before walking to a giver.
+    -- Try another id of the same quest before walking to a giver.
     if state.questAsked and not state.questVerified then
         if now - state.questAskedAt < 6 then return end
-        if state.questIndexTry == q.index then
-            dbg("The game did not take " .. state.questAsked .. " #" .. q.index)
-            state.questIndexTry = (q.index == 1) and 2 or 1
+        local nextIndex = nextQuestIndex(q, getMyLevel(), state.questTried)
+        if nextIndex then
+            dbg("The game did not take " .. state.questAsked .. " #" .. tostring(state.questIndexTry))
+            state.questIndexTry = nextIndex
             state.currentQuest = nil
             state.questAskedAt = now
         else
@@ -929,7 +1143,7 @@ local function tryAcceptQuest(info)
 
     -- The quest is asked for right here: walking to the giver first only
     -- wastes time, the game takes the quest from anywhere.
-    -- The index is the slot of the quest at this level (1 or 2).
+    -- The index is the id the game gave to this quest at this level.
     local index = state.questIndexTry or q.index
 
     -- The game wants to know where we respawn before it gives the quest.
@@ -940,12 +1154,14 @@ local function tryAcceptQuest(info)
         pcall(function() commF:InvokeServer("AbandonQuest") end)
     end
     local ok, err = pcall(function() commF:InvokeServer("StartQuest", q.name, index) end)
-    state.currentQuest = questKey(q)
+    state.currentQuest = q.name .. "#" .. tostring(index)
     state.questSentAt = tick() -- measured after the call, not before
     state.questAsked = q.name
+    state.questNpc = q.npc
     state.questAskedAt = tick()
     state.questVerified = false
     state.questIndexTry = index
+    state.questTried[index] = true
     if ok then
         dbg("Quest sent: " .. q.name .. " #" .. index)
     else
@@ -983,15 +1199,25 @@ end
 
 -- The giver for this mob; "Bandit" must not pick the "Bandit Captain" giver.
 -- With a mob name only a giver for that mob is used, never a random one.
-local function pickQuestGiver(mobName)
+-- The name of the giver from the guide of the game is used first.
+local function pickQuestGiver(mobName, npcName)
     local root = getRoot()
     if not root then return nil end
-    local best, bestD, exact, exactD = nil, math.huge, nil, math.huge
+    local best, bestD, exact, exactD, named, namedD = nil, math.huge, nil, math.huge, nil, math.huge
     for _, npc in ipairs(questGivers()) do
         local anchor = anchorOf(npc)
         if anchor then
             local d = (root.Position - anchor.Position).Magnitude
             local n = npc.Name:lower()
+            -- The guide of the game names the giver ("Pirate Giver"); the
+            -- model of the game has the name in it ("Pirate Quest Giver").
+            if npcName then
+                local fits = true
+                for word in npcName:lower():gmatch("%a+") do
+                    if not n:find(word, 1, true) then fits = false break end
+                end
+                if fits and d < namedD then named, namedD = npc, d end
+            end
             if mobName then
                 if containsWord(n, mobName) and not isCompoundMob(n, mobName) then
                     if d < exactD then exact, exactD = npc, d end
@@ -1001,7 +1227,7 @@ local function pickQuestGiver(mobName)
             end
         end
     end
-    return exact or best
+    return named or exact or best
 end
 
 -- The npc that keeps the fruit storage. Used when the fruit menu of the
@@ -1936,7 +2162,9 @@ local function step()
             dbg("No quest giver answered, farming instead")
             state.seekGaveUp, state.seekGaveUpAt = true, now
         else
-            local giver = pickQuestGiver(nil)
+            -- The guide of the game knows the giver of the quest the game
+            -- did not take.
+            local giver = pickQuestGiver(nil, state.questGaveUp and state.questNpc or nil)
             local prompt = giver and promptOf(giver)
             local anchor = (prompt and anchorOf(prompt.Parent)) or (giver and anchorOf(giver))
             if anchor then
