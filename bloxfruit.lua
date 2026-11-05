@@ -95,6 +95,10 @@ local state = {
     lastPrompt    = nil,
     promptAt      = 0,
     turnInSince   = nil,
+    -- A quest that is finished but not handed in yet. The panel of the game
+    -- can disappear, and a new quest would wipe the finished one.
+    questDone     = false,
+    questDoneMob  = nil,
     turnInFailed  = false,
     turnInFailedAt = 0,
     seekSince     = nil,
@@ -626,6 +630,10 @@ local function tryAcceptQuest(info)
     local now = tick()
     if now - state.lastQuestTry < 2 then return end
     state.lastQuestTry = now
+
+    -- A quest that is finished but not handed in must not be replaced: the
+    -- game would drop the progress we just made.
+    if state.questDone then return end
 
     -- A running quest is confirmed by the panel; leave it alone.
     if info and info.confirmed then return end
@@ -1457,6 +1465,19 @@ local function step()
     -- The panel knows the real quest, its progress and whether it is done.
     local info = CONFIG.AutoQuest and questPanelInfo() or nil
 
+    -- Remember a finished quest. The panel of the game hides itself once the
+    -- quest is done, and without this the bot would ask for a new quest and
+    -- throw the finished one away.
+    if info then
+        if info.complete then
+            state.questDone = true
+            state.questDoneMob = info.mentioned or info.target
+        elseif info.confirmed then
+            state.questDone = false
+            state.questDoneMob = nil
+        end
+    end
+
     -- Put the fruits we carry into the game storage. The menu of the game
     -- does the real work, the storage npc is the fallback.
     if CONFIG.AutoStore and now - (state.storeAt or 0) > 5 then
@@ -1506,13 +1527,17 @@ local function step()
         end
     end
 
-    if info and info.complete and CONFIG.QuestTurnIn then
+    local pendingTurnIn = (info and info.complete) or state.questDone
+    if pendingTurnIn and CONFIG.QuestTurnIn then
         -- Try again later, but never sit at the giver forever.
         if state.turnInFailed and now - state.turnInFailedAt > CONFIG.TurnInTimeout then
             state.turnInFailed, state.turnInSince = false, now
+            -- the giver never answered: do not stay stuck on the old quest
+            state.questDone = false
+            state.questDoneMob = nil
         end
         if not state.turnInFailed then
-            local giver = pickQuestGiver(info.mentioned)
+            local giver = pickQuestGiver((info and info.mentioned) or state.questDoneMob)
             local prompt = giver and promptOf(giver)
             local anchor = (prompt and anchorOf(prompt.Parent)) or (giver and anchorOf(giver))
             if anchor and prompt then
