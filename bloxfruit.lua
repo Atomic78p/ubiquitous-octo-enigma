@@ -41,7 +41,8 @@ local CONFIG = {
     AutoStatTarget  = "Melee", -- Melee | Sword | Gun | Fruit | Defense | All
     AutoStatWait    = 3,       -- seconds between two stat upgrades
     SpawnBypass     = false,   -- respawn on the island of the quest giver
-    BypassDistance  = 2000,    -- how far the quest giver has to be for a jump
+    BypassDistance  = 2500,    -- how far the quest giver has to be for a jump
+    FastPortal      = true,    -- try the door of the game before the spawn reset
     TravelWorld     = 1,       -- world for the travel button
     BigHitbox       = true,    -- make the mob hitbox bigger
     HitboxSize      = 16,
@@ -2328,15 +2329,12 @@ local function spawnNear(position)
     return best
 end
 
--- The jump itself: the game saves the spawn point of the island and the
--- character dies, so the player comes back there.
-local function jumpToIsland(position)
-    if tick() - islandSpawnsAt > 30 then loadIslandSpawns() end
-    local name = spawnNear(position)
-    if not name then
-        dbg("No spawn point found for that place")
-        return false
-    end
+-- The fast bypass: the game gets a new spawn point and the character dies,
+-- so the player comes back on that island right away. This is the way the
+-- big scripts cross the sea without waiting for a slow tween.
+local function fastBypassToIsland(spawnName)
+    local hum = getHumanoid()
+    if not hum then return false end
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if not commF then return false end
@@ -2344,32 +2342,34 @@ local function jumpToIsland(position)
     local marker = char and char:FindFirstChild("LastSpawnPoint")
     -- The game must not send us back while the new point is saved.
     if marker then pcall(function() marker.Disabled = true end) end
-    local ok = pcall(function() commF:InvokeServer("SetLastSpawnPoint", name) end)
+    -- 1. the game gets the new spawn point
+    local ok = pcall(function() commF:InvokeServer("SetLastSpawnPoint", spawnName) end)
     if not ok then
         if marker then pcall(function() marker.Disabled = false end) end
         return false
     end
-    -- The game has to take the new spawn point first. Without the value of
-    -- the game the jump is not safe, so it is given up then.
-    local deadline = tick() + 5
+    dbg("Set spawn point to: " .. tostring(spawnName))
+    -- 2. the game has to take the new spawn point. A short moment is
+    -- enough. When the game does not tell us the spawn point at all, the
+    -- command is trusted: the game takes it before the character dies.
+    local deadline = tick() + 1.5
     local taken = false
     while tick() < deadline do
         local current = valueOf(dataValue("LastSpawnPoint"))
-        if current == name then
+        if current == nil or current == spawnName then
             taken = true
             break
         end
-        task.wait(0.1)
+        task.wait(0.05)
     end
     if not taken then
-        dbg("The game did not take the spawn point " .. tostring(name))
+        dbg("The game did not take the spawn point " .. tostring(spawnName))
         if marker then pcall(function() marker.Disabled = false end) end
         return false
     end
-    -- Die on purpose: the game brings the player back to the spawn point.
-    local hum = getHumanoid()
-    if hum then hum.Health = 0 end
-    -- Wait for the new character.
+    -- 3. die on purpose: the game brings the player back to that point
+    hum.Health = 0
+    -- 4. wait for the new character
     deadline = tick() + 15
     while tick() < deadline do
         local alive = getHumanoid()
@@ -2377,7 +2377,7 @@ local function jumpToIsland(position)
         task.wait(0.2)
     end
     if marker then pcall(function() marker.Disabled = false end) end
-    dbg("Back at " .. tostring(name))
+    dbg("Back at " .. tostring(spawnName))
     return true
 end
 
@@ -2387,13 +2387,137 @@ local function spawnBypassTo(position)
     if not (position and position.X and position.Y and position.Z) then return false end
     if state.bypassBusy then return false end
     state.bypassBusy = true
-    local ok, result = pcall(jumpToIsland, position)
+    local ok, result = pcall(function()
+        if tick() - islandSpawnsAt > 30 then loadIslandSpawns() end
+        local name = spawnNear(position)
+        if not name then
+            dbg("No spawn point found for that place")
+            return false
+        end
+        return fastBypassToIsland(name)
+    end)
     state.bypassBusy = false
     if not ok then
         dbg("The jump to the island failed: " .. tostring(result))
         return false
     end
     return result
+end
+
+-- The islands of the game. The game keeps them in the map of the world and
+-- in the places of the world itself.
+local function islandPositions()
+    local list = {}
+    local known = {}
+    local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
+    if ok and type(map) == "table" then
+        for name, pos in pairs(map) do
+            if pos and pos.X and pos.Y and pos.Z then
+                table.insert(list, {name = tostring(name), pos = pos})
+                known[tostring(name)] = true
+            end
+        end
+    end
+    local origin = Workspace:FindFirstChild("_WorldOrigin")
+    local locations = origin and origin:FindFirstChild("Locations")
+    if locations then
+        for _, island in ipairs(locations:GetChildren()) do
+            if island:IsA("BasePart") and not known[island.Name] then
+                table.insert(list, {name = island.Name, pos = island.Position})
+                known[island.Name] = true
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.name < b.name end)
+    return list
+end
+
+-- Cross a door with the remote of the game. The player has to stand at the
+-- door, then the game sends it to the other side. This is the second way
+-- the big scripts cross the sea.
+local function portalBypass(targetPos)
+    local root = getRoot()
+    if not root then return false end
+    -- the doors of the game: models with a prompt that says so
+    local door, bestD = nil, 800
+    local function scan(container, depth)
+        if depth > 2 then return end
+        for _, obj in ipairs(container:GetChildren()) do
+            local prompt = obj:FindFirstChildOfClass("ProximityPrompt")
+            local text = ""
+            if prompt then
+                text = ((prompt.ActionText or "") .. " " .. (prompt.ObjectText or "") .. " " .. obj.Name):lower()
+            end
+            if prompt and (text:find("door", 1, true) or text:find("gate", 1, true)
+                or text:find("entrance", 1, true) or text:find("portal", 1, true)
+                or text:find("teleport", 1, true)) then
+                local anchor = anchorOf(obj)
+                if anchor then
+                    local d = (root.Position - anchor.Position).Magnitude
+                    if d < bestD then door, bestD = anchor, d end
+                end
+            elseif obj:IsA("Model") or obj:IsA("Folder") then
+                scan(obj, depth + 1)
+            end
+        end
+    end
+    scan(Workspace, 0)
+    local npcs = Workspace:FindFirstChild("NPCs")
+    if npcs then scan(npcs, 0) end
+    if not door then return false end
+
+    -- stand at the door
+    local before = (root.Position - targetPos).Magnitude
+    if (root.Position - door.Position).Magnitude > 12 then
+        moveTo(CFrame.new(door.Position + Vector3.new(0, 3, 0)))
+        local deadline = tick() + 10
+        while tick() < deadline do
+            local now = getRoot()
+            if not now then break end
+            if (now.Position - door.Position).Magnitude <= 12 then break end
+            task.wait(0.2)
+        end
+    end
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local commF = remotes and remotes:FindFirstChild("CommF_")
+    if not commF then return false end
+    local ok = pcall(function() commF:InvokeServer("requestEntrance", door.Position) end)
+    if not ok then return false end
+    -- the game moves the player: give it a moment
+    local deadline = tick() + 2
+    while tick() < deadline do
+        local now = getRoot()
+        if now and (now.Position - targetPos).Magnitude < before - 50 then return true end
+        task.wait(0.2)
+    end
+    return false
+end
+
+-- Travel to a place. A long way is too slow with a tween, so the game is
+-- asked to put the player on that island instead.
+local function travelTo(cf)
+    local root = getRoot()
+    if not root then return false end
+    local dist = (root.Position - cf.Position).Magnitude
+    if CONFIG.SpawnBypass and dist > (CONFIG.BypassDistance or 2500) then
+        if tick() - islandSpawnsAt > 30 then loadIslandSpawns() end
+        local name = spawnNear(cf.Position)
+        if name then
+            dbg("Far away (" .. tostring(math.floor(dist)) .. " studs): fast bypass")
+            -- The bypass runs in the background: the main loop keeps going.
+            if not state.bypassBusy then
+                state.bypassBusy = true
+                task.spawn(function()
+                    local ok, err = pcall(fastBypassToIsland, name)
+                    state.bypassBusy = false
+                    if not ok then dbg("The bypass failed: " .. tostring(err)) end
+                end)
+            end
+            return true
+        end
+    end
+    moveTo(cf)
+    return false
 end
 
 -- ================= MAIN LOOP =================
@@ -2497,7 +2621,7 @@ local function step()
                 local anchor = (prompt and anchorOf(prompt.Parent)) or (npc and anchorOf(npc))
                 if anchor and prompt then
                     state.status = "Storing fruit"
-                    moveTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                    travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
                     interactWith(npc, prompt)
                     task.wait(0.5)
                     -- The npc opens the storage window: put the fruits in it.
@@ -2538,7 +2662,7 @@ local function step()
                 if state.turnInSince == nil then state.turnInSince = now end
                 if now - state.turnInSince <= CONFIG.TurnInTimeout then
                     state.status = "Turning in quest"
-                    moveTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                    travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
                     interactWith(giver, prompt)
                     return
                 end
@@ -2594,7 +2718,7 @@ local function step()
                     end
                 end
                 state.status = "Looking for a quest"
-                moveTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
                 interactWith(giver, prompt)
                 return
             end
@@ -2623,7 +2747,7 @@ local function step()
         local anchor = sp and anchorOf(sp)
         if anchor then
             state.status = "Travelling to " .. (mob or "mobs")
-            moveTo(anchor.CFrame + Vector3.new(0, CONFIG.HoverHeight, 0))
+            travelTo(anchor.CFrame + Vector3.new(0, CONFIG.HoverHeight, 0))
         else
             state.status = "No targets"
         end
@@ -2723,7 +2847,9 @@ local function step()
     -- passes over it.
     local top = swingAnchor.Position.Y + (swingAnchor.Size and swingAnchor.Size.Y or 0) / 2
     hoverPos = Vector3.new(hoverPos.X, math.max(hoverPos.Y, top - 1), hoverPos.Z)
-    moveTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0))
+    -- A mob far away is crossed with the bypass of the game, not with a
+    -- slow tween over the sea.
+    if travelTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0)) then return end
 
     local sx = root.Position.X - swingAnchor.Position.X
     local sz = root.Position.Z - swingAnchor.Position.Z
@@ -2846,21 +2972,76 @@ minBtn.Text = "—"; minBtn.TextColor3 = THEME.text
 minBtn.Font = THEME.fontBold; minBtn.TextSize = 12
 minBtn.AutoButtonColor = false; minBtn.Parent = titleBar; corner(minBtn, 6)
 
-local content = Instance.new("ScrollingFrame")
-content.Size = UDim2.new(1, -16, 1, -120)
-content.Position = UDim2.new(0, 8, 0, 42)
+-- The tabs of the panel. Every tab has its own page, so the rows stay big
+-- and easy to tap instead of one long list.
+local TABS = {"HOME", "MOVE", "FIGHT", "STATS", "TRAVEL"}
+
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -16, 1, -152)
+content.Position = UDim2.new(0, 8, 0, 72)
 content.BackgroundTransparency = 1
 content.BorderSizePixel = 0
-content.ScrollBarThickness = 4
-content.ScrollBarImageColor3 = THEME.accent
-content.CanvasSize = UDim2.new(0, 0, 0, 0)
-content.AutomaticCanvasSize = Enum.AutomaticSize.Y
 content.Parent = main
 
-local layout = Instance.new("UIListLayout")
-layout.Padding = UDim.new(0, 6)
-layout.SortOrder = Enum.SortOrder.LayoutOrder
-layout.Parent = content
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -16, 0, 28)
+tabBar.Position = UDim2.new(0, 8, 0, 40)
+tabBar.BackgroundTransparency = 1
+tabBar.BorderSizePixel = 0
+tabBar.Parent = main
+
+local pages = {}
+local page -- the page the new rows go into
+local tabButtons = {}
+
+local function newPage(name)
+    local p = Instance.new("ScrollingFrame")
+    p.Name = "Page_" .. name
+    p.Size = UDim2.new(1, 0, 1, 0)
+    p.BackgroundTransparency = 1
+    p.BorderSizePixel = 0
+    p.ScrollBarThickness = 4
+    p.ScrollBarImageColor3 = THEME.accent
+    p.CanvasSize = UDim2.new(0, 0, 0, 0)
+    p.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    p.Visible = false
+    p.Parent = content
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, 6)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Parent = p
+    pages[name] = p
+    return p
+end
+
+-- Show one tab and hide the others.
+local function showTab(index)
+    for i, name in ipairs(TABS) do
+        pages[name].Visible = (i == index)
+        local b = tabButtons[i]
+        if b then
+            b.BackgroundColor3 = (i == index) and THEME.accent or THEME.panel
+            b.TextColor3 = (i == index) and THEME.bg or THEME.subtext
+        end
+    end
+    page = pages[TABS[index]]
+end
+
+for i, name in ipairs(TABS) do
+    local b = Instance.new("TextButton")
+    b.Name = "Tab_" .. name
+    b.Size = UDim2.new(1/#TABS, -4, 1, 0)
+    b.Position = UDim2.new((i-1)/#TABS, 0, 0, 0)
+    b.BackgroundColor3 = THEME.panel
+    b.Text = name; b.TextColor3 = THEME.subtext
+    b.Font = THEME.fontBold; b.TextSize = 11
+    b.AutoButtonColor = false; b.Parent = tabBar
+    corner(b, 6); stroke(b)
+    b.MouseButton1Click:Connect(function() showTab(i) end)
+    tabButtons[i] = b
+    newPage(name)
+end
+showTab(1)
 
 local expandedH, collapsedH = 540, 34
 local minimized = false
@@ -2870,6 +3051,7 @@ minBtn.MouseButton1Click:Connect(function()
         Size = minimized and UDim2.new(0,320,0,collapsedH) or UDim2.new(0,320,0,expandedH)
     }):Play()
     content.Visible = not minimized
+    tabBar.Visible = not minimized
 end)
 
 -- ===== BUILDERS =====
@@ -2880,8 +3062,8 @@ local function makeHeader(text)
     h.Text = text; h.TextColor3 = THEME.subtext
     h.Font = THEME.fontBold; h.TextSize = 10
     h.TextXAlignment = Enum.TextXAlignment.Left
-    h.LayoutOrder = #content:GetChildren()
-    h.Parent = content
+    h.LayoutOrder = #page:GetChildren()
+    h.Parent = page
 end
 
 local function makeHint(text)
@@ -2891,14 +3073,14 @@ local function makeHint(text)
     h.Text = text; h.TextColor3 = THEME.subtext
     h.Font = THEME.font; h.TextSize = 10
     h.TextXAlignment = Enum.TextXAlignment.Left
-    h.LayoutOrder = #content:GetChildren()
-    h.Parent = content
+    h.LayoutOrder = #page:GetChildren()
+    h.Parent = page
 end
 
 local function makeToggle(text, default, cb)
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1,0,0,32); row.BackgroundTransparency = 1
-    row.LayoutOrder = #content:GetChildren(); row.Parent = content
+    row.LayoutOrder = #page:GetChildren(); row.Parent = page
 
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1,-60,1,0); label.BackgroundTransparency = 1
@@ -2940,7 +3122,7 @@ end
 local function makeSlider(text, mn, mx, def, fmt, cb)
     local container = Instance.new("Frame")
     container.Size = UDim2.new(1,0,0,46); container.BackgroundTransparency = 1
-    container.LayoutOrder = #content:GetChildren(); container.Parent = content
+    container.LayoutOrder = #page:GetChildren(); container.Parent = page
 
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1,-60,0,16); label.BackgroundTransparency = 1
@@ -3004,7 +3186,7 @@ end
 local function makeSegment(text, options, default, cb)
     local c = Instance.new("Frame")
     c.Size = UDim2.new(1,0,0,58); c.BackgroundTransparency = 1
-    c.LayoutOrder = #content:GetChildren(); c.Parent = content
+    c.LayoutOrder = #page:GetChildren(); c.Parent = page
 
     local label = Instance.new("TextButton")
     label.Size = UDim2.new(1,0,0,16); label.BackgroundTransparency = 1
@@ -3095,7 +3277,7 @@ end
 local function makeButton(text, cb)
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1,0,0,32); row.BackgroundTransparency = 1
-    row.LayoutOrder = #content:GetChildren(); row.Parent = content
+    row.LayoutOrder = #page:GetChildren(); row.Parent = page
 
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1,0,0,26); btn.Position = UDim2.new(0,0,0,3)
@@ -3120,6 +3302,9 @@ local function makeButton(text, cb)
 end
 
 -- ===== BUILD =====
+-- The tabs are built one after the other: the rows of a tab go into the
+-- page of that tab.
+showTab(1) -- HOME
 makeHeader("MODULES")
 setBotEnabled = makeToggle("Bot Enabled", state.enabled, function(v)
     state.enabled = v
@@ -3140,6 +3325,14 @@ makeToggle("Anti-AFK",      CONFIG.AntiAfk,      function(v) CONFIG.AntiAfk     
 local setDebug = makeToggle("Debug Output (F9)", CONFIG.Debug, function(v) CONFIG.Debug = v end)
 makeHint("✕ stops the bot  •  RightShift shows/hides this panel")
 
+makeHeader("FRUIT")
+makeToggle("Auto Store", CONFIG.AutoStore, function(v) CONFIG.AutoStore = v end)
+makeSlider("Store From", 1, 10, CONFIG.StoreFruitMin,
+    function(v) return v.." fruits" end, function(v) CONFIG.StoreFruitMin = v end)
+makeSlider("Scan Radius", 500, 10000, CONFIG.FruitScanRadius,
+    function(v) return tostring(v) end, function(v) CONFIG.FruitScanRadius = v end)
+
+showTab(2) -- MOVE
 makeHeader("MOVEMENT")
 makeSegment("Mode", {"Walk","Tween","Teleport"}, CONFIG.MovementMode,
     function(v) CONFIG.MovementMode = v end)
@@ -3150,6 +3343,12 @@ makeSlider("Hover Height", 0, 30, CONFIG.HoverHeight,
 makeSlider("Void Guard Y", -1000, -50, CONFIG.SafeY,
     function(v) return tostring(v).." studs" end, function(v) CONFIG.SafeY = v end)
 
+makeHeader("BRING MOB")
+makeToggle("Bring Mob", CONFIG.BringMob, function(v) CONFIG.BringMob = v end)
+makeSlider("Bring Mob Count", 1, 6, CONFIG.BringMobCount,
+    function(v) return v.." mobs" end, function(v) CONFIG.BringMobCount = v end)
+
+showTab(3) -- FIGHT
 makeHeader("COMBAT")
 makeSegment("Weapon", {"Melee", "Sword", "Fruit", "Gun"}, CONFIG.WeaponMode,
     function(v) CONFIG.WeaponMode = v end)
@@ -3157,9 +3356,6 @@ makeToggle("Auto Attack", CONFIG.AutoAttack, function(v) CONFIG.AutoAttack = v e
 makeToggle("Fast Attack", CONFIG.FastAttack, function(v) CONFIG.FastAttack = v end)
 makeToggle("Remote Attack", CONFIG.RemoteAttack, function(v) CONFIG.RemoteAttack = v end)
 makeToggle("Big Hitbox", CONFIG.BigHitbox, function(v) CONFIG.BigHitbox = v end)
-makeToggle("Bring Mob", CONFIG.BringMob, function(v) CONFIG.BringMob = v end)
-makeSlider("Bring Mob Count", 1, 6, CONFIG.BringMobCount,
-    function(v) return v.." mobs" end, function(v) CONFIG.BringMobCount = v end)
 makeSlider("Hitbox Size", 4, 40, CONFIG.HitboxSize,
     function(v) return tostring(v) end, function(v) CONFIG.HitboxSize = v end)
 makeSlider("Swing Reach", 0, 200, CONFIG.HitboxMagnitude,
@@ -3174,6 +3370,7 @@ makeSlider("Attack Cooldown", 5, 100, math.floor(CONFIG.AttackCooldown*100),
     function(v) return string.format("%.2fs", v/100) end,
     function(v) CONFIG.AttackCooldown = v/100 end)
 
+showTab(4) -- STATS
 makeHeader("STATS")
 makeToggle("Auto Stats", CONFIG.AutoStats, function(v) CONFIG.AutoStats = v end)
 makeSegment("Stat", {"Melee","Sword","Gun","Fruit","Defense","All"}, CONFIG.AutoStatTarget,
@@ -3181,10 +3378,17 @@ makeSegment("Stat", {"Melee","Sword","Gun","Fruit","Defense","All"}, CONFIG.Auto
 makeSlider("Stat Wait", 1, 15, CONFIG.AutoStatWait,
     function(v) return v.."s" end, function(v) CONFIG.AutoStatWait = v end)
 
-makeHeader("TRAVEL")
+showTab(5) -- TRAVEL
+makeHeader("WORLD")
 makeSegment("World", {"1","2","3"}, tostring(CONFIG.TravelWorld),
     function(v) CONFIG.TravelWorld = tonumber(v) end)
 makeButton("Travel To World", function() travelToWorld(CONFIG.TravelWorld) end)
+
+makeHeader("FAST TRAVEL")
+makeToggle("Spawn Bypass", CONFIG.SpawnBypass, function(v) CONFIG.SpawnBypass = v end)
+makeToggle("Fast Portal", CONFIG.FastPortal, function(v) CONFIG.FastPortal = v end)
+makeSlider("Bypass Distance", 500, 5000, CONFIG.BypassDistance,
+    function(v) return v.." studs" end, function(v) CONFIG.BypassDistance = v end)
 makeButton("Go To Quest Island", function()
     -- The island of the quest we have, or the one the game would give us.
     local pos = state.questPos
@@ -3195,14 +3399,26 @@ makeButton("Go To Quest Island", function()
     if not pos then dbg("No island known for this quest"); return end
     task.spawn(function() spawnBypassTo(pos) end)
 end)
-makeToggle("Spawn Bypass", CONFIG.SpawnBypass, function(v) CONFIG.SpawnBypass = v end)
+makeHint("A long way is crossed with the spawn point of the island")
 
-makeHeader("FRUIT")
-makeToggle("Auto Store", CONFIG.AutoStore, function(v) CONFIG.AutoStore = v end)
-makeSlider("Store From", 1, 10, CONFIG.StoreFruitMin,
-    function(v) return v.." fruits" end, function(v) CONFIG.StoreFruitMin = v end)
-makeSlider("Scan Radius", 500, 10000, CONFIG.FruitScanRadius,
-    function(v) return tostring(v) end, function(v) CONFIG.FruitScanRadius = v end)
+makeHeader("ISLANDS")
+-- The islands the game knows: one button for every one of them.
+for _, island in ipairs(islandPositions()) do
+    local name = island.name
+    makeButton("Go: " .. name, function()
+        task.spawn(function()
+            -- The door of the game first, the spawn point as the fallback.
+            if not (CONFIG.FastPortal and portalBypass(island.pos)) then
+                spawnBypassTo(island.pos)
+            end
+        end)
+    end)
+end
+if #islandPositions() == 0 then
+    makeHint("The game has not told the islands yet")
+end
+
+showTab(1) -- back to the first tab
 
 -- Footer
 local footer = Instance.new("Frame")
