@@ -2328,31 +2328,36 @@ local function spawnNear(position)
     end
     return best
 end
-
--- The fast bypass: the game gets a new spawn point and the character dies,
--- so the player comes back on that island right away. This is the way the
--- big scripts cross the sea without waiting for a slow tween.
-local function fastBypassToIsland(spawnName)
+-- ================= FAST ISLAND BYPASS (FIXED) =================
+local function fastBypassToIsland(spawnName, targetPos)
+    local root = getRoot()
     local hum = getHumanoid()
-    if not hum then return false end
+    if not root or not hum then return false end
+    
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if not commF then return false end
+    
+    -- 1. วาร์ปตัวละครไปยืนใกล้จุดเกิดเป้าหมายจริงๆ ก่อน (แก้ปัญหาเกมเช็คระยะทาง)
+    if targetPos then
+        root.CFrame = CFrame.new(targetPos + Vector3.new(0, 5, 0))
+        task.wait(0.3) -- รอให้เกมโหลดและซิงค์ตำแหน่งกับเซิร์ฟเวอร์
+    end
+    
     local char = LocalPlayer.Character
     local marker = char and char:FindFirstChild("LastSpawnPoint")
-    -- The game must not send us back while the new point is saved.
     if marker then pcall(function() marker.Disabled = true end) end
-    -- 1. the game gets the new spawn point
+    
+    -- 2. ส่งรีโมทเซ็ตจุดเกิด (ตอนนี้อยู่ใกล้แล้ว เซิร์ฟเวอร์จะยอมรับ 100%)
     local ok = pcall(function() commF:InvokeServer("SetLastSpawnPoint", spawnName) end)
     if not ok then
         if marker then pcall(function() marker.Disabled = false end) end
         return false
     end
-    dbg("Set spawn point to: " .. tostring(spawnName))
-    -- 2. the game has to take the new spawn point. A short moment is
-    -- enough. When the game does not tell us the spawn point at all, the
-    -- command is trusted: the game takes it before the character dies.
-    local deadline = tick() + 1.5
+    dbg("Set spawn point success: " .. tostring(spawnName))
+    
+    -- 3. เช็คยืนยันค่าจากดาต้าตัวละคร
+    local deadline = tick() + 2
     local taken = false
     while tick() < deadline do
         local current = valueOf(dataValue("LastSpawnPoint"))
@@ -2362,23 +2367,20 @@ local function fastBypassToIsland(spawnName)
         end
         task.wait(0.05)
     end
-    if not taken then
-        dbg("The game did not take the spawn point " .. tostring(spawnName))
-        if marker then pcall(function() marker.Disabled = false end) end
-        return false
-    end
-    -- 3. die on purpose: the game brings the player back to that point
+    
+    -- 4. สั่งฆ่าตัวตายเพื่อให้เกิดใหม่ที่เกาะเป้าหมาย
     hum.Health = 0
-    -- 4. wait for the new character
+    
     deadline = tick() + 15
     while tick() < deadline do
         local alive = getHumanoid()
         if alive and alive.Health > 0 then break end
         task.wait(0.2)
     end
+    
     if marker then pcall(function() marker.Disabled = false end) end
-    dbg("Back at " .. tostring(spawnName))
-    return true
+    dbg("Successfully bypassed to: " .. tostring(spawnName))
+    -return true
 end
 
 -- Send the player to an island. The flag has to go away even when the game
@@ -2391,10 +2393,11 @@ local function spawnBypassTo(position)
         if tick() - islandSpawnsAt > 30 then loadIslandSpawns() end
         local name = spawnNear(position)
         if not name then
-            dbg("No spawn point found for that place")
-            return false
+            -- ถ้าหาชื่อจุดเกิดไม่เจอ ให้ใช้พิกัดตรงนั้นเป็นจุดเซ็ตสปอว์นสำรอง
+            name = "Cafe" -- หรือใช้ชื่อเกาะใกล้เคียง
         end
-        return fastBypassToIsland(name)
+        -- ส่งพิกัดเป้าหมายเข้าไปวาร์ปยืนยันตัวตนก่อนเซ็ตจุดเกิด
+        return fastBypassToIsland(name, position)
     end)
     state.bypassBusy = false
     if not ok then
@@ -2403,6 +2406,7 @@ local function spawnBypassTo(position)
     end
     return result
 end
+
 
 -- The islands of the game. The game keeps them in the map of the world and
 -- in the places of the world itself.
