@@ -31,7 +31,7 @@ local CONFIG = {
     MeleeHover      = 4,
     BringMob        = true,
     BringMobRange   = 35,
-    BringMobCount   = 2,
+    BringMobCount   = 0,
     BringMobSearch  = 200,
     AutoStats       = false,
     AutoStatTarget  = "Melee",
@@ -1277,10 +1277,10 @@ local function bringMob(target, root)
         end
     end
     for mob, at in pairs(state.bringMoved) do
-        if now - at > 2.5 then
+        if now - at > 5 then
             state.bringMoved[mob] = nil
             local part = anchorOf(mob)
-            if part and (part.Position - root.Position).Magnitude > CONFIG.BringMobRange * 2 then
+            if part and (part.Position - root.Position).Magnitude > CONFIG.BringMobRange * 3 then
                 state.bringIgnored[mob] = now
                 if not mob:FindFirstChild("Ignored") then
                     Instance.new("IntValue", mob).Name = "Ignored"
@@ -1293,7 +1293,7 @@ local function bringMob(target, root)
     local dz = root.Position.Z - anchor.Position.Z
     if math.sqrt(dx * dx + dz * dz) > CONFIG.BringMobRange then return end
     if now < (state.bringAt or 0) then return end
-    state.bringAt = now + 0.2
+    state.bringAt = now + 0.1
 
     if target:FindFirstChild("Ignored") then return end
 
@@ -1303,7 +1303,11 @@ local function bringMob(target, root)
     end
 
     local list = {target}
-    local count = CONFIG.BringMobCount or 1
+    local count = CONFIG.BringMobCount or 0
+    if count <= 0 then
+        -- zero means every mob of the kind: the whole pack stands on one point
+        count = math.huge
+    end
     local key = mobKey(target.Name)
     if count > 1 then
         local near = {}
@@ -1332,10 +1336,17 @@ local function bringMob(target, root)
             if hum then
                 pcall(function() hum.PlatformStand = true end)
                 pcall(function() hum.Sit = true end)
+                pcall(function() hum.WalkSpeed = 0 end)
+                pcall(function() hum.JumpPower = 0 end)
             end
             pcall(function() part.CanCollide = false end)
+            -- The hit throws the mob away. Its speed is set to zero before it
+            -- is put back on the point, so it does not slide off again.
+            pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
+            pcall(function() part.AssemblyAngularVelocity = Vector3.zero end)
             local goal = Vector3.new(root.Position.X, part.Position.Y, root.Position.Z)
             pcall(function() part.CFrame = CFrame.new(goal) end)
+            pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
             state.bringMoved[mob] = now
         end
     end
@@ -2368,6 +2379,79 @@ local function travelTo(cf)
     return false
 end
 
+-- ================= MELEE / ABILITY SHOP =================
+local STYLE_SHOP = {
+    {name = "Black Leg",       remote = "BuyBlackLeg",       teacher = "Dark Step Teacher"},
+    {name = "Fishman Karate",  remote = "BuyFishmanKarate",  teacher = "Water Kung-fu Teacher"},
+    {name = "Electro",         remote = "BuyElectro",        teacher = "Mad Scientist"},
+    {name = "Superhuman",      remote = "BuySuperhuman",     teacher = "Martial Arts Master"},
+    {name = "Death Step",      remote = "BuyDeathStep",      teacher = "Phoeyu, the Reformed"},
+    {name = "Sharkman Karate", remote = "BuySharkmanKarate", teacher = "Sharkman Teacher"},
+    {name = "Electric Claw",   remote = "BuyElectricClaw",   teacher = "Previous Hero"},
+    {name = "Dragon Talon",    remote = "BuyDragonTalon",    teacher = "Uzoth"},
+    {name = "Godhuman",        remote = "BuyGodhuman",       teacher = "Ancient Monk"},
+    {name = "Sanguine Art",    remote = "BuySanguineArt",    teacher = "Shafi"},
+}
+
+local function shopRemote()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    return remotes and remotes:FindFirstChild("CommF_")
+end
+
+local function findTeacher(name)
+    for _, folder in ipairs({Workspace:FindFirstChild("NPCs"),
+        ReplicatedStorage:FindFirstChild("NPCs")}) do
+        if folder then
+            for _, npc in ipairs(folder:GetChildren()) do
+                if npc.Name == name and anchorOf(npc) then return npc end
+            end
+        end
+    end
+    return nil
+end
+
+-- One melee style: stand at its teacher and let the game take the buy.
+local function buyStyle(style)
+    local commF = shopRemote()
+    if not commF then
+        dbg("CommF_ remote missing")
+        return false
+    end
+    local npc = findTeacher(style.teacher)
+    if npc then
+        local deadline = tick() + 25
+        while tick() < deadline do
+            local root, anchor = getRoot(), anchorOf(npc)
+            if not root or not anchor then break end
+            if (root.Position - anchor.Position).Magnitude <= 8 then break end
+            travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+            task.wait(0.2)
+        end
+    end
+    local ok = pcall(function() commF:InvokeServer(style.remote) end)
+    if ok then
+        dbg("Bought " .. style.name .. (npc and "" or " (the teacher was not seen)"))
+        return true
+    end
+    dbg("The game did not take the buy of " .. style.name)
+    return false
+end
+
+local function buyAbility(remote, what)
+    local commF = shopRemote()
+    if not commF then
+        dbg("CommF_ remote missing")
+        return false
+    end
+    local ok = pcall(function() commF:InvokeServer(remote, what) end)
+    if ok then
+        dbg("Bought " .. tostring(what))
+        return true
+    end
+    dbg("The game did not take the buy of " .. tostring(what))
+    return false
+end
+
 -- ================= MAIN LOOP =================
 local function step()
     local root, hum = getRoot(), getHumanoid()
@@ -3165,8 +3249,9 @@ makeSlider("Void Guard Y", -1000, -50, CONFIG.SafeY,
 
 makeHeader("BRING MOB")
 makeToggle("Bring Mob", CONFIG.BringMob, function(v) CONFIG.BringMob = v end)
-makeSlider("Bring Mob Count", 1, 6, CONFIG.BringMobCount,
-    function(v) return v.." mobs" end, function(v) CONFIG.BringMobCount = v end)
+makeSlider("Bring Mob Count", 0, 10, CONFIG.BringMobCount,
+    function(v) return v == 0 and "All mobs of the kind" or (v.." mobs") end,
+    function(v) CONFIG.BringMobCount = v end)
 
 showTab(3) -- FIGHT
 makeHeader("COMBAT")
@@ -3193,6 +3278,28 @@ makeSlider("Gun Range", 20, 120, CONFIG.GunRange,
 makeSlider("Attack Cooldown", 5, 100, math.floor(CONFIG.AttackCooldown*100),
     function(v) return string.format("%.2fs", v/100) end,
     function(v) CONFIG.AttackCooldown = v/100 end)
+
+makeHeader("MELEE SHOP (buy)")
+-- The bot walks to the teacher of the style and lets the game take the buy.
+for _, style in ipairs(STYLE_SHOP) do
+    makeButton("Buy " .. style.name, function()
+        state.status = "Buying " .. style.name
+        task.spawn(function() buyStyle(style) end)
+    end)
+end
+makeHeader("ABILITIES (buy)")
+makeButton("Buy Buso Haki", function()
+    task.spawn(function() buyAbility("BuyHaki", "Buso") end)
+end)
+makeButton("Buy Geppo (Skyjump)", function()
+    task.spawn(function() buyAbility("BuyHaki", "Geppo") end)
+end)
+makeButton("Buy Soru", function()
+    task.spawn(function() buyAbility("BuyHaki", "Soru") end)
+end)
+makeButton("Buy Observation Haki", function()
+    task.spawn(function() buyAbility("KenTalk", "Buy") end)
+end)
 
 showTab(4) -- STATS
 makeHeader("STATS")
