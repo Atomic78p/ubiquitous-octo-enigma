@@ -44,9 +44,14 @@ local CONFIG = {
     HitboxSize      = 16,
     HeadHover       = 2,
     AutoAttack      = true,
-    AutoStore       = false,
+    AutoStore       = true,
     StoreFruitMin   = 3,
-    HoverHeight     = 8,
+    AutoBuso        = true,
+    Aoe             = true,
+    AoeRange        = 80,
+    WarpClose       = true,
+    WarpDistance    = 60,
+    HoverHeight     = 14,
     FruitScanRadius = 5000,
     MovementMode    = "Tween",
     MoveSpeed       = 250,
@@ -1348,6 +1353,15 @@ local function moveTo(cf)
     local root = getRoot()
     if not root then return end
     local mode = CONFIG.MovementMode
+    local hop = (root.Position - cf.Position).Magnitude
+
+    -- A short hop is taken at once: the game accepts a small move, so the
+    -- long way to a mob right next to the player is not walked.
+    if CONFIG.WarpClose and hop <= (CONFIG.WarpDistance or 60) then
+        stopTween()
+        root.CFrame = cf
+        return
+    end
 
     if mode == "Teleport" then
         root.CFrame = cf
@@ -1506,6 +1520,42 @@ local function canAttack(tool)
     return allowed ~= false
 end
 
+local function hitPartOf(mob)
+    if not mob then return nil end
+    return mob:FindFirstChild("RightHand")
+        or mob:FindFirstChild("Head")
+        or anchorOf(mob)
+end
+
+-- Every mob close to the player goes into one swing: the game takes the whole
+-- list of hit parts at once, so a single hit lands on all of them.
+local function aoeParts(root, target)
+    local range = CONFIG.AoeRange or 80
+    local parts, seen = {}, {}
+    if root and target then
+        local part = hitPartOf(target)
+        if part then
+            table.insert(parts, part)
+            seen[target] = true
+        end
+    end
+    if root and CONFIG.Aoe then
+        for _, mob in ipairs(collectEnemies(tick())) do
+            if not seen[mob] then
+                local anchor = anchorOf(mob)
+                if anchor and (anchor.Position - root.Position).Magnitude <= range then
+                    local part = hitPartOf(mob)
+                    if part then
+                        table.insert(parts, part)
+                        seen[mob] = true
+                    end
+                end
+            end
+        end
+    end
+    return parts
+end
+
 local function remoteAttack(target, tool)
     local modules = ReplicatedStorage:FindFirstChild("Modules")
     local net = modules and modules:FindFirstChild("Net")
@@ -1513,20 +1563,20 @@ local function remoteAttack(target, tool)
     local regAttack = net:FindFirstChild("RE/RegisterAttack")
     local regHit = net:FindFirstChild("RE/RegisterHit")
     if not regAttack or not regHit then return false end
-    local part = nil
-    if target then
-        part = target:FindFirstChild("RightHand")
-            or target:FindFirstChild("Head")
-            or anchorOf(target)
-    end
-    if not part then return false end
+    local root = getRoot()
+    local parts = aoeParts(root, target)
+    if #parts == 0 then return false end
     local id = nil
     pcall(function() id = regAttack:FireServer(attackAnimLength(tool), 1) end)
     if type(id) ~= "string" then
         state.attackId = (state.attackId or 0) + 1
         id = string.format("%08x", state.attackId)
     end
-    pcall(function() regHit:FireServer(part, {}, nil, id) end)
+    -- The hub sends the rest of its {rig, part} list through the Net wrapper of
+    -- the game. This script calls the raw remote, and the recorded call of the
+    -- game itself is (part, list, nil, id) with a list of parts, so the rest of
+    -- the parts goes in as it is.
+    pcall(function() regHit:FireServer(parts[1], {table.unpack(parts, 2)}, nil, id) end)
     return true
 end
 
@@ -2560,7 +2610,12 @@ local function step()
     local tool = equipWeapon()
     local reach = attackRange(tool)
     local hover = CONFIG.HoverHeight
-    if reach <= CONFIG.MeleeRange then hover = math.min(hover, CONFIG.MeleeHover) end
+    -- The hits go through the remote of the game, so the player can stay high
+    -- above the mob where its swings cannot reach. Only the plain swing has to
+    -- come down close.
+    if reach <= CONFIG.MeleeRange and not CONFIG.RemoteAttack then
+        hover = math.min(hover, CONFIG.MeleeHover)
+    end
 
     if CONFIG.BringMob then bringMob(target, root) end
 
@@ -2594,7 +2649,8 @@ local function step()
     end
     local hoverPos
     if head then
-        hoverPos = head.Position + Vector3.new(0, CONFIG.HeadHover, 0)
+        local above = CONFIG.RemoteAttack and math.max(hover, CONFIG.HeadHover) or CONFIG.HeadHover
+        hoverPos = head.Position + Vector3.new(0, above, 0)
     else
         hoverPos = swingAnchor.Position + Vector3.new(0, hover, 0)
     end
@@ -2631,6 +2687,36 @@ task.spawn(function()
             stopTween()
         end
         task.wait(0.05)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if CONFIG.AutoBuso and state.enabled then
+            local ok, err = pcall(function()
+                local char = LocalPlayer.Character
+                local hasBuso = false
+                if char then
+                    for _, d in ipairs(char:GetDescendants()) do
+                        local n = d.Name
+                        if n == "HasBuso" or n:find("_BusoLayer", 1, true) then
+                            hasBuso = true
+                            break
+                        end
+                    end
+                end
+                if not hasBuso then
+                    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+                    local commF = remotes and remotes:FindFirstChild("CommF_")
+                    if commF then
+                        pcall(function() commF:InvokeServer("Buso") end)
+                        task.wait(2)
+                    end
+                end
+            end)
+            if not ok then dbg("The haki check failed: " .. tostring(err)) end
+        end
     end
 end)
 
@@ -3069,8 +3155,11 @@ makeSegment("Mode", {"Walk","Tween","Teleport"}, CONFIG.MovementMode,
     function(v) CONFIG.MovementMode = v end)
 makeSlider("Move Speed", 50, 500, CONFIG.MoveSpeed,
     function(v) return v.." st/s" end, function(v) CONFIG.MoveSpeed = v end)
-makeSlider("Hover Height", 0, 30, CONFIG.HoverHeight,
+makeSlider("Hover Height", 0, 60, CONFIG.HoverHeight,
     function(v) return v.." studs" end, function(v) CONFIG.HoverHeight = v end)
+makeToggle("Short Warp", CONFIG.WarpClose, function(v) CONFIG.WarpClose = v end)
+makeSlider("Warp Distance", 20, 200, CONFIG.WarpDistance,
+    function(v) return v.." studs" end, function(v) CONFIG.WarpDistance = v end)
 makeSlider("Void Guard Y", -1000, -50, CONFIG.SafeY,
     function(v) return tostring(v).." studs" end, function(v) CONFIG.SafeY = v end)
 
@@ -3086,6 +3175,10 @@ makeSegment("Weapon", {"Melee", "Sword", "Fruit", "Gun"}, CONFIG.WeaponMode,
 makeToggle("Auto Attack", CONFIG.AutoAttack, function(v) CONFIG.AutoAttack = v end)
 makeToggle("Fast Attack", CONFIG.FastAttack, function(v) CONFIG.FastAttack = v end)
 makeToggle("Remote Attack", CONFIG.RemoteAttack, function(v) CONFIG.RemoteAttack = v end)
+makeToggle("AOE (all mobs in reach)", CONFIG.Aoe, function(v) CONFIG.Aoe = v end)
+makeSlider("AOE Range", 40, 200, CONFIG.AoeRange,
+    function(v) return v.." studs" end, function(v) CONFIG.AoeRange = v end)
+makeToggle("Auto Buso (Haki)", CONFIG.AutoBuso, function(v) CONFIG.AutoBuso = v end)
 makeToggle("Big Hitbox", CONFIG.BigHitbox, function(v) CONFIG.BigHitbox = v end)
 makeSlider("Hitbox Size", 4, 40, CONFIG.HitboxSize,
     function(v) return tostring(v) end, function(v) CONFIG.HitboxSize = v end)
