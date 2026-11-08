@@ -1539,33 +1539,38 @@ local function hitPartOf(mob)
         or anchorOf(mob)
 end
 
--- Every mob close to the player goes into one swing: the game takes the whole
--- list of hit parts at once, so a single hit lands on all of them.
-local function aoeParts(root, target)
+-- Every mob close to the player goes into one swing. Like the hub, each mob
+-- goes in as a pair of its rig and the part that was hit, and the target is
+-- the first one: the game takes that part on its own and the whole list with
+-- it, so a single swing lands on all of them.
+local function aoePairs(root, target)
     local range = CONFIG.AoeRange or 80
-    local parts, seen = {}, {}
-    if root and target then
-        local part = hitPartOf(target)
-        if part then
-            table.insert(parts, part)
-            seen[target] = true
-        end
+    local out, seen = {}, {}
+    local function add(mob)
+        if not mob or seen[mob] then return end
+        local part = hitPartOf(mob)
+        if not part then return end
+        local anchor = anchorOf(mob)
+        if root and anchor and (anchor.Position - root.Position).Magnitude > range then return end
+        seen[mob] = true
+        table.insert(out, {mob, part})
     end
-    if root and CONFIG.Aoe then
-        for _, mob in ipairs(collectEnemies(tick())) do
-            if not seen[mob] then
-                local anchor = anchorOf(mob)
-                if anchor and (anchor.Position - root.Position).Magnitude <= range then
-                    local part = hitPartOf(mob)
-                    if part then
-                        table.insert(parts, part)
-                        seen[mob] = true
-                    end
-                end
-            end
-        end
+    add(target)
+    if CONFIG.Aoe then
+        for _, mob in ipairs(collectEnemies(tick())) do add(mob) end
     end
-    return parts
+    return out
+end
+
+-- The hub fires the hit remote through the Net wrapper of the game; the raw
+-- remote is the fallback when that wrapper is not there.
+local function hitRemote()
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local net = modules and modules:FindFirstChild("Net")
+    if not net then return nil, false end
+    local ok, wrapped = pcall(function() return net:RemoteEvent("RegisterHit", true) end)
+    if ok and wrapped then return wrapped, true end
+    return net:FindFirstChild("RE/RegisterHit"), false
 end
 
 local function remoteAttack(target, tool)
@@ -1573,22 +1578,26 @@ local function remoteAttack(target, tool)
     local net = modules and modules:FindFirstChild("Net")
     if not net then return false end
     local regAttack = net:FindFirstChild("RE/RegisterAttack")
-    local regHit = net:FindFirstChild("RE/RegisterHit")
-    if not regAttack or not regHit then return false end
+    if not regAttack then return false end
     local root = getRoot()
-    local parts = aoeParts(root, target)
-    if #parts == 0 then return false end
+    local pairs_ = aoePairs(root, target)
+    if #pairs_ == 0 then return false end
     local id = nil
     pcall(function() id = regAttack:FireServer(attackAnimLength(tool), 1) end)
     if type(id) ~= "string" then
         state.attackId = (state.attackId or 0) + 1
         id = string.format("%08x", state.attackId)
     end
-    -- The hub sends the rest of its {rig, part} list through the Net wrapper of
-    -- the game. This script calls the raw remote, and the recorded call of the
-    -- game itself is (part, list, nil, id) with a list of parts, so the rest of
-    -- the parts goes in as it is.
-    pcall(function() regHit:FireServer(parts[1], {table.unpack(parts, 2)}, nil, id) end)
+    state.aoeCount = #pairs_
+    local hit, wrapped = hitRemote()
+    if not hit then return false end
+    local rest = {}
+    for i = 2, #pairs_ do rest[i - 1] = pairs_[i] end
+    if wrapped then
+        pcall(function() hit:FireServer(pairs_[1][2], rest) end)
+    else
+        pcall(function() hit:FireServer(pairs_[1][2], rest, nil, id) end)
+    end
     return true
 end
 
@@ -2788,10 +2797,12 @@ local function step()
         if not tool then dbg("No weapon in backpack!"); return end
         if doAttack(tool, swingTarget) then
             state.lastAttack = now
+            local many = (state.aoeCount or 1) > 1 and (" +" .. (state.aoeCount - 1) .. " close") or ""
             if swingTarget == target then
-                state.status = "Hitting " .. target.Name .. " (" .. state.hitsConfirmed .. " hits)"
+                state.status = "Hitting " .. target.Name .. many
+                    .. " (" .. state.hitsConfirmed .. " hits)"
             else
-                state.status = "Attacking " .. swingTarget.Name
+                state.status = "Attacking " .. swingTarget.Name .. many
             end
         end
     end
