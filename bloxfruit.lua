@@ -123,6 +123,7 @@ local state = {
     statAt        = 0,
     bypassAt      = nil,
     bypassFailAt  = nil,
+    shopping      = false,
     bringMoved    = setmetatable({}, {__mode = "k"}),
     bringIgnored  = setmetatable({}, {__mode = "k"}),
     questVerified = false,
@@ -1280,7 +1281,7 @@ local function bringMob(target, root)
         if now - at > 5 then
             state.bringMoved[mob] = nil
             local part = anchorOf(mob)
-            if part and (part.Position - root.Position).Magnitude > CONFIG.BringMobRange * 3 then
+            if part and (part.Position - root.Position).Magnitude > CONFIG.BringMobSearch then
                 state.bringIgnored[mob] = now
                 if not mob:FindFirstChild("Ignored") then
                     Instance.new("IntValue", mob).Name = "Ignored"
@@ -2399,12 +2400,29 @@ local function shopRemote()
 end
 
 local function findTeacher(name)
-    for _, folder in ipairs({Workspace:FindFirstChild("NPCs"),
-        ReplicatedStorage:FindFirstChild("NPCs")}) do
+    local folders = {Workspace:FindFirstChild("NPCs"), ReplicatedStorage:FindFirstChild("NPCs")}
+    for _, folder in ipairs(folders) do
         if folder then
             for _, npc in ipairs(folder:GetChildren()) do
-                if npc.Name == name and anchorOf(npc) then return npc end
+                local ready = true
+                pcall(function()
+                    if npc:GetAttribute("NPCLoaded") == false or npc:GetAttribute("NPCReady") == false then
+                        ready = false
+                    end
+                end)
+                if npc.Name == name and ready and anchorOf(npc) then return npc end
             end
+        end
+    end
+    for _, npc in ipairs(Workspace:GetChildren()) do
+        if npc:IsA("Model") and npc.Name == name and anchorOf(npc) then
+            local ready = true
+            pcall(function()
+                if npc:GetAttribute("NPCLoaded") == false or npc:GetAttribute("NPCReady") == false then
+                    ready = false
+                end
+            end)
+            if ready then return npc end
         end
     end
     return nil
@@ -2417,24 +2435,34 @@ local function buyStyle(style)
         dbg("CommF_ remote missing")
         return false
     end
+    if state.shopping then
+        dbg("A buy is already running")
+        return false
+    end
+    state.shopping = true
+    -- The main loop keeps walking to the mob. While the shop walks to the
+    -- teacher it has to stand back. The flag goes away on every path.
     local npc = findTeacher(style.teacher)
     if npc then
         local deadline = tick() + 25
-        while tick() < deadline do
-            local root, anchor = getRoot(), anchorOf(npc)
-            if not root or not anchor then break end
-            if (root.Position - anchor.Position).Magnitude <= 8 then break end
-            travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
-            task.wait(0.2)
-        end
+        pcall(function()
+            while tick() < deadline do
+                local root, anchor = getRoot(), anchorOf(npc)
+                if not root or not anchor then break end
+                if (root.Position - anchor.Position).Magnitude <= 8 then break end
+                travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                task.wait(0.2)
+            end
+        end)
     end
-    local ok = pcall(function() commF:InvokeServer(style.remote) end)
-    if ok then
-        dbg("Bought " .. style.name .. (npc and "" or " (the teacher was not seen)"))
-        return true
+    local ok, reply = pcall(function() return commF:InvokeServer(style.remote) end)
+    state.shopping = false
+    if not ok or reply == false then
+        dbg("The game did not take the buy of " .. style.name)
+        return false
     end
-    dbg("The game did not take the buy of " .. style.name)
-    return false
+    dbg("Asked the game to buy " .. style.name .. (npc and "" or " (no teacher was seen)"))
+    return true
 end
 
 local function buyAbility(remote, what)
@@ -2443,13 +2471,19 @@ local function buyAbility(remote, what)
         dbg("CommF_ remote missing")
         return false
     end
-    local ok = pcall(function() commF:InvokeServer(remote, what) end)
-    if ok then
-        dbg("Bought " .. tostring(what))
-        return true
+    if state.shopping then
+        dbg("A buy is already running")
+        return false
     end
-    dbg("The game did not take the buy of " .. tostring(what))
-    return false
+    state.shopping = true
+    local ok, reply = pcall(function() return commF:InvokeServer(remote, what) end)
+    state.shopping = false
+    if not ok or reply == false then
+        dbg("The game did not take the buy of " .. tostring(what))
+        return false
+    end
+    dbg("Asked the game to buy " .. tostring(what))
+    return true
 end
 
 -- ================= MAIN LOOP =================
@@ -2484,6 +2518,9 @@ local function step()
         end
         return
     end
+
+    -- A shop buy owns the movement of the character while it runs.
+    if state.shopping then return end
 
     if not state.lastPos or (root.Position - state.lastPos).Magnitude > 1 then
         state.lastPos = root.Position
