@@ -2095,16 +2095,16 @@ end
 
 -- ================= MELEE / ABILITY SHOP =================
 local STYLE_SHOP = {
-    {name = "Black Leg",       remote = "BuyBlackLeg"},
-    {name = "Fishman Karate",  remote = "BuyFishmanKarate"},
-    {name = "Electro",         remote = "BuyElectro"},
-    {name = "Superhuman",      remote = "BuySuperhuman"},
-    {name = "Death Step",      remote = "BuyDeathStep"},
-    {name = "Sharkman Karate", remote = "BuySharkmanKarate"},
-    {name = "Electric Claw",   remote = "BuyElectricClaw"},
-    {name = "Dragon Talon",    remote = "BuyDragonTalon"},
-    {name = "Godhuman",        remote = "BuyGodhuman"},
-    {name = "Sanguine Art",    remote = "BuySanguineArt"},
+    {name = "Black Leg",       remote = "BuyBlackLeg",       teacher = "Dark Step Teacher"},
+    {name = "Fishman Karate",  remote = "BuyFishmanKarate", teacher = "Water Kung-fu Teacher"},
+    {name = "Electro",         remote = "BuyElectro", teacher = "Mad Scientist"},
+    {name = "Superhuman",      remote = "BuySuperhuman", teacher = "Martial Arts Master"},
+    {name = "Death Step",      remote = "BuyDeathStep", teacher = "Phoeyu, the Reformed"},
+    {name = "Sharkman Karate", remote = "BuySharkmanKarate", teacher = "Sharkman Teacher"},
+    {name = "Electric Claw",   remote = "BuyElectricClaw", teacher = "Previous Hero"},
+    {name = "Dragon Talon",    remote = "BuyDragonTalon", teacher = "Uzoth"},
+    {name = "Godhuman",        remote = "BuyGodhuman", teacher = "Ancient Monk"},
+    {name = "Sanguine Art",    remote = "BuySanguineArt", teacher = "Shafi"},
 }
 
 local function shopRemote()
@@ -2112,8 +2112,29 @@ local function shopRemote()
     return remotes and remotes:FindFirstChild("CommF_")
 end
 
--- One melee style: the buy is asked for right away, the player does not
--- have to walk to the teacher of it first.
+local function findTeacher(name)
+    local folders = {Workspace:FindFirstChild("NPCs"), ReplicatedStorage:FindFirstChild("NPCs")}
+    for _, folder in ipairs(folders) do
+        if folder then
+            for _, npc in ipairs(folder:GetChildren()) do
+                local ready = true
+                pcall(function()
+                    if npc:GetAttribute("NPCLoaded") == false or npc:GetAttribute("NPCReady") == false then
+                        ready = false
+                    end
+                end)
+                if npc.Name == name and ready and anchorOf(npc) then return npc end
+            end
+        end
+    end
+    for _, npc in ipairs(Workspace:GetChildren()) do
+        if npc:IsA("Model") and npc.Name == name and anchorOf(npc) then return npc end
+    end
+    return nil
+end
+
+-- The game only takes the buy when the player stands at the teacher of the
+-- style, so the bot walks to it first and asks there.
 local function buyStyle(style)
     local commF = shopRemote()
     if not commF then
@@ -2125,13 +2146,31 @@ local function buyStyle(style)
         return false
     end
     state.shopping = true
+    local npc = findTeacher(style.teacher)
+    local near = false
+    if npc then
+        local deadline = tick() + 25
+        pcall(function()
+            while tick() < deadline do
+                local root, anchor = getRoot(), anchorOf(npc)
+                if not root or not anchor then break end
+                if (root.Position - anchor.Position).Magnitude <= 8 then
+                    near = true
+                    break
+                end
+                travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                task.wait(0.2)
+            end
+        end)
+    end
     local ok, reply = pcall(function() return commF:InvokeServer(style.remote) end)
     state.shopping = false
+    dbg("Buy " .. style.name .. " from " .. (npc and "the teacher" or "far away")
+        .. (npc and (near and " (stood at it)" or " (could not reach it)") or " (no teacher was seen)"))
     if not ok or reply == false then
         dbg("The game did not take the buy of " .. style.name)
         return false
     end
-    dbg("Asked the game to buy " .. style.name)
     return true
 end
 
