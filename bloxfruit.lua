@@ -36,10 +36,6 @@ local CONFIG = {
     AutoStats       = false,
     AutoStatTarget  = "Melee",
     AutoStatWait    = 3,
-    SpawnBypass     = true,
-    BypassDistance  = 2500,
-    FastPortal      = true,
-    TravelWorld     = 1,
     BigHitbox       = true,
     HitboxSize      = 16,
     HeadHover       = 2,
@@ -49,8 +45,6 @@ local CONFIG = {
     AutoBuso        = true,
     Aoe             = true,
     AoeRange        = 80,
-    WarpClose       = true,
-    WarpDistance    = 60,
     HoverHeight     = 14,
     FruitScanRadius = 5000,
     MovementMode    = "Tween",
@@ -121,11 +115,12 @@ local state = {
     questNpc      = nil,
     questPos      = nil,
     statAt        = 0,
-    bypassAt      = nil,
-    bypassFailAt  = nil,
     shopping      = false,
     bringMoved    = setmetatable({}, {__mode = "k"}),
     bringIgnored  = setmetatable({}, {__mode = "k"}),
+    bringHealth   = setmetatable({}, {__mode = "k"}),
+    bringPoint    = nil,
+    bringTarget   = nil,
     questVerified = false,
     questGaveUp   = false,
     hitsConfirmed = 0,
@@ -1013,9 +1008,7 @@ local function tryAcceptQuest(info)
 
     local index = state.questIndexTry or q.index
 
-    if not state.bypassBusy then
-        pcall(function() commF:InvokeServer("SetLastSpawnPoint", "Town") end)
-    end
+    pcall(function() commF:InvokeServer("SetLastSpawnPoint", "Town") end)
 
     if questRemoteState then
         pcall(function() commF:InvokeServer("AbandonQuest") end)
@@ -1259,6 +1252,31 @@ local function ownedByOther(part)
     return false
 end
 
+-- The pack stands on one point. Like the hub, that point is the spawn point
+-- of that mob in the world; the place the mob was first seen is the fallback.
+local function mobSpawnPoint(target, fallback)
+    local origin = Workspace:FindFirstChild("_WorldOrigin")
+    local spawns = origin and origin:FindFirstChild("EnemySpawns")
+    if not spawns then return fallback end
+    local key = mobKey(target.Name)
+    local best, bestD = nil, nil
+    for _, part in ipairs(spawns:GetChildren()) do
+        if part:IsA("BasePart") then
+            local display = nil
+            pcall(function() display = part:GetAttribute("DisplayName") end)
+            local clean = tostring(display or part.Name)
+            clean = clean:gsub("%s*%(Lv%.?%s*%d+%)", "")
+            if mobKey(clean) == key then
+                local d = (part.Position - fallback).Magnitude
+                if bestD == nil or d < bestD then
+                    best, bestD = part.Position, d
+                end
+            end
+        end
+    end
+    return best or fallback
+end
+
 local function bringMob(target, root)
     local anchor = anchorOf(target)
     if not anchor then return end
@@ -1278,15 +1296,23 @@ local function bringMob(target, root)
         end
     end
     for mob, at in pairs(state.bringMoved) do
-        if now - at > 5 then
+        if now - at > 2.2 then
             state.bringMoved[mob] = nil
-            local part = anchorOf(mob)
-            if part and (part.Position - root.Position).Magnitude > CONFIG.BringMobSearch then
-                state.bringIgnored[mob] = now
-                if not mob:FindFirstChild("Ignored") then
-                    Instance.new("IntValue", mob).Name = "Ignored"
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+            local hp = hum and hum.Health
+            if hp and state.bringHealth[mob] == hp and not mob:FindFirstChild("Ignored") then
+                -- It is not being hurt: it is put back and left alone.
+                local part = anchorOf(mob)
+                if part then
+                    local back = nil
+                    pcall(function() back = mob:GetPivot() end)
+                    if not back then pcall(function() back = mob.WorldPivot end) end
+                    if back then pcall(function() part.CFrame = back end) end
                 end
+                state.bringIgnored[mob] = now
+                Instance.new("IntValue", mob).Name = "Ignored"
             end
+            state.bringHealth[mob] = hp
         end
     end
 
@@ -1308,7 +1334,7 @@ local function bringMob(target, root)
     -- the player turns or walks to the next fruit.
     if state.bringTarget ~= target or not state.bringPoint then
         state.bringTarget = target
-        state.bringPoint = anchor.Position
+        state.bringPoint = mobSpawnPoint(target, anchor.Position)
     end
     local point = state.bringPoint
 
@@ -1377,15 +1403,6 @@ local function moveTo(cf)
     local root = getRoot()
     if not root then return end
     local mode = CONFIG.MovementMode
-    local hop = (root.Position - cf.Position).Magnitude
-
-    -- A short hop is taken at once: the game accepts a small move, so the
-    -- long way to a mob right next to the player is not walked.
-    if CONFIG.WarpClose and hop <= (CONFIG.WarpDistance or 60) then
-        stopTween()
-        root.CFrame = cf
-        return
-    end
 
     if mode == "Teleport" then
         root.CFrame = cf
@@ -2060,343 +2077,7 @@ local function tryUpgradeStats()
     end
 end
 
--- ================= TRAVEL =================
-local WORLD_TRAVEL = {"TravelMain", "TravelDressrosa", "TravelZou"}
-
-local function travelToWorld(world)
-    local what = WORLD_TRAVEL[world]
-    if not what then return false end
-    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-    local commF = remotes and remotes:FindFirstChild("CommF_")
-    if not commF then return false end
-    local ok = pcall(function() commF:InvokeServer(what) end)
-    if ok then
-        dbg("Travelling to world " .. tostring(world))
-        return true
-    end
-    dbg("The game did not take the travel to world " .. tostring(world))
-    return false
-end
-
-local function modelCFrame(model)
-    local ok, cf = pcall(function() return model:GetModelCFrame() end)
-    if ok and cf then return cf end
-    local hrp = model:FindFirstChild("HumanoidRootPart")
-    if hrp then return hrp.CFrame end
-    return model.CFrame
-end
-
-local islandSpawns, islandSpawnsAt = {}, -999
-
-local function loadIslandSpawns()
-    islandSpawns = {}
-    local origin = Workspace:FindFirstChild("_WorldOrigin")
-    local locations = origin and origin:FindFirstChild("Locations")
-    local spawns = origin and origin:FindFirstChild("PlayerSpawns")
-    if not locations or not spawns then return end
-    local points = {}
-    for _, folder in ipairs(spawns:GetChildren()) do
-        for _, model in ipairs(folder:GetChildren()) do
-            if model:IsA("Model") then
-                table.insert(points, {name = model.Name, cf = modelCFrame(model)})
-            end
-        end
-    end
-    if #points == 0 then return end
-    for _, island in ipairs(locations:GetChildren()) do
-        if island:IsA("BasePart") then
-            local mesh = island:FindFirstChildWhichIsA("SpecialMesh")
-            local scale = mesh and mesh.Scale.X or 1
-            local radius = island.Size.X * scale / 2
-            local list = {}
-            for _, p in ipairs(points) do
-                if (p.cf.Position - island.Position).Magnitude <= radius then
-                    table.insert(list, p)
-                end
-            end
-            if #list > 0 then islandSpawns[island.Name] = list end
-        end
-    end
-    islandSpawnsAt = tick()
-end
-
-local function spawnNear(position)
-    local origin = Workspace:FindFirstChild("_WorldOrigin")
-    local locations = origin and origin:FindFirstChild("Locations")
-    if not locations then return nil end
-    local best, bestD = nil, nil
-    for _, island in ipairs(locations:GetChildren()) do
-        local list = islandSpawns[island.Name]
-        if list and island:IsA("BasePart") then
-            local mesh = island:FindFirstChildWhichIsA("SpecialMesh")
-            local scale = mesh and mesh.Scale.X or 1
-            local radius = island.Size.X * scale / 2
-            if radius >= (position - island.Position).Magnitude then
-                for _, p in ipairs(list) do
-                    local d = (p.cf.Position - position).Magnitude
-                    if bestD == nil or d < bestD then best, bestD = p.name, d end
-                end
-            end
-        end
-    end
-    return best
-end
-
--- ================= FAST ISLAND BYPASS (FIXED) =================
-local function fastBypassToIsland(spawnName, targetPos, knownIsland)
-    local root = getRoot()
-    if not root then return false end
-
-    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-    local commF = remotes and remotes:FindFirstChild("CommF_")
-    if not commF then return false end
-
-    if knownIsland == false then
-        -- The island of that place was not found: no spawn point is sent at
-        -- all, the old one stays. Only the position can be crossed.
-        if targetPos then
-            root.CFrame = CFrame.new(targetPos + Vector3.new(0, 5, 0))
-            task.wait(0.3)
-        end
-        dbg("The island of that place is not known, only a teleport is possible")
-        return false
-    end
-
-    local char = LocalPlayer.Character
-    local marker = char and char:FindFirstChild("LastSpawnPoint")
-    if marker then pcall(function() marker.Disabled = true end) end
-    local function restoreMarker()
-        if marker then pcall(function() marker.Disabled = false end) end
-    end
-
-    local ok, result = pcall(function()
-        local sent = pcall(function() commF:InvokeServer("SetLastSpawnPoint", spawnName) end)
-        if not sent then
-            dbg("The game refused the spawn point " .. tostring(spawnName))
-            return false
-        end
-        dbg("Set spawn point: " .. tostring(spawnName))
-
-        local deadline = tick() + 5
-        local taken = false
-        while tick() < deadline do
-            local current = valueOf(dataValue("LastSpawnPoint"))
-            if current == spawnName then
-                taken = true
-                break
-            end
-            task.wait(0.1)
-        end
-        if not taken then
-            dbg("The game did not take the spawn point " .. tostring(spawnName))
-            return false
-        end
-
-        local hum = getHumanoid()
-        if not hum then
-            dbg("The character is gone")
-            return false
-        end
-        hum.Health = 0
-
-        deadline = tick() + 15
-        local back = false
-        while tick() < deadline do
-            local alive = getHumanoid()
-            if alive and alive.Health > 0 then
-                back = true
-                break
-            end
-            task.wait(0.2)
-        end
-        if not back then
-            dbg("The character did not come back")
-            return false
-        end
-
-        -- The game put the character on the island: now it can be placed on
-        -- the exact spot of that island.
-        if targetPos then
-            local now = getRoot()
-            if now then
-                now.CFrame = CFrame.new(targetPos + Vector3.new(0, 5, 0))
-                task.wait(0.3)
-            end
-        end
-        dbg("Back at " .. tostring(spawnName))
-        return true
-    end)
-    restoreMarker()
-    if not ok then
-        dbg("The jump to the island failed: " .. tostring(result))
-        return false
-    end
-    return result
-end
-
-local function spawnBypassTo(position)
-    if not (position and position.X and position.Y and position.Z) then return false end
-    if state.bypassBusy then
-        dbg("A jump is already running")
-        return false
-    end
-    state.bypassBusy = true
-    local ok, result = pcall(function()
-        if tick() - islandSpawnsAt > 30 then loadIslandSpawns() end
-        local name = spawnNear(position)
-        local known = true
-        if not name then
-            if next(islandSpawns) == nil then
-                name = "Cafe"
-                known = false
-                dbg("The islands are not known yet, only the teleport is possible")
-            else
-                dbg("No spawn point found for that place")
-                return false
-            end
-        end
-        return fastBypassToIsland(name, position, known)
-    end)
-    state.bypassBusy = false
-    if not ok then
-        dbg("The jump to the island failed: " .. tostring(result))
-        return false
-    end
-    return result
-end
-
-local function islandPositions()
-    local list = {}
-    local known = {}
-    local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
-    if ok and type(map) == "table" then
-        for name, pos in pairs(map) do
-            if pos and pos.X and pos.Y and pos.Z then
-                table.insert(list, {name = tostring(name), pos = pos})
-                known[tostring(name)] = true
-            end
-        end
-    end
-    local origin = Workspace:FindFirstChild("_WorldOrigin")
-    local locations = origin and origin:FindFirstChild("Locations")
-    if locations then
-        for _, island in ipairs(locations:GetChildren()) do
-            if island:IsA("BasePart") and not known[island.Name] then
-                table.insert(list, {name = island.Name, pos = island.Position})
-                known[island.Name] = true
-            end
-        end
-    end
-    local root = getRoot()
-    table.sort(list, function(a, b)
-        if root then
-            local da = (root.Position - a.pos).Magnitude
-            local db = (root.Position - b.pos).Magnitude
-            if da ~= db then return da < db end
-        end
-        return a.name < b.name
-    end)
-    return list
-end
-
-local function portalBypass(targetPos)
-    local root = getRoot()
-    if not root then return false end
-    if state.bypassBusy then
-        dbg("A jump is already running")
-        return false
-    end
-    state.bypassBusy = true
-    local ok, result = pcall(function()
-        local door, bestD = nil, 2000
-        local function scan(container, depth)
-            if depth > 2 then return end
-            for _, obj in ipairs(container:GetChildren()) do
-                local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
-                local text = ""
-                if prompt then
-                    text = ((prompt.ActionText or "") .. " " .. (prompt.ObjectText or "") .. " " .. obj.Name):lower()
-                end
-                if prompt and (text:find("door", 1, true) or text:find("gate", 1, true)
-                    or text:find("entrance", 1, true) or text:find("portal", 1, true)
-                    or text:find("teleport", 1, true)) then
-                    local anchor = anchorOf(obj)
-                    if anchor then
-                        local d = (root.Position - anchor.Position).Magnitude
-                        if d < bestD then door, bestD = anchor, d end
-                    end
-                elseif obj:IsA("Model") or obj:IsA("Folder") then
-                    scan(obj, depth + 1)
-                end
-            end
-        end
-        scan(Workspace, 0)
-        local npcs = Workspace:FindFirstChild("NPCs")
-        if npcs then scan(npcs, 0) end
-        if not door then return false end
-
-        local before = (root.Position - targetPos).Magnitude
-        if (root.Position - door.Position).Magnitude > 12 then
-            moveTo(CFrame.new(door.Position + Vector3.new(0, 3, 0)))
-            local deadline = tick() + 10
-            while tick() < deadline do
-                local now = getRoot()
-                if not now then break end
-                if (now.Position - door.Position).Magnitude <= 12 then break end
-                task.wait(0.2)
-            end
-        end
-        local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-        local commF = remotes and remotes:FindFirstChild("CommF_")
-        if not commF then return false end
-        local sent = pcall(function() commF:InvokeServer("requestEntrance", door.Position) end)
-        if not sent then return false end
-        dbg("Crossed the door to the island")
-        local deadline = tick() + 2
-        while tick() < deadline do
-            local now = getRoot()
-            if now and (now.Position - targetPos).Magnitude < before - 50 then return true end
-            task.wait(0.2)
-        end
-        return false
-    end)
-    state.bypassBusy = false
-    if not ok then
-        dbg("The portal failed: " .. tostring(result))
-        return false
-    end
-    return result
-end
-
 local function travelTo(cf)
-    local root = getRoot()
-    if not root then return false end
-    local dist = (root.Position - cf.Position).Magnitude
-    local cooling = state.bypassFailAt and (tick() - state.bypassFailAt < 10)
-    if CONFIG.SpawnBypass and not cooling and dist > (CONFIG.BypassDistance or 2500) then
-        if tick() - islandSpawnsAt > 30 then loadIslandSpawns() end
-        local name = spawnNear(cf.Position)
-        if name then
-            dbg("Far away (" .. tostring(math.floor(dist)) .. " studs): fast bypass")
-            if not state.bypassBusy then
-                state.bypassBusy = true
-                task.spawn(function()
-                    local ok, result = pcall(function() return fastBypassToIsland(name, cf.Position) end)
-                    state.bypassBusy = false
-                    if not ok then
-                        dbg("The bypass failed: " .. tostring(result))
-                    elseif not result then
-                        dbg("The jump did not work, walking instead")
-                    end
-                    if not ok or not result then
-                        state.bypassFailAt = tick()
-                        moveTo(cf)
-                    end
-                end)
-            end
-            return true
-        end
-    end
     moveTo(cf)
     return false
 end
@@ -2669,16 +2350,6 @@ local function step()
             local prompt = giver and promptOf(giver)
             local anchor = (prompt and anchorOf(prompt.Parent)) or (giver and anchorOf(giver))
             if anchor then
-                if CONFIG.SpawnBypass and (not state.bypassAt or now - state.bypassAt > 60) then
-                    local root = getRoot()
-                    if root and (root.Position - anchor.Position).Magnitude
-                        > (CONFIG.BypassDistance or 2500) then
-                        state.bypassAt = now
-                        dbg("Going to the island of the quest giver")
-                        task.spawn(function() spawnBypassTo(anchor.Position) end)
-                        return
-                    end
-                end
                 state.status = "Looking for a quest"
                 travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
                 interactWith(giver, prompt)
@@ -2799,7 +2470,7 @@ local function step()
     local top = swingAnchor.Position.Y + (swingAnchor.Size and swingAnchor.Size.Y or 0) / 2
     hoverPos = Vector3.new(hoverPos.X, math.max(hoverPos.Y, top - 1), hoverPos.Z)
 
-    if travelTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0)) then return end
+    travelTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0))
 
     local sx = root.Position.X - swingAnchor.Position.X
     local sz = root.Position.Z - swingAnchor.Position.Z
@@ -2951,7 +2622,7 @@ minBtn.Text = "—"; minBtn.TextColor3 = THEME.text
 minBtn.Font = THEME.fontBold; minBtn.TextSize = 12
 minBtn.AutoButtonColor = false; minBtn.Parent = titleBar; corner(minBtn, 6)
 
-local TABS = {"HOME", "MOVE", "FIGHT", "STATS", "TRAVEL"}
+local TABS = {"HOME", "MOVE", "FIGHT", "STATS"}
 
 local content = Instance.new("Frame")
 content.Size = UDim2.new(1, -16, 1, -152)
@@ -3301,9 +2972,6 @@ makeSlider("Move Speed", 50, 500, CONFIG.MoveSpeed,
     function(v) return v.." st/s" end, function(v) CONFIG.MoveSpeed = v end)
 makeSlider("Hover Height", 0, 60, CONFIG.HoverHeight,
     function(v) return v.." studs" end, function(v) CONFIG.HoverHeight = v end)
-makeToggle("Short Warp", CONFIG.WarpClose, function(v) CONFIG.WarpClose = v end)
-makeSlider("Warp Distance", 20, 200, CONFIG.WarpDistance,
-    function(v) return v.." studs" end, function(v) CONFIG.WarpDistance = v end)
 makeSlider("Void Guard Y", -1000, -50, CONFIG.SafeY,
     function(v) return tostring(v).." studs" end, function(v) CONFIG.SafeY = v end)
 
@@ -3368,44 +3036,6 @@ makeSegment("Stat", {"Melee","Sword","Gun","Fruit","Defense","All"}, CONFIG.Auto
     function(v) CONFIG.AutoStatTarget = v end)
 makeSlider("Stat Wait", 1, 15, CONFIG.AutoStatWait,
     function(v) return v.."s" end, function(v) CONFIG.AutoStatWait = v end)
-
-showTab(5) -- TRAVEL
-makeHeader("WORLD")
-makeSegment("World", {"1","2","3"}, tostring(CONFIG.TravelWorld),
-    function(v) CONFIG.TravelWorld = tonumber(v) end)
-makeButton("Travel To World", function() travelToWorld(CONFIG.TravelWorld) end)
-
-makeHeader("FAST TRAVEL")
-makeToggle("Spawn Bypass", CONFIG.SpawnBypass, function(v) CONFIG.SpawnBypass = v end)
-makeToggle("Fast Portal", CONFIG.FastPortal, function(v) CONFIG.FastPortal = v end)
-makeSlider("Bypass Distance", 500, 5000, CONFIG.BypassDistance,
-    function(v) return v.." studs" end, function(v) CONFIG.BypassDistance = v end)
-makeButton("Go To Quest Island", function()
-    local pos = state.questPos
-    if not pos then
-        local q = questFor(getMyLevel())
-        pos = q and q.pos
-    end
-    if not pos then dbg("No island known for this quest"); return end
-    task.spawn(function() spawnBypassTo(pos) end)
-end)
-makeHint("A long way is crossed with the spawn point of the island")
-
-makeHeader("ISLANDS")
-local knownIslands = islandPositions()
-for _, island in ipairs(knownIslands) do
-    local name = island.name
-    makeButton("Go: " .. name, function()
-        task.spawn(function()
-            if not (CONFIG.FastPortal and portalBypass(island.pos)) then
-                spawnBypassTo(island.pos)
-            end
-        end)
-    end)
-end
-if #knownIslands == 0 then
-    makeHint("The game has not told the islands yet")
-end
 
 showTab(1)
 
