@@ -1303,6 +1303,15 @@ local function bringMob(target, root)
         return
     end
 
+    -- The pack has one fixed point to stand on and the player comes to it.
+    -- Pulling to the player instead drags the whole pack around every time
+    -- the player turns or walks to the next fruit.
+    if state.bringTarget ~= target or not state.bringPoint then
+        state.bringTarget = target
+        state.bringPoint = anchor.Position
+    end
+    local point = state.bringPoint
+
     local list = {target}
     local count = CONFIG.BringMobCount or 0
     if count <= 0 then
@@ -1330,7 +1339,7 @@ local function bringMob(target, root)
         end
     end
 
-    for _, mob in ipairs(list) do
+    for i, mob in ipairs(list) do
         local part = anchorOf(mob)
         if part then
             local hum = mob:FindFirstChildOfClass("Humanoid")
@@ -1345,7 +1354,10 @@ local function bringMob(target, root)
             -- is put back on the point, so it does not slide off again.
             pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
             pcall(function() part.AssemblyAngularVelocity = Vector3.zero end)
-            local goal = Vector3.new(root.Position.X, part.Position.Y, root.Position.Z)
+            -- A small step apart, so they stand next to each other instead of
+            -- pushing each other off the one spot.
+            local shift = ((i - 1) % 3 - 1) * 2
+            local goal = Vector3.new(point.X + shift, part.Position.Y, point.Z)
             pcall(function() part.CFrame = CFrame.new(goal) end)
             pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
             state.bringMoved[mob] = now
