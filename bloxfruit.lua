@@ -1401,15 +1401,16 @@ local function stopTween()
     tweenGoal = nil
 end
 
-local function moveTo(cf)
+local function moveTo(cf, noWarp)
     local root = getRoot()
     if not root then return end
     local mode = CONFIG.MovementMode
     local hop = (root.Position - cf.Position).Magnitude
 
     -- A short hop inside the same island is accepted by the game, so it is
-    -- taken at once instead of being walked.
-    if CONFIG.WarpClose and hop <= (CONFIG.WarpDistance or 60) then
+    -- taken at once instead of being walked. The shop turns that off: the
+    -- teacher of a style has to see the player walk up to it.
+    if CONFIG.WarpClose and not noWarp and hop <= (CONFIG.WarpDistance or 60) then
         stopTween()
         root.CFrame = cf
         return
@@ -2088,8 +2089,8 @@ local function tryUpgradeStats()
     end
 end
 
-local function travelTo(cf)
-    moveTo(cf)
+local function travelTo(cf, noWarp)
+    moveTo(cf, noWarp)
     return false
 end
 
@@ -2130,6 +2131,16 @@ local function findTeacher(name)
     for _, npc in ipairs(Workspace:GetChildren()) do
         if npc:IsA("Model") and npc.Name == name and anchorOf(npc) then return npc end
     end
+    local manager = ReplicatedStorage:FindFirstChild("NPCManager")
+    if manager then
+        local ok, npc = pcall(function()
+            local mod = require(manager)
+            local list = mod.getNPCsByName(name)
+            local first = list and list[1]
+            return first and first._modelState and first._modelState._instance
+        end)
+        if ok and npc and anchorOf(npc) then return npc end
+    end
     return nil
 end
 
@@ -2158,19 +2169,22 @@ local function buyStyle(style)
                     near = true
                     break
                 end
-                travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)), true)
                 task.wait(0.2)
             end
         end)
     end
-    local ok, reply = pcall(function() return commF:InvokeServer(style.remote) end)
+    local ok, reply = true, nil
+    for _ = 1, 3 do
+        ok, reply = pcall(function() return commF:InvokeServer(style.remote) end)
+        if not ok or reply == false then
+            dbg("The game did not take the buy of " .. style.name)
+        end
+        task.wait(0.4)
+    end
     state.shopping = false
     dbg("Buy " .. style.name .. " from " .. (npc and "the teacher" or "far away")
         .. (npc and (near and " (stood at it)" or " (could not reach it)") or " (no teacher was seen)"))
-    if not ok or reply == false then
-        dbg("The game did not take the buy of " .. style.name)
-        return false
-    end
     return true
 end
 
