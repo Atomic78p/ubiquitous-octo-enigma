@@ -2132,25 +2132,6 @@ end
 -- Some islands cannot be tweened to at all (the sea floor, the islands the
 -- game only opens through a door). For those the game itself is asked to move
 -- the player. The remotes are the ones BananaHub uses.
-local function specialTravel(name)
-    local lower = tostring(name):lower()
-    local net = nil
-    local modules = ReplicatedStorage:FindFirstChild("Modules")
-    net = modules and modules:FindFirstChild("Net")
-    if not net then return false end
-    if lower:find("underwater", 1, true) or lower:find("submerged", 1, true) then
-        local sub = net:FindFirstChild("RF/SubmarineWorkerSpeak")
-        if sub then
-            local ok = pcall(function() sub:InvokeServer("TravelToSubmergedIsland") end)
-            if ok then
-                dbg("Asked the submarine to take us to " .. tostring(name))
-                return true
-            end
-        end
-    end
-    return false
-end
-
 -- Fly to a place with the tween of the script: no jump, no portal, just a
 -- straight tween across the sea, like the player would glide over.
 local function flyTo(position)
@@ -2185,6 +2166,38 @@ local function flyTo(position)
         return false
     end
     return true
+end
+
+-- The submarine of the game only takes the player from its own spot at Tiki,
+-- so the bot has to tween there first. The point is the one BananaHub uses.
+local SUBMERGED_FLY = Vector3.new(-16269.41, 23.98, 1371.66)
+
+local function specialTravel(name)
+    local lower = tostring(name):lower()
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local net = modules and modules:FindFirstChild("Net")
+    if not net then
+        dbg("The Net module of the game was not found")
+        return false
+    end
+    if lower:find("underwater", 1, true) or lower:find("submerged", 1, true) then
+        -- stand at the submarine first, then let it take us down
+        dbg("Flying to the submarine of " .. tostring(name))
+        flyTo(SUBMERGED_FLY)
+        local sub = net:FindFirstChild("RF/SubmarineWorkerSpeak")
+        if not sub then
+            dbg("The submarine remote of the game was not found")
+            return false
+        end
+        local ok = pcall(function() sub:InvokeServer("TravelToSubmergedIsland") end)
+        if ok then
+            dbg("Asked the submarine to take us to " .. tostring(name))
+            return true
+        end
+        dbg("The submarine refused to take us")
+        return false
+    end
+    return false
 end
 
 -- ================= MELEE / ABILITY SHOP =================
