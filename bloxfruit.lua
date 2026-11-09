@@ -45,6 +45,8 @@ local CONFIG = {
     AutoBuso        = true,
     Aoe             = true,
     AoeRange        = 80,
+    BossFarm        = false,
+    BossRange       = 3000,
     WarpClose       = true,
     WarpDistance    = 60,
     HoverHeight     = 14,
@@ -1225,6 +1227,49 @@ local function collectEnemies(now)
     return list
 end
 
+-- The bosses of the game (the list BananaHub farms with). With the boss farm
+-- on, the nearest one alive is taken over the quest mob: a boss gives far
+-- more experience than a normal mob.
+local BOSS_NAMES = {
+    ["gorilla king"] = true, ["bobby"] = true, ["the saw"] = true, ["yeti"] = true,
+    ["mob leader"] = true, ["vice admiral"] = true, ["saber expert"] = true,
+    ["warden"] = true, ["chief warden"] = true, ["swan"] = true,
+    ["magma admiral"] = true, ["fishman lord"] = true, ["wysper"] = true,
+    ["thunder god"] = true, ["cyborg"] = true, ["ice admiral"] = true,
+    ["diamond"] = true, ["jeremy"] = true, ["orbitus"] = true, ["don swan"] = true,
+    ["smoke admiral"] = true, ["awakened ice admiral"] = true, ["tide keeper"] = true,
+    ["stone"] = true, ["island empress"] = true, ["kilo admiral"] = true,
+    ["captain elephant"] = true, ["beautiful pirate"] = true, ["longma"] = true,
+    ["cake queen"] = true, ["greybeard"] = true, ["order"] = true,
+    ["cursed captain"] = true, ["darkbeard"] = true, ["soul reaper"] = true,
+    ["rip_indra true form"] = true, ["mihawk"] = true, ["cake prince"] = true,
+    ["dough king"] = true,
+}
+
+local function pickBoss(root, range)
+    if not root then return nil end
+    local best, bestD = nil, nil
+    for _, mob in ipairs(collectEnemies(tick())) do
+        local key = mobKey(mob.Name):lower()
+        local isBoss = BOSS_NAMES[key]
+        if not isBoss then
+            local display = nil
+            pcall(function() display = mob:GetAttribute("DisplayName") end)
+            isBoss = BOSS_NAMES[mobKey(display or ""):lower()]
+        end
+        if isBoss then
+            local anchor = anchorOf(mob)
+            if anchor then
+                local d = (anchor.Position - root.Position).Magnitude
+                if d <= range and (bestD == nil or d < bestD) then
+                    best, bestD = mob, d
+                end
+            end
+        end
+    end
+    return best
+end
+
 local function getTarget(mobName)
     local root = getRoot()
     if not root then return nil end
@@ -1398,9 +1443,29 @@ end
 -- ================= MOVEMENT =================
 local activeTween, tweenGoal
 
+local function setFlying()
+    -- While a tween moves the character, its own body (gravity, walking,
+    -- getting up) fights the CFrame and the flight looks jerky. The body is
+    -- put in the physics state and left alone until the move is over.
+    local hum = getHumanoid()
+    if not hum then return end
+    pcall(function() hum.PlatformStand = true end)
+    pcall(function() hum.AutoRotate = false end)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+end
+
+local function setWalking()
+    local hum = getHumanoid()
+    if not hum then return end
+    pcall(function() hum.PlatformStand = false end)
+    pcall(function() hum.AutoRotate = true end)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+end
+
 local function stopTween()
     if activeTween then activeTween:Cancel(); activeTween = nil end
     tweenGoal = nil
+    setWalking()
 end
 
 local function moveTo(cf, noWarp)
@@ -1424,20 +1489,29 @@ local function moveTo(cf, noWarp)
         local dist = (root.Position - cf.Position).Magnitude
         if dist < 6 then
             stopTween()
+            setWalking()
             root.CFrame = cf
             return
         end
-        if activeTween and tweenGoal and (tweenGoal.Position - cf.Position).Magnitude < 3
+        -- A running tween is left alone while its goal only shifts a little:
+        -- cancelling and building a new one every tick is what made the
+        -- flight jump. It is only replaced when the goal really moved.
+        if activeTween and tweenGoal
             and activeTween.PlaybackState == Enum.PlaybackState.Playing then
-            return
+            local moved = (tweenGoal.Position - cf.Position).Magnitude
+            local left = (root.Position - tweenGoal.Position).Magnitude
+            if moved < math.max(8, left * 0.5) then return end
         end
         if activeTween then activeTween:Cancel() end
+        setFlying()
         tweenGoal = cf
         activeTween = TweenService:Create(root,
-            TweenInfo.new(math.max(dist / CONFIG.MoveSpeed, 0.03), Enum.EasingStyle.Linear),
+            TweenInfo.new(math.max(dist / CONFIG.MoveSpeed, 0.1), Enum.EasingStyle.Sine,
+                Enum.EasingDirection.Out),
             {CFrame = cf})
         activeTween:Play()
     else
+        setWalking()
         local hum = getHumanoid()
         if hum then hum:MoveTo(cf.Position) end
     end
@@ -2126,6 +2200,29 @@ local function travelTo(cf, noWarp)
     return false
 end
 
+-- ================= WORLD (SEA) TRAVEL =================
+local WORLD_TRAVEL = {"TravelMain", "TravelDressrosa", "TravelZou"}
+
+-- The seas are separate places: the game moves the whole character between
+-- them, and the remotes are the ones BananaHub uses.
+local function travelToWorld(world)
+    local what = WORLD_TRAVEL[world]
+    if not what then return false end
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local commF = remotes and remotes:FindFirstChild("CommF_")
+    if not commF then
+        dbg("CommF_ remote missing")
+        return false
+    end
+    local ok = pcall(function() commF:InvokeServer(what) end)
+    if ok then
+        dbg("Travelling to world " .. tostring(world))
+        return true
+    end
+    dbg("The game did not take the travel to world " .. tostring(world))
+    return false
+end
+
 -- ================= FLY TO AN ISLAND =================
 local function islandPositions()
     local list, known = {}, {}
@@ -2177,9 +2274,11 @@ local function flyTo(position)
     local here = root.Position
     local distance = (here - position).Magnitude
     dbg("Flying to the island (" .. tostring(math.floor(distance)) .. " studs)")
+    setFlying()
     local ok, err = pcall(function()
         local tween = TweenService:Create(root,
-            TweenInfo.new(math.max(distance / CONFIG.MoveSpeed, 0.1), Enum.EasingStyle.Linear),
+            TweenInfo.new(math.max(distance / CONFIG.MoveSpeed, 0.2), Enum.EasingStyle.Sine,
+                Enum.EasingDirection.Out),
             {CFrame = CFrame.new(position + Vector3.new(0, 6, 0))})
         activeTween, tweenGoal = tween, CFrame.new(position)
         tween:Play()
@@ -2192,6 +2291,7 @@ local function flyTo(position)
         end
     end)
     state.flying = false
+    setWalking()
     if not ok then
         dbg("The flight failed: " .. tostring(err))
         return false
@@ -2586,6 +2686,10 @@ local function step()
     if info and info.target then mob = info.target end
 
     local target = getTarget(mob)
+    if CONFIG.BossFarm then
+        local boss = pickBoss(root, CONFIG.BossRange or 3000)
+        if boss then target = boss end
+    end
     if not target then
         local sp = findSpawn(mob)
         local anchor = sp and anchorOf(sp)
@@ -2651,7 +2755,10 @@ local function step()
     local swingTarget, swingAnchor = target, er
     if CONFIG.AutoAttack then
         local close = mobInReach(root, reach)
-        if close and close ~= target and flat > reach then
+        -- A boss is not given up for a normal mob that happens to stand near:
+        -- the boss is what the boss farm went there for.
+        local onBoss = CONFIG.BossFarm and BOSS_NAMES[mobKey(target.Name):lower()]
+        if close and close ~= target and flat > reach and not onBoss then
             if (state.autoBurst or 0) <= now then state.autoBurst = now + 2 end
             if state.autoBurst > now then
                 swingTarget = close
@@ -3190,6 +3297,12 @@ makeSlider("Warp Distance", 20, 200, CONFIG.WarpDistance,
 makeSlider("Void Guard Y", -1000, -50, CONFIG.SafeY,
     function(v) return tostring(v).." studs" end, function(v) CONFIG.SafeY = v end)
 
+makeHeader("WORLD (SEA)")
+makeButton("Go to Sea 1", function() task.spawn(function() travelToWorld(1) end) end)
+makeButton("Go to Sea 2", function() task.spawn(function() travelToWorld(2) end) end)
+makeButton("Go to Sea 3", function() task.spawn(function() travelToWorld(3) end) end)
+makeHint("The seas are separate places: this uses the travel of the game")
+
 makeHeader("FLY TO ISLAND (tween)")
 local islandList = islandPositions()
 for _, island in ipairs(islandList) do
@@ -3237,6 +3350,12 @@ makeSlider("Gun Range", 20, 120, CONFIG.GunRange,
 makeSlider("Attack Cooldown", 5, 100, math.floor(CONFIG.AttackCooldown*100),
     function(v) return string.format("%.2fs", v/100) end,
     function(v) CONFIG.AttackCooldown = v/100 end)
+
+makeHeader("BOSS FARM")
+makeToggle("Farm Bosses", CONFIG.BossFarm, function(v) CONFIG.BossFarm = v end)
+makeSlider("Boss Range", 500, 8000, CONFIG.BossRange,
+    function(v) return v.." studs" end, function(v) CONFIG.BossRange = v end)
+makeHint("Takes the nearest boss over the quest mob: a boss gives far more exp")
 
 makeHeader("MELEE SHOP (buy)")
 -- The buy is asked for right away: no walk to the teacher of the style.
