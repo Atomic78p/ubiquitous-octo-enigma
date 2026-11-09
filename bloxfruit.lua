@@ -2129,6 +2129,28 @@ local function islandPositions()
     return list
 end
 
+-- Some islands cannot be tweened to at all (the sea floor, the islands the
+-- game only opens through a door). For those the game itself is asked to move
+-- the player. The remotes are the ones BananaHub uses.
+local function specialTravel(name)
+    local lower = tostring(name):lower()
+    local net = nil
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    net = modules and modules:FindFirstChild("Net")
+    if not net then return false end
+    if lower:find("underwater", 1, true) or lower:find("submerged", 1, true) then
+        local sub = net:FindFirstChild("RF/SubmarineWorkerSpeak")
+        if sub then
+            local ok = pcall(function() sub:InvokeServer("TravelToSubmergedIsland") end)
+            if ok then
+                dbg("Asked the submarine to take us to " .. tostring(name))
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- Fly to a place with the tween of the script: no jump, no portal, just a
 -- straight tween across the sea, like the player would glide over.
 local function flyTo(position)
@@ -3074,9 +3096,12 @@ makeHeader("FLY TO ISLAND (tween)")
 local islandList = islandPositions()
 for _, island in ipairs(islandList) do
     local target = island.pos
+    local islandName = island.name
     makeButton("Go: " .. island.name, function()
         state.status = "Flying to " .. island.name
-        task.spawn(function() flyTo(target) end)
+        task.spawn(function()
+            if not specialTravel(islandName) then flyTo(target) end
+        end)
     end)
 end
 if #islandList == 0 then
