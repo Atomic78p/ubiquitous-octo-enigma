@@ -119,6 +119,7 @@ local state = {
     statAt        = 0,
     shopping      = false,
     flying        = false,
+    whirlpooling  = false,
     bringMoved    = setmetatable({}, {__mode = "k"}),
     bringIgnored  = setmetatable({}, {__mode = "k"}),
     bringHealth   = setmetatable({}, {__mode = "k"}),
@@ -2090,7 +2091,37 @@ local function tryUpgradeStats()
     end
 end
 
+takeWhirlpool = nil
+
+-- Is this destination a place under the sea, and is the player still up here?
+-- Then walking or tweening there is hopeless: the whirlpool is the way in.
+local function needsWhirlpool(pos)
+    if not (pos and pos.X and pos.Y and pos.Z) then return false end
+    local root = getRoot()
+    if not root then return false end
+    local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
+    if not (ok and type(map) == "table") then return false end
+    for name, place in pairs(map) do
+        local lower = tostring(name):lower()
+        if lower:find("underwater", 1, true) or lower:find("submerged", 1, true) then
+            if place and place.X and place.Y and place.Z then
+                if (place - pos).Magnitude < 2000
+                    and (root.Position - place).Magnitude > 2000 then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 local function travelTo(cf, noWarp)
+    -- A farm under the sea goes through the whirlpool of the sea first.
+    if not noWarp and not state.whirlpooling and takeWhirlpool and needsWhirlpool(cf.Position) then
+        state.whirlpooling = true
+        takeWhirlpool()
+        state.whirlpooling = false
+    end
     moveTo(cf, noWarp)
     return false
 end
@@ -2250,6 +2281,57 @@ local function findTeacher(name)
     return nil
 end
 
+-- The teacher of these styles stands under the sea (Underwater): the way
+-- there is the whirlpool of the sea, which drops the player in.
+local WHIRLPOOL_STYLES = {["Fishman Karate"] = true, ["Water Kung Fu"] = true}
+
+local function findWhirlpool()
+    for _, obj in ipairs(Workspace:GetChildren()) do
+        if obj.Name:lower():find("whirlpool", 1, true) then return obj end
+    end
+    local origin = Workspace:FindFirstChild("_WorldOrigin")
+    local locations = origin and origin:FindFirstChild("Locations")
+    if locations then
+        for _, island in ipairs(locations:GetChildren()) do
+            if island.Name:lower():find("whirlpool", 1, true) then return island end
+        end
+    end
+    return nil
+end
+
+-- Fly into the whirlpool of the sea and wait until the game drops the player
+-- under it. That is the way to Underwater (the Water Kung-fu teacher lives
+-- there too).
+function takeWhirlpool()
+    local pool = findWhirlpool()
+    if not pool then
+        dbg("The whirlpool of the sea was not found")
+        return false
+    end
+    local part = anchorOf(pool)
+    if not part then
+        dbg("The whirlpool has no place to fly to")
+        return false
+    end
+    local root = getRoot()
+    local before = root and root.Position
+    dbg("Flying into the whirlpool of the sea")
+    flyTo(part.Position)
+    local deadline = tick() + 20
+    while tick() < deadline do
+        local now = getRoot()
+        if not now then break end
+        if before and (now.Position - before).Magnitude > 500 then
+            dbg("The whirlpool took us under the sea")
+            return true
+        end
+        travelTo(CFrame.new(part.Position), true)
+        task.wait(0.3)
+    end
+    dbg("The whirlpool did not take us this time")
+    return false
+end
+
 -- The game only takes the buy when the player stands at the teacher of the
 -- style, so the bot walks to it first and asks there.
 local function buyStyle(style)
@@ -2263,6 +2345,9 @@ local function buyStyle(style)
         return false
     end
     state.shopping = true
+    if WHIRLPOOL_STYLES[style.name] then
+        takeWhirlpool()
+    end
     local npc = findTeacher(style.teacher)
     local near = false
     if npc then
