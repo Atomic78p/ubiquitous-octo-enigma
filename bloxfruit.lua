@@ -118,6 +118,7 @@ local state = {
     questPos      = nil,
     statAt        = 0,
     shopping      = false,
+    flying        = false,
     bringMoved    = setmetatable({}, {__mode = "k"}),
     bringIgnored  = setmetatable({}, {__mode = "k"}),
     bringHealth   = setmetatable({}, {__mode = "k"}),
@@ -2094,6 +2095,76 @@ local function travelTo(cf, noWarp)
     return false
 end
 
+-- ================= FLY TO AN ISLAND =================
+local function islandPositions()
+    local list, known = {}, {}
+    local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
+    if ok and type(map) == "table" then
+        for name, pos in pairs(map) do
+            if pos and pos.X and pos.Y and pos.Z then
+                table.insert(list, {name = tostring(name), pos = pos})
+                known[tostring(name)] = true
+            end
+        end
+    end
+    local origin = Workspace:FindFirstChild("_WorldOrigin")
+    local locations = origin and origin:FindFirstChild("Locations")
+    if locations then
+        for _, island in ipairs(locations:GetChildren()) do
+            if island:IsA("BasePart") and not known[island.Name] then
+                table.insert(list, {name = island.Name, pos = island.Position})
+                known[island.Name] = true
+            end
+        end
+    end
+    local root = getRoot()
+    table.sort(list, function(a, b)
+        if root then
+            local da = (root.Position - a.pos).Magnitude
+            local db = (root.Position - b.pos).Magnitude
+            if da ~= db then return da < db end
+        end
+        return a.name < b.name
+    end)
+    return list
+end
+
+-- Fly to a place with the tween of the script: no jump, no portal, just a
+-- straight tween across the sea, like the player would glide over.
+local function flyTo(position)
+    local root = getRoot()
+    if not root or not position then return false end
+    if state.flying then
+        dbg("Already flying to an island")
+        return false
+    end
+    state.flying = true
+    stopTween()
+    local here = root.Position
+    local distance = (here - position).Magnitude
+    dbg("Flying to the island (" .. tostring(math.floor(distance)) .. " studs)")
+    local ok, err = pcall(function()
+        local tween = TweenService:Create(root,
+            TweenInfo.new(math.max(distance / CONFIG.MoveSpeed, 0.1), Enum.EasingStyle.Linear),
+            {CFrame = CFrame.new(position + Vector3.new(0, 6, 0))})
+        activeTween, tweenGoal = tween, CFrame.new(position)
+        tween:Play()
+        local deadline = tick() + math.max(distance / CONFIG.MoveSpeed, 0.1) + 5
+        while tick() < deadline do
+            local now = getRoot()
+            if not now then break end
+            if (now.Position - position).Magnitude <= 12 then break end
+            task.wait(0.2)
+        end
+    end)
+    state.flying = false
+    if not ok then
+        dbg("The flight failed: " .. tostring(err))
+        return false
+    end
+    return true
+end
+
 -- ================= MELEE / ABILITY SHOP =================
 local STYLE_SHOP = {
     {name = "Black Leg",       remote = "BuyBlackLeg",       teacher = "Dark Step Teacher"},
@@ -2242,8 +2313,8 @@ local function step()
         return
     end
 
-    -- A shop buy owns the movement of the character while it runs.
-    if state.shopping then return end
+    -- A shop buy or a flight owns the movement of the character while it runs.
+    if state.shopping or state.flying then return end
 
     if not state.lastPos or (root.Position - state.lastPos).Magnitude > 1 then
         state.lastPos = root.Position
@@ -2998,6 +3069,19 @@ makeSlider("Warp Distance", 20, 200, CONFIG.WarpDistance,
     function(v) return v.." studs" end, function(v) CONFIG.WarpDistance = v end)
 makeSlider("Void Guard Y", -1000, -50, CONFIG.SafeY,
     function(v) return tostring(v).." studs" end, function(v) CONFIG.SafeY = v end)
+
+makeHeader("FLY TO ISLAND (tween)")
+local islandList = islandPositions()
+for _, island in ipairs(islandList) do
+    local target = island.pos
+    makeButton("Go: " .. island.name, function()
+        state.status = "Flying to " .. island.name
+        task.spawn(function() flyTo(target) end)
+    end)
+end
+if #islandList == 0 then
+    makeHint("The game has not told the islands yet")
+end
 
 makeHeader("BRING MOB")
 makeToggle("Bring Mob", CONFIG.BringMob, function(v) CONFIG.BringMob = v end)
