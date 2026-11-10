@@ -2254,11 +2254,15 @@ local function needsWhirlpool(pos)
 end
 
 local function travelTo(cf, noWarp)
-    -- A farm under the sea goes through the whirlpool of the sea first.
+    -- A farm under the sea goes through the whirlpool of the sea first: fly
+    -- there with the tween of the script, let the game drop the player under
+    -- the sea, and only then walk the rest of the way. Nothing on this route
+    -- is ever warped: a teleport here is what made the character jump around.
     if not noWarp and not state.whirlpooling and takeWhirlpool and needsWhirlpool(cf.Position) then
         state.whirlpooling = true
         takeWhirlpool()
         state.whirlpooling = false
+        noWarp = true
     end
     moveTo(cf, noWarp)
     return false
@@ -2341,8 +2345,8 @@ local function flyTo(position)
     setFlying()
     local ok, err = pcall(function()
         local tween = TweenService:Create(root,
-            TweenInfo.new(math.max(distance / CONFIG.MoveSpeed, 0.2), Enum.EasingStyle.Sine,
-                Enum.EasingDirection.Out),
+            TweenInfo.new(math.max(distance / CONFIG.MoveSpeed, 0.2),
+                Enum.EasingStyle.Linear),
             {CFrame = CFrame.new(position + Vector3.new(0, 6, 0))})
         activeTween, tweenGoal = tween, CFrame.new(position)
         tween:Play()
@@ -2494,6 +2498,9 @@ function takeWhirlpool()
         if not now then break end
         if before and (now.Position - before).Magnitude > 500 then
             dbg("The whirlpool took us under the sea")
+            -- the mobs and the givers under the sea are streamed in a moment
+            -- later: the farm starts when the place is there
+            task.wait(0.8)
             return true
         end
         travelTo(CFrame.new(part.Position), true)
