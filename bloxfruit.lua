@@ -2240,65 +2240,6 @@ takeWhirlpool = nil
 
 -- Is this destination a place under the sea, and is the player still up here?
 -- Then walking or tweening there is hopeless: the whirlpool is the way in.
-local function needsWhirlpool(pos)
-    if not (pos and pos.X and pos.Y and pos.Z) then return false end
-    local root = getRoot()
-    if not root then return false end
-    local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
-    if not (ok and type(map) == "table") then return false end
-    for name, place in pairs(map) do
-        local lower = tostring(name):lower()
-        if lower:find("underwater", 1, true) or lower:find("submerged", 1, true) then
-            if place and place.X and place.Y and place.Z then
-                if (place - pos).Magnitude < 2000
-                    and (root.Position - place).Magnitude > 2000 then
-                    return true
-                end
-            end
-        end
-    end
-    return false
-end
-
-function travelTo(cf, noWarp)
-    -- A farm under the sea goes through the whirlpool of the sea first: fly
-    -- there with the tween of the script, let the game drop the player under
-    -- the sea, and only then walk the rest of the way. Nothing on this route
-    -- is ever warped: a teleport here is what made the character jump around.
-    if not noWarp and not state.whirlpooling and takeWhirlpool and needsWhirlpool(cf.Position) then
-        state.whirlpooling = true
-        takeWhirlpool()
-        state.whirlpooling = false
-        noWarp = true
-    end
-    moveTo(cf, noWarp)
-    return false
-end
-
--- ================= WORLD (SEA) TRAVEL =================
-local WORLD_TRAVEL = {"TravelMain", "TravelDressrosa", "TravelZou"}
-
--- The seas are separate places: the game moves the whole character between
--- them, and the remotes are the ones BananaHub uses.
-local function travelToWorld(world)
-    local what = WORLD_TRAVEL[world]
-    if not what then return false end
-    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-    local commF = remotes and remotes:FindFirstChild("CommF_")
-    if not commF then
-        dbg("CommF_ remote missing")
-        return false
-    end
-    local ok = pcall(function() commF:InvokeServer(what) end)
-    if ok then
-        dbg("Travelling to world " .. tostring(world))
-        return true
-    end
-    dbg("The game did not take the travel to world " .. tostring(world))
-    return false
-end
-
--- ================= FLY TO AN ISLAND =================
 local function islandPositions()
     local list, known = {}, {}
     local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
@@ -2331,6 +2272,79 @@ local function islandPositions()
     end)
     return list
 end
+
+local function needsWhirlpool(pos)
+    if not (pos and pos.X and pos.Y and pos.Z) then return false end
+    local root = getRoot()
+    if not root then return false end
+    for _, island in ipairs(islandPositions()) do
+        local name = island.name:lower()
+        if name:find("underwater", 1, true) or name:find("submerged", 1, true) then
+            -- the destination is inside that place and we are still up here
+            if (island.pos - pos).Magnitude < 4000
+                and (root.Position - island.pos).Magnitude > 2000 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Where the warp door of the sea is: the whirlpool island of the game, with
+-- the whirlpool part of the world as the fallback.
+function whirlpoolPos()
+    for _, island in ipairs(islandPositions()) do
+        if island.name:lower():find("whirlpool", 1, true) then return island.pos end
+    end
+    for _, obj in ipairs(Workspace:GetChildren()) do
+        if obj.Name:lower():find("whirlpool", 1, true) then
+            local a = anchorOf(obj)
+            if a then return a.Position end
+        end
+    end
+    return nil
+end
+
+function travelTo(cf, noWarp)
+    -- A farm under the sea goes through the whirlpool of the sea first: fly
+    -- there with the tween of the script, let the game drop the player under
+    -- the sea, and only then walk the rest of the way. Nothing on this route
+    -- is ever warped: a teleport here is what made the character jump around.
+    if not noWarp and not state.whirlpooling and takeWhirlpool and needsWhirlpool(cf.Position) then
+        state.whirlpooling = true
+        takeWhirlpool()
+        state.whirlpooling = false
+        noWarp = true
+    end
+    moveTo(cf, noWarp)
+    return false
+end
+
+
+-- ================= WORLD (SEA) TRAVEL =================
+local WORLD_TRAVEL = {"TravelMain", "TravelDressrosa", "TravelZou"}
+
+-- The seas are separate places: the game moves the whole character between
+-- them, and the remotes are the ones BananaHub uses.
+local function travelToWorld(world)
+    local what = WORLD_TRAVEL[world]
+    if not what then return false end
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local commF = remotes and remotes:FindFirstChild("CommF_")
+    if not commF then
+        dbg("CommF_ remote missing")
+        return false
+    end
+    local ok = pcall(function() commF:InvokeServer(what) end)
+    if ok then
+        dbg("Travelling to world " .. tostring(world))
+        return true
+    end
+    dbg("The game did not take the travel to world " .. tostring(world))
+    return false
+end
+
+-- ================= FLY TO AN ISLAND =================
 
 -- Some islands cannot be tweened to at all (the sea floor, the islands the
 -- game only opens through a door). For those the game itself is asked to move
@@ -2461,36 +2475,18 @@ end
 -- there is the whirlpool of the sea, which drops the player in.
 local WHIRLPOOL_STYLES = {["Fishman Karate"] = true, ["Water Kung Fu"] = true}
 
-local function findWhirlpool()
-    for _, obj in ipairs(Workspace:GetChildren()) do
-        if obj.Name:lower():find("whirlpool", 1, true) then return obj end
-    end
-    local origin = Workspace:FindFirstChild("_WorldOrigin")
-    local locations = origin and origin:FindFirstChild("Locations")
-    if locations then
-        for _, island in ipairs(locations:GetChildren()) do
-            if island.Name:lower():find("whirlpool", 1, true) then return island end
-        end
-    end
-    return nil
-end
 
--- Fly into the whirlpool of the sea and wait until the game drops the player
+-- Fly to the whirlpool of the sea and wait until the game drops the player
 -- under it. That is the way to Underwater (the Water Kung-fu teacher lives
--- there too).
+-- there too). Nothing here is warped: it is a normal flight at MoveSpeed.
 function takeWhirlpool()
-    local pool = findWhirlpool()
-    if not pool then
+    local pos = whirlpoolPos()
+    if not pos then
         dbg("The whirlpool of the sea was not found")
         return false
     end
-    local part = anchorOf(pool)
-    if not part then
-        dbg("The whirlpool has no place to fly to")
-        return false
-    end
     dbg("Flying into the whirlpool of the sea")
-    flyTo(part.Position)
+    flyTo(pos)
     -- the place to compare against is where the flight left the player: the
     -- jump the game does from here is what puts us under the sea
     local root = getRoot()
@@ -2506,7 +2502,7 @@ function takeWhirlpool()
             task.wait(0.8)
             return true
         end
-        travelTo(CFrame.new(part.Position), true)
+        travelTo(CFrame.new(pos), true)
         task.wait(0.3)
     end
     dbg("The whirlpool did not take us this time")
