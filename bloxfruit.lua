@@ -52,6 +52,7 @@ CONFIG = {
     AutoBuso        = true,
     Aoe             = true,
     AoeRange        = 80,
+    BringMobMax     = 8,
     BossFarm        = false,
     BossRange       = 3000,
     WarpClose       = true,
@@ -390,10 +391,9 @@ local function enlargeHitbox(target)
     if not anchor or not anchor.Size then return end
     local size = CONFIG.HitboxSize or 16
     if anchor.Size.X >= size then return end
-    local now = tick()
-    if now < (state.hitboxAt or 0) then return end
-    state.hitboxAt = now + 2
+    state.hitboxAt = tick()
     pcall(function() anchor.Size = Vector3.new(size, size, size) end)
+    pcall(function() anchor.CanCollide = false end)
 end
 
 -- ================= GAME QUEST DATA =================
@@ -1380,7 +1380,7 @@ local function bringMob(target, root)
         end
     end
     for mob, at in pairs(state.bringIgnored) do
-        if now - at > 60 then
+        if now - at > 30 then
             local marker = mob:FindFirstChild("Ignored")
             if marker then pcall(function() marker:Destroy() end) end
             state.bringIgnored[mob] = nil
@@ -1391,7 +1391,8 @@ local function bringMob(target, root)
             state.bringMoved[mob] = nil
             local hum = mob:FindFirstChildOfClass("Humanoid")
             local hp = hum and hum.Health
-            if hp and state.bringHealth[mob] == hp and not mob:FindFirstChild("Ignored") then
+            if mob ~= target and hp and state.bringHealth[mob] == hp
+                and not mob:FindFirstChild("Ignored") then
                 -- It is not being hurt: it is put back and left alone.
                 local part = anchorOf(mob)
                 if part then
@@ -1409,7 +1410,7 @@ local function bringMob(target, root)
     local dz = root.Position.Z - anchor.Position.Z
     if math.sqrt(dx * dx + dz * dz) > CONFIG.BringMobRange then return end
     if now < (state.bringAt or 0) then return end
-    state.bringAt = now + 0.1
+    state.bringAt = now + 0.15
 
     if target:FindFirstChild("Ignored") then return end
 
@@ -1430,9 +1431,10 @@ local function bringMob(target, root)
     local list = {target}
     local count = CONFIG.BringMobCount or 0
     if count <= 0 then
-        -- zero means every mob of the kind: the whole pack stands on one point
+        -- zero means every mob of the kind, up to the cap of the pull
         count = math.huge
     end
+    count = math.min(count, CONFIG.BringMobMax or 8)
     local key = mobKey(target.Name)
     if count > 1 then
         local near = {}
@@ -1460,14 +1462,18 @@ local function bringMob(target, root)
     for i, mob in ipairs(list) do
         local part = anchorOf(mob)
         if part then
-            local shift = ((i - 1) % 3 - 1) * 2
-            local goal = Vector3.new(point.X + shift, part.Position.Y, point.Z)
+            -- Three to a row on the ground of the spawn point: the height is
+            -- the one of the ground, not the one the mob happened to float at.
+            local col = (i - 1) % 3
+            local row = math.floor((i - 1) / 3)
+            local goal = Vector3.new(point.X + (col - 1) * 2.3, point.Y + 1.8,
+                point.Z + row * 2.3)
             local off = (part.Position - goal).Magnitude
             local vel = part.AssemblyLinearVelocity
             local speed = vel and vel.Magnitude or 0
             -- A mob that already stands still on its step is left alone: it is
             -- only handled when it drifted away or something is moving it.
-            if off > 3 or speed > 2 then
+            if off > 2.5 or speed > 2 then
                 local hum = mob:FindFirstChildOfClass("Humanoid")
                 if hum then
                     pcall(function() hum.PlatformStand = true end)
@@ -1480,7 +1486,7 @@ local function bringMob(target, root)
                     pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
                     pcall(function() part.AssemblyAngularVelocity = Vector3.zero end)
                 end
-                if off > 3 then
+                if off > 2.5 then
                     pcall(function() part.CFrame = CFrame.new(goal) end)
                 end
                 pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
@@ -1538,7 +1544,7 @@ local function moveTo(cf, noWarp)
         root.CFrame = cf
     elseif mode == "Tween" then
         local dist = (root.Position - cf.Position).Magnitude
-        if dist < 6 and not noWarp then
+        if dist < 9 and not noWarp then
             stopTween()
             setWalking()
             root.CFrame = cf
@@ -1551,14 +1557,14 @@ local function moveTo(cf, noWarp)
             and activeTween.PlaybackState == Enum.PlaybackState.Playing then
             local moved = (tweenGoal.Position - cf.Position).Magnitude
             local left = (root.Position - tweenGoal.Position).Magnitude
-            if moved < math.max(8, left * 0.5) then return end
+            if moved < math.max(12, left * 0.4) then return end
         end
         if activeTween then activeTween:Cancel() end
         setFlying()
         tweenGoal = cf
         activeTween = TweenService:Create(root,
-            TweenInfo.new(math.max(dist / CONFIG.MoveSpeed, 0.1), Enum.EasingStyle.Sine,
-                Enum.EasingDirection.Out),
+            TweenInfo.new(math.clamp(dist / CONFIG.MoveSpeed, 0.18, 6),
+                Enum.EasingStyle.Linear),
             {CFrame = cf})
         activeTween:Play()
     else
@@ -1613,8 +1619,15 @@ RunService.Stepped:Connect(function()
             return
         end
         applyNoclip()
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
+        -- A tween is moving the character itself: zeroing its speed here
+        -- every frame is what made the flight stutter. Only a character that
+        -- is not on a tween is held in place.
+        local tweenPlaying = activeTween
+            and activeTween.PlaybackState == Enum.PlaybackState.Playing
+        if not tweenPlaying then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
     end)
 end)
 
@@ -2559,16 +2572,41 @@ local function buyAbility(remote, what)
 end
 
 -- ================= MAIN LOOP =================
+-- Everything that pointed at the character that just died is dropped here.
+-- Without this the farm keeps chasing a corpse: the old target, the old
+-- bring point, the old fruit and the old tween all stay behind.
+local function fullReset(reason)
+    stopTween()
+    restoreNoclip()
+    state.farming = false
+    state.fruit, state.fruitTools, state.fruitTries = nil, nil, 0
+    state.lastTarget, state.targetHealth, state.targetAt, state.targetDist = nil, nil, 0, nil
+    state.bringPoint, state.bringTarget = nil, nil
+    state.bringMoved = setmetatable({}, {__mode = "k"})
+    state.bringIgnored = setmetatable({}, {__mode = "k"})
+    state.bringHealth = setmetatable({}, {__mode = "k"})
+    state.bringAt = 0
+    state.flying, state.shopping, state.questing, state.whirlpooling = false, false, false, false
+    state.lastSafe, state.lastPos, state.movedAt = nil, nil, 0
+    stuckTargets = {}
+    enemyCache, enemyCacheAt = {}, 0
+    dbg("Reset after: " .. tostring(reason))
+end
+
 local function step()
     local root, hum = getRoot(), getHumanoid()
     local now = tick()
     if not root or not hum or hum.Health <= 0 then
-        state.farming = false
+        if not state.dead then
+            state.dead = true
+            fullReset("the character died")
+        end
         state.status = "Respawning..."
-        state.lastSafe = nil
-        state.lastPos = nil
-        state.movedAt = 0
         return
+    end
+    if state.dead then
+        state.dead = false
+        dbg("The character is back, farming again")
     end
 
     if state.shakerAt == nil or now - state.shakerAt > 30 then
@@ -2769,6 +2807,12 @@ local function step()
         return
     end
 
+    -- A target that was marked ignored or stuck earlier is cleared before it
+    -- is attacked: one old mark is what left a single mob unkillable.
+    local stale = target:FindFirstChild("Ignored")
+    if stale then pcall(function() stale:Destroy() end) end
+    stuckTargets[target] = nil
+
     local er = anchorOf(target)
     if not er then return end
 
@@ -2876,6 +2920,17 @@ local function step()
         end
     end
 end
+
+pcall(function()
+    LocalPlayer.CharacterAdded:Connect(function()
+        fullReset("a new character came in")
+        state.dead = false
+        dbg("New character, farming again")
+    end)
+    LocalPlayer.CharacterRemoving:Connect(function()
+        fullReset("the character was removed")
+    end)
+end)
 
 task.spawn(function()
     while true do
