@@ -1499,7 +1499,30 @@ end
 -- ================= MOVEMENT =================
 local activeTween, tweenGoal
 
-local function setFlying()
+-- The one tween of the script. Every trip of the character goes through here,
+-- so the walk to a mob, the flight to an island and the way into the whirlpool
+-- all move at exactly CONFIG.MoveSpeed. There is no cap: a longer way simply
+-- takes longer, it is never rushed (a rushed flight is what the game undoes).
+function tweenTo(cf)
+    local root = getRoot()
+    if not root then return end
+    local dist = (root.Position - cf.Position).Magnitude
+    if activeTween and tweenGoal
+        and activeTween.PlaybackState == Enum.PlaybackState.Playing then
+        local moved = (tweenGoal.Position - cf.Position).Magnitude
+        local left = (root.Position - tweenGoal.Position).Magnitude
+        if moved < math.max(12, left * 0.4) then return end
+    end
+    if activeTween then activeTween:Cancel() end
+    setFlying()
+    tweenGoal = cf
+    activeTween = TweenService:Create(root,
+        TweenInfo.new(math.max(dist / CONFIG.MoveSpeed, 0.12), Enum.EasingStyle.Linear),
+        {CFrame = cf})
+    activeTween:Play()
+end
+
+function setFlying()
     -- While a tween moves the character, its own body (gravity, walking,
     -- getting up) fights the CFrame and the flight looks jerky. The body is
     -- put in the physics state and left alone until the move is over.
@@ -1510,7 +1533,7 @@ local function setFlying()
     pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
 end
 
-local function setWalking()
+function setWalking()
     local hum = getHumanoid()
     if not hum then return end
     pcall(function() hum.PlatformStand = false end)
@@ -1518,13 +1541,13 @@ local function setWalking()
     pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
 end
 
-local function stopTween()
+function stopTween()
     if activeTween then activeTween:Cancel(); activeTween = nil end
     tweenGoal = nil
     setWalking()
 end
 
-local function moveTo(cf, noWarp)
+function moveTo(cf, noWarp)
     local root = getRoot()
     if not root then return end
     local mode = CONFIG.MovementMode
@@ -1550,23 +1573,7 @@ local function moveTo(cf, noWarp)
             root.CFrame = cf
             return
         end
-        -- A running tween is left alone while its goal only shifts a little:
-        -- cancelling and building a new one every tick is what made the
-        -- flight jump. It is only replaced when the goal really moved.
-        if activeTween and tweenGoal
-            and activeTween.PlaybackState == Enum.PlaybackState.Playing then
-            local moved = (tweenGoal.Position - cf.Position).Magnitude
-            local left = (root.Position - tweenGoal.Position).Magnitude
-            if moved < math.max(12, left * 0.4) then return end
-        end
-        if activeTween then activeTween:Cancel() end
-        setFlying()
-        tweenGoal = cf
-        activeTween = TweenService:Create(root,
-            TweenInfo.new(math.clamp(dist / CONFIG.MoveSpeed, 0.18, 6),
-                Enum.EasingStyle.Linear),
-            {CFrame = cf})
-        activeTween:Play()
+        tweenTo(cf)
     else
         setWalking()
         local hum = getHumanoid()
@@ -2253,7 +2260,7 @@ local function needsWhirlpool(pos)
     return false
 end
 
-local function travelTo(cf, noWarp)
+function travelTo(cf, noWarp)
     -- A farm under the sea goes through the whirlpool of the sea first: fly
     -- there with the tween of the script, let the game drop the player under
     -- the sea, and only then walk the rest of the way. Nothing on this route
@@ -2344,13 +2351,9 @@ local function flyTo(position)
     dbg("Flying to the island (" .. tostring(math.floor(distance)) .. " studs)")
     setFlying()
     local ok, err = pcall(function()
-        local tween = TweenService:Create(root,
-            TweenInfo.new(math.max(distance / CONFIG.MoveSpeed, 0.2),
-                Enum.EasingStyle.Linear),
-            {CFrame = CFrame.new(position + Vector3.new(0, 6, 0))})
-        activeTween, tweenGoal = tween, CFrame.new(position)
-        tween:Play()
-        local deadline = tick() + math.max(distance / CONFIG.MoveSpeed, 0.1) + 5
+        -- the very same tween as the walk to a mob
+        tweenTo(CFrame.new(position + Vector3.new(0, 6, 0)))
+        local deadline = tick() + math.max(distance / CONFIG.MoveSpeed, 0.12) + 5
         while tick() < deadline do
             local now = getRoot()
             if not now then break end
