@@ -1,11 +1,13 @@
 -- // Blox Fruits Auto-Farm — Fixed Build
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local Workspace         = game:GetService("Workspace")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService  = game:GetService("UserInputService")
-local TweenService      = game:GetService("TweenService")
-local LocalPlayer       = Players.LocalPlayer
+-- The services are put in the global table on purpose: the script has a hard
+-- limit of 200 locals in one chunk, and it is already close to it.
+Players           = game:GetService("Players")
+RunService        = game:GetService("RunService")
+Workspace         = game:GetService("Workspace")
+ReplicatedStorage = game:GetService("ReplicatedStorage")
+UserInputService  = game:GetService("UserInputService")
+TweenService      = game:GetService("TweenService")
+LocalPlayer       = Players.LocalPlayer
 
 pcall(function() Workspace.StreamingEnabled = false end)
 pcall(function() Workspace.StreamingMinRadius = 1e8 end)
@@ -27,7 +29,10 @@ local CONFIG = {
     HitboxMagnitude = 120,
     WeaponMode      = "Melee",
     MeleeRange      = 10,
-    GunRange        = 60,
+    GunRange        = 70,
+    FruitRange      = 70,
+    AutoBuyStyles   = false,
+    AutoSaber       = false,
     MeleeHover      = 4,
     BringMob        = true,
     BringMobRange   = 35,
@@ -122,6 +127,7 @@ local state = {
     shopping      = false,
     flying        = false,
     whirlpooling  = false,
+    questing      = false,
     bringMoved    = setmetatable({}, {__mode = "k"}),
     bringIgnored  = setmetatable({}, {__mode = "k"}),
     bringHealth   = setmetatable({}, {__mode = "k"}),
@@ -285,7 +291,9 @@ local function fallbackRank(tool)
 end
 
 local function attackRange(tool)
-    if tool and isGun(tool) then return CONFIG.GunRange end
+    if not tool then return CONFIG.MeleeRange end
+    if isGun(tool) then return CONFIG.GunRange end
+    if isFruit(tool) then return CONFIG.FruitRange or CONFIG.GunRange end
     return CONFIG.MeleeRange
 end
 
@@ -1208,7 +1216,8 @@ local function collectEnemies(now)
         for _, e in ipairs(folder:GetChildren()) do
             local hum = e:FindFirstChildOfClass("Humanoid")
             local stuck = stuckTargets[e]
-            if hum and hum.Health > 0 and (not stuck or stuck < now) then
+            if hum and hum.Health > 0 and (not stuck or stuck < now)
+                and not e:FindFirstChild("Ignored") then
                 table.insert(list, e)
             end
         end
@@ -1217,7 +1226,8 @@ local function collectEnemies(now)
             if child:IsA("Model") and not child.Name:lower():find("quest", 1, true) then
                 local hum = child:FindFirstChildOfClass("Humanoid")
                 local stuck = stuckTargets[child]
-                if hum and hum.Health > 0 and (not stuck or stuck < now) then
+                if hum and hum.Health > 0 and (not stuck or stuck < now)
+                    and not child:FindFirstChild("Ignored") then
                     table.insert(list, child)
                 end
             end
@@ -1231,43 +1241,73 @@ end
 -- on, the nearest one alive is taken over the quest mob: a boss gives far
 -- more experience than a normal mob.
 local BOSS_NAMES = {
-    ["gorilla king"] = true, ["bobby"] = true, ["the saw"] = true, ["yeti"] = true,
+    -- the bosses of the wiki list (First, Second and Third Sea)
+    ["the gorilla king"] = true, ["chef"] = true, ["the saw"] = true, ["yeti"] = true,
     ["mob leader"] = true, ["vice admiral"] = true, ["saber expert"] = true,
-    ["warden"] = true, ["chief warden"] = true, ["swan"] = true,
-    ["magma admiral"] = true, ["fishman lord"] = true, ["wysper"] = true,
-    ["thunder god"] = true, ["cyborg"] = true, ["ice admiral"] = true,
-    ["diamond"] = true, ["jeremy"] = true, ["orbitus"] = true, ["don swan"] = true,
-    ["smoke admiral"] = true, ["awakened ice admiral"] = true, ["tide keeper"] = true,
-    ["stone"] = true, ["island empress"] = true, ["kilo admiral"] = true,
-    ["captain elephant"] = true, ["beautiful pirate"] = true, ["longma"] = true,
-    ["cake queen"] = true, ["greybeard"] = true, ["order"] = true,
-    ["cursed captain"] = true, ["darkbeard"] = true, ["soul reaper"] = true,
-    ["rip_indra true form"] = true, ["mihawk"] = true, ["cake prince"] = true,
-    ["dough king"] = true,
+    ["warden"] = true, ["magma general"] = true, ["fishman lord"] = true,
+    ["sky warlord"] = true, ["lightning god"] = true, ["cyborg"] = true,
+    ["ice admiral"] = true, ["diamond"] = true, ["jeremy"] = true, ["orbitus"] = true,
+    ["don swan"] = true, ["smoke admiral"] = true, ["awakened ice admiral"] = true,
+    ["tide keeper"] = true, ["rip_indra"] = true, ["stone"] = true,
+    ["hydra leader"] = true, ["kilo admiral"] = true, ["captain elephant"] = true,
+    ["beautiful pirate"] = true, ["longma"] = true, ["cursed skeleton boss"] = true,
+    ["cake queen"] = true, ["heaven's guardian"] = true, ["hell's messenger"] = true,
+    -- the raid bosses the hubs farm as well
+    ["darkbeard"] = true, ["soul reaper"] = true, ["dough king"] = true,
+    ["cake prince"] = true, ["rip_indra true form"] = true,
 }
+
+-- The level of each boss quest (the table of the wiki), so the boss farm
+-- takes one the player can actually beat.
+local BOSS_LEVELS = {
+    ["the gorilla king"] = 20, ["chef"] = 55, ["yeti"] = 105, ["vice admiral"] = 130,
+    ["warden"] = 230, ["magma general"] = 350, ["fishman lord"] = 425,
+    ["sky warlord"] = 500, ["lightning god"] = 575, ["cyborg"] = 675,
+    ["diamond"] = 750, ["jeremy"] = 850, ["orbitus"] = 925, ["smoke admiral"] = 1150,
+    ["awakened ice admiral"] = 1400, ["tide keeper"] = 1475, ["stone"] = 1550,
+    ["hydra leader"] = 1675, ["kilo admiral"] = 1750, ["captain elephant"] = 1875,
+    ["beautiful pirate"] = 1950, ["cake queen"] = 2175,
+}
+
+-- The key of the boss tables for a mob, from its name or its display name.
+-- nil when the mob is no boss at all.
+local function bossKeyOf(mob)
+    if not mob then return nil end
+    local key = mobKey(mob.Name):lower()
+    if BOSS_NAMES[key] then return key end
+    local display = nil
+    pcall(function() display = mob:GetAttribute("DisplayName") end)
+    if display then
+        local dkey = mobKey(display):lower()
+        if BOSS_NAMES[dkey] then return dkey end
+    end
+    return nil
+end
 
 local function pickBoss(root, range)
     if not root then return nil end
-    local best, bestD = nil, nil
+    local level = getMyLevel()
+    local best, bestD, fallback, fallbackD = nil, nil, nil, nil
     for _, mob in ipairs(collectEnemies(tick())) do
-        local key = mobKey(mob.Name):lower()
-        local isBoss = BOSS_NAMES[key]
-        if not isBoss then
-            local display = nil
-            pcall(function() display = mob:GetAttribute("DisplayName") end)
-            isBoss = BOSS_NAMES[mobKey(display or ""):lower()]
-        end
-        if isBoss then
+        local key = bossKeyOf(mob)
+        if key then
             local anchor = anchorOf(mob)
             if anchor then
                 local d = (anchor.Position - root.Position).Magnitude
-                if d <= range and (bestD == nil or d < bestD) then
-                    best, bestD = mob, d
+                if d <= range then
+                    -- A boss whose level is unknown, or far above the level of
+                    -- the player, is only taken when nothing better is around.
+                    local bossLevel = BOSS_LEVELS[key]
+                    if bossLevel == nil or bossLevel > level + 25 then
+                        if fallbackD == nil or d < fallbackD then fallback, fallbackD = mob, d end
+                    elseif bestD == nil or d < bestD then
+                        best, bestD = mob, d
+                    end
                 end
             end
         end
     end
-    return best
+    return best or fallback
 end
 
 local function getTarget(mobName)
@@ -1353,10 +1393,8 @@ local function bringMob(target, root)
                 -- It is not being hurt: it is put back and left alone.
                 local part = anchorOf(mob)
                 if part then
-                    local back = nil
-                    pcall(function() back = mob:GetPivot() end)
-                    if not back then pcall(function() back = mob.WorldPivot end) end
-                    if back then pcall(function() part.CFrame = back end) end
+                    local home = mobSpawnPoint(mob, part.Position)
+                    if home then pcall(function() part.CFrame = CFrame.new(home) end) end
                 end
                 state.bringIgnored[mob] = now
                 Instance.new("IntValue", mob).Name = "Ignored"
@@ -1414,27 +1452,37 @@ local function bringMob(target, root)
         end
     end
 
+    -- The pack is put down as one group: each mob gets its own small step of
+    -- the same point, so five of them stand next to each other and one swing
+    -- takes them all.
     for i, mob in ipairs(list) do
         local part = anchorOf(mob)
         if part then
-            local hum = mob:FindFirstChildOfClass("Humanoid")
-            if hum then
-                pcall(function() hum.PlatformStand = true end)
-                pcall(function() hum.Sit = true end)
-                pcall(function() hum.WalkSpeed = 0 end)
-                pcall(function() hum.JumpPower = 0 end)
-            end
-            pcall(function() part.CanCollide = false end)
-            -- The hit throws the mob away. Its speed is set to zero before it
-            -- is put back on the point, so it does not slide off again.
-            pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
-            pcall(function() part.AssemblyAngularVelocity = Vector3.zero end)
-            -- A small step apart, so they stand next to each other instead of
-            -- pushing each other off the one spot.
             local shift = ((i - 1) % 3 - 1) * 2
             local goal = Vector3.new(point.X + shift, part.Position.Y, point.Z)
-            pcall(function() part.CFrame = CFrame.new(goal) end)
-            pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
+            local off = (part.Position - goal).Magnitude
+            local vel = part.AssemblyLinearVelocity
+            local speed = vel and vel.Magnitude or 0
+            -- A mob that already stands still on its step is left alone: it is
+            -- only handled when it drifted away or something is moving it.
+            if off > 3 or speed > 2 then
+                local hum = mob:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    pcall(function() hum.PlatformStand = true end)
+                    pcall(function() hum.Sit = true end)
+                    pcall(function() hum.WalkSpeed = 0 end)
+                    pcall(function() hum.JumpPower = 0 end)
+                end
+                pcall(function() part.CanCollide = false end)
+                if speed > 2 then
+                    pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
+                    pcall(function() part.AssemblyAngularVelocity = Vector3.zero end)
+                end
+                if off > 3 then
+                    pcall(function() part.CFrame = CFrame.new(goal) end)
+                end
+                pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
+            end
             state.bringMoved[mob] = now
         end
     end
@@ -1484,10 +1532,11 @@ local function moveTo(cf, noWarp)
     end
 
     if mode == "Teleport" then
+        stopTween()
         root.CFrame = cf
     elseif mode == "Tween" then
         local dist = (root.Position - cf.Position).Magnitude
-        if dist < 6 then
+        if dist < 6 and not noWarp then
             stopTween()
             setWalking()
             root.CFrame = cf
@@ -2332,17 +2381,22 @@ local function specialTravel(name)
 end
 
 -- ================= MELEE / ABILITY SHOP =================
+-- The styles of the wiki, in the order they can be bought: the first form
+-- of a style comes before its second form (Death Step needs Dark Step, and
+-- so on), and Superhuman comes before Godhuman.
 local STYLE_SHOP = {
-    {name = "Black Leg",       remote = "BuyBlackLeg",       teacher = "Dark Step Teacher"},
-    {name = "Fishman Karate",  remote = "BuyFishmanKarate", teacher = "Water Kung-fu Teacher"},
-    {name = "Electro",         remote = "BuyElectro", teacher = "Mad Scientist"},
-    {name = "Superhuman",      remote = "BuySuperhuman", teacher = "Martial Arts Master"},
-    {name = "Death Step",      remote = "BuyDeathStep", teacher = "Phoeyu, the Reformed"},
+    {name = "Dark Step",       remote = "BuyBlackLeg",       teacher = "Dark Step Teacher"},
+    {name = "Electric",        remote = "BuyElectro",        teacher = "Mad Scientist"},
+    {name = "Water Kung Fu",   remote = "BuyFishmanKarate",  teacher = "Water Kung Fu Teacher"},
+    {name = "Dragon Breath",   remote = "BuyDragonBreath",   teacher = "Sabi"},
+    {name = "Superhuman",      remote = "BuySuperhuman",     teacher = "Martial Arts Master"},
+    {name = "Death Step",      remote = "BuyDeathStep",      teacher = "Phoeyu, the Reformed"},
+    {name = "Electric Claw",   remote = "BuyElectricClaw",   teacher = "Previous Hero"},
     {name = "Sharkman Karate", remote = "BuySharkmanKarate", teacher = "Sharkman Teacher"},
-    {name = "Electric Claw",   remote = "BuyElectricClaw", teacher = "Previous Hero"},
-    {name = "Dragon Talon",    remote = "BuyDragonTalon", teacher = "Uzoth"},
-    {name = "Godhuman",        remote = "BuyGodhuman", teacher = "Ancient Monk"},
-    {name = "Sanguine Art",    remote = "BuySanguineArt", teacher = "Shafi"},
+    {name = "Dragon Talon",    remote = "BuyDragonTalon",    teacher = "Uzoth"},
+    {name = "Godhuman",        remote = "BuyGodhuman",       teacher = "Ancient Monk"},
+    {name = "Sanguine Art",    remote = "BuySanguineArt",    teacher = "Shafi"},
+    {name = "Advanced Combat", remote = "BuyAdvancedCombat", teacher = "Secrets Master"},
 }
 
 local function shopRemote()
@@ -2413,10 +2467,12 @@ function takeWhirlpool()
         dbg("The whirlpool has no place to fly to")
         return false
     end
-    local root = getRoot()
-    local before = root and root.Position
     dbg("Flying into the whirlpool of the sea")
     flyTo(part.Position)
+    -- the place to compare against is where the flight left the player: the
+    -- jump the game does from here is what puts us under the sea
+    local root = getRoot()
+    local before = root and root.Position
     local deadline = tick() + 20
     while tick() < deadline do
         local now = getRoot()
@@ -2533,8 +2589,8 @@ local function step()
         return
     end
 
-    -- A shop buy or a flight owns the movement of the character while it runs.
-    if state.shopping or state.flying then return end
+    -- A shop buy, a flight or a quest owns the movement while it runs.
+    if state.shopping or state.flying or state.questing then return end
 
     if not state.lastPos or (root.Position - state.lastPos).Magnitude > 1 then
         state.lastPos = root.Position
@@ -2690,6 +2746,15 @@ local function step()
         local boss = pickBoss(root, CONFIG.BossRange or 3000)
         if boss then target = boss end
     end
+    if state.saberTarget then
+        -- a running quest knows which mob it needs
+        for _, m in ipairs(collectEnemies(tick())) do
+            if m.Name:lower():find(state.saberTarget:lower(), 1, true) then
+                target = m
+                break
+            end
+        end
+    end
     if not target then
         local sp = findSpawn(mob)
         local anchor = sp and anchorOf(sp)
@@ -2757,7 +2822,7 @@ local function step()
         local close = mobInReach(root, reach)
         -- A boss is not given up for a normal mob that happens to stand near:
         -- the boss is what the boss farm went there for.
-        local onBoss = CONFIG.BossFarm and BOSS_NAMES[mobKey(target.Name):lower()]
+        local onBoss = CONFIG.BossFarm and bossKeyOf(target)
         if close and close ~= target and flat > reach and not onBoss then
             if (state.autoBurst or 0) <= now then state.autoBurst = now + 2 end
             if state.autoBurst > now then
@@ -2821,6 +2886,204 @@ task.spawn(function()
             stopTween()
         end
         task.wait(0.05)
+    end
+end)
+
+-- ================= AUTO QUESTS (Saber) =================
+-- The Saber of the First Sea is a puzzle of five steps (the wiki): five green
+-- buttons in the Jungle, a torch in the hidden room, a cup filled in the
+-- Frozen cave, two NPCs, the Mob Leader and finally the Saber Expert. The
+-- script looks the pieces up in the world by name and walks the list.
+local SABER_STEPS = {
+    {act = "press", name = "Button", note = "the green buttons of the Jungle"},
+    {act = "pick",  name = "Torch",  note = "the torch in the hidden Jungle room"},
+    {act = "talk",  name = "Sick Man", note = "the Sick Man of the Frozen Village"},
+    {act = "talk",  name = "Rich Man", note = "the Rich Man of the Pirate Village"},
+    {act = "kill",  name = "Mob Leader", note = "the Mob Leader on Jean-Luc Island"},
+    {act = "talk",  name = "Rich Man", note = "the Rich Man again, for the relic"},
+    {act = "kill",  name = "Saber Expert", note = "the Saber Expert behind the door"},
+}
+
+-- every object of the world whose name has the wanted text in it
+local function findParts(text, limit)
+    local out = {}
+    local ok, list = pcall(function() return Workspace:GetDescendants() end)
+    if not ok then return out end
+    for _, obj in ipairs(list) do
+        if (obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Tool"))
+            and obj.Name:lower():find(text:lower(), 1, true) then
+            table.insert(out, obj)
+            if limit and #out >= limit then break end
+        end
+    end
+    return out
+end
+
+local function pressPart(part)
+    -- a button of the game answers a click or a touch
+    pcall(function()
+        local cd = part:FindFirstChildWhichIsA("ClickDetector")
+        if cd and fireclickdetector then fireclickdetector(cd) end
+    end)
+    pcall(function()
+        local root = getRoot()
+        if root and firetouchinterest then
+            firetouchinterest(root, part, 0)
+            firetouchinterest(root, part, 1)
+        end
+    end)
+end
+
+local function findMob(text)
+    for _, mob in ipairs(collectEnemies(tick())) do
+        if mob.Name:lower():find(text:lower(), 1, true) then return mob end
+    end
+    return nil
+end
+
+-- One pass at the current step of the quest.
+local function saberStep(step, root)
+    if not step then return true end
+    if step.act == "press" then
+        local best, bestD = nil, nil
+        for _, part in ipairs(findParts(step.name, 12)) do
+            local anchor = anchorOf(part)
+            if anchor then
+                local d = (anchor.Position - root.Position).Magnitude
+                if bestD == nil or d < bestD then best, bestD = anchor, d end
+            end
+        end
+        if not best then
+            state.status = "Saber: no " .. step.name .. " seen"
+            return false
+        end
+        if bestD and bestD > 30 then
+            state.status = "Saber: walking to " .. step.name
+            travelTo(CFrame.new(best.Position))
+            return false
+        end
+        pressPart(best)
+        state.status = "Saber: pressed a " .. step.name
+        return true
+    elseif step.act == "pick" then
+        local best, bestD = nil, nil
+        for _, obj in ipairs(findParts(step.name, 8)) do
+            local anchor = anchorOf(obj)
+            if anchor then
+                local d = (anchor.Position - root.Position).Magnitude
+                if bestD == nil or d < bestD then best, bestD = anchor, d end
+            end
+        end
+        local char = LocalPlayer.Character
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        local have = false
+        for _, folder in ipairs({char, backpack}) do
+            if folder then
+                for _, t in ipairs(folder:GetChildren()) do
+                    if t:IsA("Tool") and t.Name:lower():find(step.name:lower(), 1, true) then
+                        have = true
+                    end
+                end
+            end
+        end
+        if have then return true end
+        if not best then
+            state.status = "Saber: no " .. step.name .. " seen"
+            return false
+        end
+        if bestD and bestD > 12 then
+            state.status = "Saber: walking to the " .. step.name
+            travelTo(CFrame.new(best.Position))
+            return false
+        end
+        if firetouchinterest then
+            pcall(function()
+                firetouchinterest(root, best, 0)
+                firetouchinterest(root, best, 1)
+            end)
+        end
+        state.status = "Saber: took the " .. step.name
+        return true
+    elseif step.act == "talk" then
+        local npc = nil
+        for _, obj in ipairs(findParts(step.name, 4)) do
+            if anchorOf(obj) then npc = obj break end
+        end
+        if not npc then
+            state.status = "Saber: " .. step.name .. " not found"
+            return false
+        end
+        local prompt = promptOf(npc)
+        local anchor = (prompt and anchorOf(prompt.Parent)) or anchorOf(npc)
+        if not anchor then return false end
+        if (root.Position - anchor.Position).Magnitude > 8 then
+            state.status = "Saber: walking to " .. step.name
+            travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+            return false
+        end
+        interactWith(npc, prompt)
+        state.status = "Saber: talked to " .. step.name
+        return true
+    elseif step.act == "kill" then
+        state.saberTarget = step.name
+        local mob = findMob(step.name)
+        if not mob then
+            state.saberTarget = nil
+            state.status = "Saber: " .. step.name .. " is down"
+            return true
+        end
+        state.status = "Saber: fighting " .. step.name
+        return false
+    end
+    return true
+end
+
+local saberIndex = 1
+task.spawn(function()
+    while true do
+        task.wait(1)
+        state.questing = CONFIG.AutoSaber and state.enabled
+        if CONFIG.AutoSaber and state.enabled then
+            local root = getRoot()
+            if root then
+                local step = SABER_STEPS[saberIndex]
+                if step then
+                    if not state.saberAt or state.saberAt ~= step.note then
+                        state.saberAt = step.note
+                        dbg("Saber quest step: " .. step.note)
+                    end
+                    if saberStep(step, root) then
+                        dbg("Saber quest done: " .. step.note)
+                        state.saberTarget = nil
+                        state.saberAt = nil
+                        saberIndex = saberIndex + 1
+                        if saberIndex > #SABER_STEPS then
+                            dbg("Saber quest finished")
+                            CONFIG.AutoSaber = false
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- ================= AUTO BUY STYLES =================
+-- Every style has its own teacher and its own requirements, so the list is
+-- walked in order: the first form before its second form, and the ones with
+-- no requirements first. A style the game refuses is simply tried again on
+-- the next round.
+local styleBuyIndex = 0
+task.spawn(function()
+    while true do
+        task.wait(5)
+        if CONFIG.AutoBuyStyles and state.enabled and not state.shopping and not state.flying then
+            styleBuyIndex = styleBuyIndex % #STYLE_SHOP + 1
+            local style = STYLE_SHOP[styleBuyIndex]
+            dbg("Auto buy style: " .. style.name)
+            buyStyle(style)
+            task.wait(20)
+        end
     end
 end)
 
@@ -2981,6 +3244,8 @@ local function newPage(name)
     return p
 end
 
+local rebuildIslands = nil
+
 local function showTab(index)
     for i, name in ipairs(TABS) do
         pages[name].Visible = (i == index)
@@ -2991,6 +3256,7 @@ local function showTab(index)
         end
     end
     page = pages[TABS[index]]
+    if TABS[index] == "MOVE" and rebuildIslands then rebuildIslands() end
 end
 
 for i, name in ipairs(TABS) do
@@ -3235,6 +3501,7 @@ local function makeButton(text, cb)
 
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1,0,0,26); btn.Position = UDim2.new(0,0,0,3)
+    -- the row is handed back so a list of buttons can be rebuilt later
     btn.BackgroundColor3 = THEME.panel; btn.Text = text; btn.TextColor3 = THEME.text
     btn.Font = THEME.fontBold; btn.TextSize = 12
     btn.AutoButtonColor = false; btn.Parent = row
@@ -3251,7 +3518,7 @@ local function makeButton(text, cb)
             end)
         end)
     end)
-    return btn
+    return row
 end
 
 -- ===== BUILD =====
@@ -3304,20 +3571,33 @@ makeButton("Go to Sea 3", function() task.spawn(function() travelToWorld(3) end)
 makeHint("The seas are separate places: this uses the travel of the game")
 
 makeHeader("FLY TO ISLAND (tween)")
-local islandList = islandPositions()
-for _, island in ipairs(islandList) do
-    local target = island.pos
-    local islandName = island.name
-    makeButton("Go: " .. island.name, function()
-        state.status = "Flying to " .. island.name
-        task.spawn(function()
-            if not specialTravel(islandName) then flyTo(target) end
-        end)
+local islandButtons = {}
+local islandHint = nil
+rebuildIslands = function()
+    local ok, err = pcall(function()
+    for _, row in ipairs(islandButtons) do
+        if row then pcall(function() row:Destroy() end) end
+    end
+    islandButtons = {}
+    if islandHint then pcall(function() islandHint:Destroy() end); islandHint = nil end
+    local list = islandPositions()
+    for _, island in ipairs(list) do
+        local target = island.pos
+        local islandName = island.name
+        table.insert(islandButtons, makeButton("Go: " .. islandName, function()
+            state.status = "Flying to " .. islandName
+            task.spawn(function()
+                if not specialTravel(islandName) then flyTo(target) end
+            end)
+        end))
+    end
+    if #list == 0 then
+        islandHint = makeHint("The game has not told the islands yet")
+    end
     end)
+    if not ok then dbg("The island list failed: " .. tostring(err)) end
 end
-if #islandList == 0 then
-    makeHint("The game has not told the islands yet")
-end
+rebuildIslands()
 
 makeHeader("BRING MOB")
 makeToggle("Bring Mob", CONFIG.BringMob, function(v) CONFIG.BringMob = v end)
@@ -3343,21 +3623,26 @@ makeSlider("Swing Reach", 0, 200, CONFIG.HitboxMagnitude,
     function(v) return v.." studs" end, function(v) CONFIG.HitboxMagnitude = v end)
 makeSlider("Head Hover", 0, 8, CONFIG.HeadHover,
     function(v) return v.." studs" end, function(v) CONFIG.HeadHover = v end)
-makeSlider("Melee Range", 4, 30, CONFIG.MeleeRange,
-    function(v) return v.." studs" end, function(v) CONFIG.MeleeRange = v end)
-makeSlider("Gun Range", 20, 120, CONFIG.GunRange,
-    function(v) return v.." studs" end, function(v) CONFIG.GunRange = v end)
+makeHint("Melee keeps its real, short reach - guns and fruits reach 70 studs")
 makeSlider("Attack Cooldown", 5, 100, math.floor(CONFIG.AttackCooldown*100),
     function(v) return string.format("%.2fs", v/100) end,
     function(v) CONFIG.AttackCooldown = v/100 end)
+
+makeHeader("AUTO QUESTS")
+makeToggle("Auto Saber (First Sea puzzle)", CONFIG.AutoSaber,
+    function(v) CONFIG.AutoSaber = v end)
+makeHint("Does the Saber puzzle step by step: buttons, torch, cup, NPCs, bosses")
 
 makeHeader("BOSS FARM")
 makeToggle("Farm Bosses", CONFIG.BossFarm, function(v) CONFIG.BossFarm = v end)
 makeSlider("Boss Range", 500, 8000, CONFIG.BossRange,
     function(v) return v.." studs" end, function(v) CONFIG.BossRange = v end)
-makeHint("Takes the nearest boss over the quest mob: a boss gives far more exp")
+makeHint("Takes the nearest boss of the player's level over the quest mob")
 
 makeHeader("MELEE SHOP (buy)")
+makeToggle("Auto Buy Styles (in order)", CONFIG.AutoBuyStyles,
+    function(v) CONFIG.AutoBuyStyles = v end)
+makeHint("Walks to the teacher of each style in turn and buys it")
 -- The buy is asked for right away: no walk to the teacher of the style.
 for _, style in ipairs(STYLE_SHOP) do
     makeButton("Buy " .. style.name, function()
