@@ -14,7 +14,9 @@ pcall(function() Workspace.StreamingMinRadius = 1e8 end)
 pcall(function() Workspace.StreamingTargetRadius = 1e8 end)
 
 -- ================= CONFIG =================
-local CONFIG = {
+-- CONFIG and state live in the global table: the chunk is at the limit of
+-- 200 locals.
+CONFIG = {
     AutoQuest       = true,
     AutoFarm        = true,
     FruitSniper     = true,
@@ -57,7 +59,7 @@ local CONFIG = {
     HoverHeight     = 14,
     FruitScanRadius = 5000,
     MovementMode    = "Tween",
-    MoveSpeed       = 250,
+    MoveSpeed       = 200,
     QuestRetry      = 20,
     TurnInTimeout   = 20,
     QuestSeekTimeout = 30,
@@ -82,7 +84,7 @@ local CONFIG = {
     },
 }
 
-local state = {
+state = {
     enabled       = true,
     currentQuest  = nil,
     questSentAt   = 0,
@@ -2895,14 +2897,32 @@ end)
 -- Frozen cave, two NPCs, the Mob Leader and finally the Saber Expert. The
 -- script looks the pieces up in the world by name and walks the list.
 local SABER_STEPS = {
-    {act = "press", name = "Button", note = "the green buttons of the Jungle"},
-    {act = "pick",  name = "Torch",  note = "the torch in the hidden Jungle room"},
-    {act = "talk",  name = "Sick Man", note = "the Sick Man of the Frozen Village"},
-    {act = "talk",  name = "Rich Man", note = "the Rich Man of the Pirate Village"},
-    {act = "kill",  name = "Mob Leader", note = "the Mob Leader on Jean-Luc Island"},
-    {act = "talk",  name = "Rich Man", note = "the Rich Man again, for the relic"},
-    {act = "kill",  name = "Saber Expert", note = "the Saber Expert behind the door"},
+    {act = "press", name = "Button", island = "Jungle", count = 5,
+        note = "the green buttons of the Jungle"},
+    {act = "pick",  name = "Torch", island = "Jungle",
+        note = "the torch in the hidden Jungle room"},
+    {act = "talk",  name = "Sick Man", island = "Frozen Village",
+        note = "the Sick Man of the Frozen Village"},
+    {act = "talk",  name = "Rich Man", island = "Pirate Village",
+        note = "the Rich Man of the Pirate Village"},
+    {act = "kill",  name = "Mob Leader", island = "Jean-Luc Island",
+        note = "the Mob Leader on Jean-Luc Island"},
+    {act = "talk",  name = "Rich Man", island = "Pirate Village",
+        note = "the Rich Man again, for the relic"},
+    {act = "kill",  name = "Saber Expert", island = "Jungle",
+        note = "the Saber Expert behind the door"},
 }
+
+-- the place of an island, from the list the panel already builds
+local function islandPosByName(text)
+    for _, island in ipairs(islandPositions()) do
+        if island.name:lower():find(text:lower(), 1, true)
+            or text:lower():find(island.name:lower(), 1, true) then
+            return island.pos
+        end
+    end
+    return nil
+end
 
 -- every object of the world whose name has the wanted text in it
 local function findParts(text, limit)
@@ -2944,18 +2964,34 @@ end
 -- One pass at the current step of the quest.
 local function saberStep(step, root)
     if not step then return true end
+    -- the pieces of the puzzle are streamed in only when the player is on
+    -- their island, so the island is flown to before anything is searched
+    if step.island then
+        local place = islandPosByName(step.island)
+        if place and (root.Position - place).Magnitude > 600 then
+            state.status = "Saber: flying to " .. step.island
+            flyTo(place)
+            return false
+        end
+    end
     if step.act == "press" then
+        state.saberPressed = state.saberPressed or {}
         local best, bestD = nil, nil
-        for _, part in ipairs(findParts(step.name, 12)) do
-            local anchor = anchorOf(part)
-            if anchor then
-                local d = (anchor.Position - root.Position).Magnitude
-                if bestD == nil or d < bestD then best, bestD = anchor, d end
+        for _, part in ipairs(findParts(step.name, 16)) do
+            -- only the ones that are not pressed yet are looked at again
+            if not state.saberPressed[part] then
+                local anchor = anchorOf(part)
+                if anchor then
+                    local d = (anchor.Position - root.Position).Magnitude
+                    if bestD == nil or d < bestD then best, bestD = anchor, d end
+                end
             end
         end
         if not best then
-            state.status = "Saber: no " .. step.name .. " seen"
-            return false
+            local done = 0
+            for _ in pairs(state.saberPressed) do done = done + 1 end
+            state.status = "Saber: " .. done .. " of " .. tostring(step.count or 1) .. " " .. step.name
+            return done >= (step.count or 1)
         end
         if bestD and bestD > 30 then
             state.status = "Saber: walking to " .. step.name
@@ -2963,8 +2999,9 @@ local function saberStep(step, root)
             return false
         end
         pressPart(best)
+        state.saberPressed[best] = true
         state.status = "Saber: pressed a " .. step.name
-        return true
+        return false
     elseif step.act == "pick" then
         local best, bestD = nil, nil
         for _, obj in ipairs(findParts(step.name, 8)) do
