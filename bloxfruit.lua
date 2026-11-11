@@ -1371,34 +1371,20 @@ end
 
 local function bringMob(target, root)
     if not CONFIG.BringMob or not target or not target.Parent then return end
-
+    
     local anchor = anchorOf(target)
     if not anchor then return end
 
     local searchDist = CONFIG.BringMobSearch or 200
     local targetPos = anchor.Position
-    
-    -- 🛠️ หาพื้นดิน (Ground) ด้วย Raycast เพื่อไม่ให้มอนลอยขึ้นฟ้า
-    local groundY = targetPos.Y
-    local rayParams = RaycastParams.new()
-    rayParams.FilterDescendantsInstances = {target, LocalPlayer.Character}
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
-    local result = Workspace:Raycast(targetPos + Vector3.new(0, 50, 0), Vector3.new(0, -100, 0), rayParams)
-    if result then groundY = result.Position.Y end
 
     local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
     if not folder then return end
 
     local broughtCount = 0
     local maxBring = CONFIG.BringMobCount or 5
-    local now = tick()
-
-    -- ตั้งค่าระยะห่างระหว่างมอนในตาราง (Grid) กัน Hitbox ซ้อนทับ
-    local gridX = 3
-    local spacing = 4.5
 
     for _, enemy in ipairs(folder:GetChildren()) do
-        -- ตรวจสอบว่ามอนตัวนี้ชื่อเดียวกับเป้าหมาย และยังมีชีวิตอยู่
         if enemy and enemy.Parent and enemy.Name == target.Name then
             local hum = enemy:FindFirstChildOfClass("Humanoid")
             local hrp = enemy:FindFirstChild("HumanoidRootPart")
@@ -1408,34 +1394,23 @@ local function bringMob(target, root)
                 local distSq = diff.X * diff.X + diff.Y * diff.Y + diff.Z * diff.Z
 
                 if distSq <= (searchDist * searchDist) then
-                    -- 1. ขอ Network Ownership และแช่แข็งท่าทางมอน
+                    -- ขอ Network Ownership ให้ตัวละครเราควบคุมฟิสิกส์มอนตัวนี้ได้ลื่นๆ
                     if not state.bringAnchored[enemy] then
                         pcall(function() hrp:SetNetworkOwner(LocalPlayer) end)
-                        pcall(function()
-                            hum.PlatformStand = true
-                            hum.Sit = true
-                            hum.WalkSpeed = 0
-                            hum.JumpPower = 0
-                        end)
-                        hrp.CanCollide = false
+                        state.bringAnchored[enemy] = hrp
                     end
-                    
-                    -- 2. คำนวณตำแหน่งแบบตาราง (Grid) โดยล็อกความสูงไว้ที่พื้นดิน (groundY)
-                    local col = broughtCount % gridX
-                    local row = math.floor(broughtCount / gridX)
-                    local goal = Vector3.new(targetPos.X + (col - 1) * spacing, groundY + 2.5, targetPos.Z + row * spacing)
-                    
-                    -- 3. หยุดความเร็วและย้าย CFrame ไปที่พื้นดิน
+
+                    hrp.CanCollide = false
                     hrp.AssemblyLinearVelocity = Vector3.zero
                     hrp.AssemblyAngularVelocity = Vector3.zero
-                    hrp.CFrame = CFrame.new(goal)
                     
-                    -- 4. ล็อกมอนไว้กับที่
-                    hrp.Anchored = true
+                    -- จัดเรียงมอนเป็นวงกลมรอบเป้าหมาย (Radius 4 studs) เพื่อไม่ให้ทับกันเองและตีโดนง่ายขึ้น
+                    local angle = (broughtCount / math.max(maxBring, 1)) * (math.pi * 2)
+                    local radius = 4
+                    local offset = Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
                     
-                    state.bringAnchored[enemy] = hrp
-                    state.bringMoved[enemy] = now
-                    
+                    hrp.CFrame = anchor.CFrame + offset
+
                     broughtCount = broughtCount + 1
                     if maxBring > 0 and broughtCount >= maxBring then
                         break
@@ -2543,27 +2518,19 @@ end
 
 -- ================= MAIN LOOP =================
 -- The mobs that were frozen for the farm are let go again with this.
+
 local function releaseBringMobs()
-    -- วนลูปปลดล็อกมอนทุกตัวที่เราเคยแช่แข็งไว้
-    for mob, hrp in pairs(state.bringAnchored) do
+    for _, hrp in pairs(state.bringAnchored) do
         if hrp and hrp.Parent then
             pcall(function()
-                hrp.Anchored = false -- ปลดล็อกให้Physicsทำงานปกติ
-                local hum = mob:FindFirstChildOfClass("Humanoid")
-                if hum then
-                    hum.PlatformStand = false
-                    hum.Sit = false
-                end
+                hrp.CanCollide = true
+                hrp:SetNetworkOwner(nil)
             end)
         end
     end
-    -- ล้างค่าที่บันทึกไว้ทั้งหมด
     state.bringAnchored = setmetatable({}, {__mode = "k"})
-    state.bringMoved = setmetatable({}, {__mode = "k"})
-    state.bringIgnored = setmetatable({}, {__mode = "k"})
-    state.bringHealth = setmetatable({}, {__mode = "k"})
-    state.bringAt = 0
 end
+
 
 -- Everything that pointed at the character that just died is dropped here.
 -- Without this the farm keeps chasing a corpse: the old target, the old
