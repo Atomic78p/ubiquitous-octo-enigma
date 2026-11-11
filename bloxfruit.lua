@@ -1380,11 +1380,16 @@ letGoMob = function(mob, part)
         pcall(function()
             local lock = part:FindFirstChild("Lock")
             if lock then lock:Destroy() end
+            local gyro = part:FindFirstChild("BringGyro")
+            if gyro then gyro:Destroy() end
             part:SetAttribute("BeingBrought", false)
             part.CanCollide = true
+            part.CanTouch = true
             part.Massless = false
             part.AssemblyLinearVelocity = Vector3.zero
             part.AssemblyAngularVelocity = Vector3.zero
+            -- and the mob goes back to the server's physics
+            part:SetNetworkOwner(nil)
         end)
     end
     local hum = mob:FindFirstChildOfClass("Humanoid")
@@ -1509,15 +1514,34 @@ local function bringMob(target, root)
                 point.Z + row * 2.3)
             local hum = mob:FindFirstChildOfClass("Humanoid")
 
-            pcall(function() part.CanCollide = false end)
-            pcall(function() part.Massless = true end)
-            if hum then
-                pcall(function() hum.AutoRotate = false end)
-                pcall(function() hum.BreakJointsOnDeath = false end)
-                if not state.bringHeld[mob] then
-                    pcall(function() hum.PlatformStand = true end)
-                    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+            -- every part of the mob goes ghost and is stopped. One part that
+            -- still collides with the ground is enough to hold the whole mob
+            -- back, so the hub does this to all of them, and it does it once.
+            if not state.bringHeld[mob] then
+                for _, d in ipairs(mob:GetDescendants()) do
+                    if d:IsA("BasePart") then
+                        pcall(function()
+                            d.CanCollide = false
+                            d.CanTouch = false
+                            d.Massless = true
+                            d.AssemblyLinearVelocity = Vector3.zero
+                            d.AssemblyAngularVelocity = Vector3.zero
+                        end)
+                    end
                 end
+                -- if the client may take the mob over the pull sticks. When it
+                -- may not, the call fails and nothing is lost.
+                pcall(function() part:SetNetworkOwner(LocalPlayer) end)
+            end
+
+            if hum then
+                pcall(function()
+                    hum.AutoRotate = false
+                    hum.BreakJointsOnDeath = false
+                    -- the hub leaves PlatformStand alone: a standing mob is
+                    -- rigid and the pull does not move it
+                    hum.PlatformStand = false
+                end)
             end
 
             -- the hold: a body velocity named Lock drags the mob to its step
@@ -1531,14 +1555,32 @@ local function bringMob(target, root)
                 lock.Parent = part
                 pcall(function() part:SetAttribute("BeingBrought", true) end)
             end
-            pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
-            pcall(function() part.AssemblyAngularVelocity = Vector3.zero end)
+            -- the gyro keeps the mob upright, so the pull is a slide and not a
+            -- tumble the humanoid then has to get back up from
+            local gyro = part:FindFirstChild("BringGyro")
+            if not gyro then
+                gyro = Instance.new("BodyGyro")
+                gyro.Name = "BringGyro"
+                gyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+                gyro.P = 30000
+                gyro.D = 1000
+                gyro.Parent = part
+            end
+            gyro.CFrame = root.CFrame
+            if hum then
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+            end
+            pcall(function()
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
+            end)
             local toGo = goal - part.Position
             local mag = toGo.Magnitude
             if mag > 0.5 then
-                lock.Velocity = toGo.Unit * math.clamp(mag * 8, 20, 300)
+                lock.Velocity = toGo.Unit * math.clamp(mag * 10, 20, 1200)
             else
                 lock.Velocity = Vector3.zero
+                pcall(function() part.CFrame = CFrame.new(goal) end)
             end
 
             state.bringHeld[mob] = part
