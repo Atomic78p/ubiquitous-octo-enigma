@@ -1375,15 +1375,8 @@ local function bringMob(target, root)
     local anchor = anchorOf(target)
     if not anchor then return end
 
-    local searchDist = CONFIG.BringMobSearch or 200
-    local searchDistSq = searchDist * searchDist
+    local searchDistSq = (CONFIG.BringMobSearch or 200) ^ 2
     local targetPos = anchor.Position
-
-    -- ขยายรัศมี Simulation ให้กว้างที่สุดเท่าที่จะทำได้
-    pcall(function()
-        sethiddenproperty(LocalPlayer, "SimulationRadius", 100000)
-        sethiddenproperty(LocalPlayer, "MaxSimulationRadius", 100000)
-    end)
 
     local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
     if not folder then return end
@@ -1391,25 +1384,23 @@ local function bringMob(target, root)
     local broughtCount = 0
     local maxBring = CONFIG.BringMobCount or 5
 
+    -- ดึงเฉพาะมอนสเตอร์ที่ตรงกับ Target และยังมีชีวิตอยู่
     for _, enemy in ipairs(folder:GetChildren()) do
-        if enemy:IsA("Model") and enemy.Name == target.Name then
+        if enemy and enemy.Parent and enemy.Name == target.Name then
             local hum = enemy:FindFirstChildOfClass("Humanoid")
             local hrp = enemy:FindFirstChild("HumanoidRootPart")
 
             if hum and hrp and hum.Health > 0 then
                 local distSq = (hrp.Position - targetPos).SquareMagnitude
                 if distSq <= searchDistSq then
-                    -- ปิด Collide เพื่อไม่ให้มอนสเตอร์เบียดกันจนบินขึ้นฟ้า
-                    for _, part in ipairs(enemy:GetChildren()) do
-                        if part:IsA("BasePart") then
-                            part.CanCollide = false
-                        end
-                    end
                     
-                    -- ดึงเข้ามาซ้อนไว้ที่จุดเดียวกันหน้าตัวผู้เล่น
-                    hrp.CFrame = anchor.CFrame * CFrame.new(0, 0, -2)
+                    -- ปรับเฉพาะ HumanoidRootPart เพื่อลด Overhead ไม่ให้เกมค้าง
+                    hrp.CanCollide = false
                     hrp.AssemblyLinearVelocity = Vector3.zero
                     hrp.AssemblyAngularVelocity = Vector3.zero
+                    
+                    -- ย้ายตำแหน่งมาที่ด้านหน้า Target
+                    hrp.CFrame = anchor.CFrame * CFrame.new(0, 0, -2)
 
                     broughtCount = broughtCount + 1
                     if maxBring > 0 and broughtCount >= maxBring then
@@ -1420,6 +1411,7 @@ local function bringMob(target, root)
         end
     end
 end
+
 
 
 -- The client only simulates the mobs that stand inside its simulation radius.
