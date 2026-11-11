@@ -131,12 +131,15 @@ state = {
     flying        = false,
     whirlpooling  = false,
     questing      = false,
-    bringAnchored = setmetatable({}, {__mode = "k"}),
+    bringHeld     = setmetatable({}, {__mode = "k"}),
+    bringSlot     = setmetatable({}, {__mode = "k"}),
+    bringSlotCount = 0,
     bringMoved    = setmetatable({}, {__mode = "k"}),
     bringIgnored  = setmetatable({}, {__mode = "k"}),
     bringHealth   = setmetatable({}, {__mode = "k"}),
     bringPoint    = nil,
     bringTarget   = nil,
+    bringCentre   = nil,
     questVerified = false,
     questGaveUp   = false,
     hitsConfirmed = 0,
@@ -1369,79 +1372,278 @@ local function mobSpawnPoint(target, fallback)
     return best or fallback
 end
 
-local function bringMob(target, root)
-    if not CONFIG.BringMob or not target or not target.Parent then return end
+-- The middle of a camp, straight from the game: the spawn points of that kind
+-- that stand around the player. Mobs are born there, so dragging them onto
+-- their own camp is a short move - a mob that is far from its spawn is the one
+-- that gets stuck, and that is what this avoids. The camp with no spawn point
+-- next to the player is the player.
+local function spawnCentre(target, near)
+    local origin = Workspace:FindFirstChild("_WorldOrigin")
+    local spawns = origin and origin:FindFirstChild("EnemySpawns")
+    if not spawns then return nil end
+    local key = mobKey(target.Name)
+    local sum, n = nil, 0
+    for _, part in ipairs(spawns:GetChildren()) do
+        if part:IsA("BasePart") and not part:GetAttribute("Disabled") then
+            local display = nil
+            pcall(function() display = part:GetAttribute("DisplayName") end)
+            local clean = tostring(display or part.Name)
+            clean = clean:gsub("%s*%(Lv%.?%s*%d+%)", "")
+            if mobKey(clean) == key
+                and (part.Position - near).Magnitude <= (CONFIG.BringMobSearch or 200) then
+                sum = sum and (sum + part.Position) or part.Position
+                n = n + 1
+            end
+        end
+    end
+    if n == 0 or not sum then return nil end
+    return sum / n
+end
 
+-- A mob is let go: the drag goes away and the physics the pack changed is put
+-- back, so the mob can stand on its own again. It is a global because the
+-- chunk is at the limit of 200 locals.
+letGoMob = function(mob, part)
+    part = part or anchorOf(mob)
+    if part and part.Parent then
+        pcall(function()
+            local lock = part:FindFirstChild("Lock")
+            if lock then lock:Destroy() end
+            local gyro = part:FindFirstChild("BringGyro")
+            if gyro then gyro:Destroy() end
+            -- the whole rig was made ghost and weightless on the way in, so
+            -- the whole rig is put back, not only the root
+            for _, d in ipairs(mob:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    d.CanCollide = true
+                    d.CanTouch = true
+                    d.Massless = false
+                    d.AssemblyLinearVelocity = Vector3.zero
+                    d.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+            part:SetAttribute("BeingBrought", false)
+        end)
+    end
+    local hum = mob:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function()
+            hum.PlatformStand = false
+            hum.AutoRotate = true
+        end)
+    end
+    state.bringHeld[mob] = nil
+    state.bringMoved[mob] = nil
+    state.bringHealth[mob] = nil
+end
+
+-- Bring Mob, the way the good hubs do it: the pack is gathered on one point
+-- and every mob is held there by a body velocity named Lock (unlimited force,
+-- so a hit cannot knock it off), not by a teleport. The point is the spawn
+-- point of that mob in the world, and each mob keeps its own step of the row
+-- so the pack never shuffles.
+local function bringMob(target, root)
+    if not CONFIG.BringMob or not target or not target.Parent or not root then return end
     local anchor = anchorOf(target)
     if not anchor then return end
+    if ownedByOther(anchor) then return end
 
-    local searchDist = CONFIG.BringMobSearch or 200
-    local targetPos = anchor.Position
-    
-    -- 🛠️ หาพื้นดิน (Ground) ด้วย Raycast เพื่อไม่ให้มอนลอยขึ้นฟ้า
-    local groundY = targetPos.Y
-    local rayParams = RaycastParams.new()
-    rayParams.FilterDescendantsInstances = {target, LocalPlayer.Character}
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
-    local result = Workspace:Raycast(targetPos + Vector3.new(0, 50, 0), Vector3.new(0, -100, 0), rayParams)
-    if result then groundY = result.Position.Y end
-
-    local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
-    if not folder then return end
-
-    local broughtCount = 0
-    local maxBring = CONFIG.BringMobCount or 5
     local now = tick()
 
-    -- ตั้งค่าระยะห่างระหว่างมอนในตาราง (Grid) กัน Hitbox ซ้อนทับ
-    local gridX = 3
-    local spacing = 4.5
+    -- the mark of a mob that was given up is taken off again
+    for mob, at in pairs(state.bringIgnored) do
+        if now - at > 30 then
+            local marker = mob:FindFirstChild("Ignored")
+            if marker then pcall(function() marker:Destroy() end) end
+            state.bringIgnored[mob] = nil
+        end
+    end
 
-    for _, enemy in ipairs(folder:GetChildren()) do
-        -- ตรวจสอบว่ามอนตัวนี้ชื่อเดียวกับเป้าหมาย และยังมีชีวิตอยู่
-        if enemy and enemy.Parent and enemy.Name == target.Name then
-            local hum = enemy:FindFirstChildOfClass("Humanoid")
-            local hrp = enemy:FindFirstChild("HumanoidRootPart")
+    -- a held mob that is not being hurt is let go, put back on its spawn
+    -- ground and left alone for a while
+    for mob, at in pairs(state.bringMoved) do
+        if now - at > 2.2 then
+            state.bringMoved[mob] = nil
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+            local hp = hum and hum.Health
+            if mob ~= target and hp and state.bringHealth[mob] == hp
+                and not mob:FindFirstChild("Ignored") then
+                local part = anchorOf(mob)
+                if part then
+                    letGoMob(mob, part)
+                    state.bringSlot[mob] = nil
+                    local home = mobSpawnPoint(mob, part.Position)
+                    if home then pcall(function() part.CFrame = CFrame.new(home) end) end
+                end
+                state.bringIgnored[mob] = now
+                Instance.new("IntValue", mob).Name = "Ignored"
+            end
+            state.bringHealth[mob] = hp
+        end
+    end
 
-            if hum and hrp and hum.Health > 0 then
-                local diff = hrp.Position - targetPos
-                local distSq = diff.X * diff.X + diff.Y * diff.Y + diff.Z * diff.Z
+    if now < (state.bringAt or 0) then return end
+    state.bringAt = now + 0.15
 
-                if distSq <= (searchDist * searchDist) then
-                    -- 1. ขอ Network Ownership และแช่แข็งท่าทางมอน
-                    if not state.bringAnchored[enemy] then
-                        pcall(function() hrp:SetNetworkOwner(LocalPlayer) end)
+    if target:FindFirstChild("Ignored") then
+        local part = anchorOf(target)
+        if part then
+            local lock = part:FindFirstChild("Lock")
+            if lock then pcall(function() lock:Destroy() end) end
+            pcall(function() part:SetAttribute("BeingBrought", false) end)
+        end
+        state.bringHeld[target] = nil
+        return
+    end
+
+    -- The middle of the pack is the camp of that kind, taken from the game.
+    -- It is only looked up again when the middle has really moved: the player
+    -- hovers and creeps by a stud, and a middle that creeps with it never lets
+    -- a mob rest.
+    state.bringTarget = target
+    local point = spawnCentre(target, root.Position) or root.Position
+    local centre = state.bringCentre
+    if not centre or (point - centre).Magnitude > 6 then
+        state.bringCentre = point
+        centre = point
+    end
+    point = centre
+    state.bringPoint = point
+
+    local list = {target}
+    local count = CONFIG.BringMobCount or 0
+    if count <= 0 then count = math.huge end
+    count = math.min(count, CONFIG.BringMobMax or 8)
+    local key = mobKey(target.Name)
+    if count > 1 then
+        local near = {}
+        for _, mob in ipairs(collectEnemies(now)) do
+            if mob ~= target and not mob:FindFirstChild("Ignored")
+                and mobKey(mob.Name) == key then
+                local part = anchorOf(mob)
+                local hum = mob:FindFirstChildOfClass("Humanoid")
+                if part and hum and hum.Health > 0 and not ownedByOther(part)
+                    and (part.Position - anchor.Position).Magnitude <= (CONFIG.BringMobSearch or 200) then
+                    table.insert(near, {mob = mob, dist = (part.Position - anchor.Position).Magnitude})
+                end
+            end
+        end
+        table.sort(near, function(a, b) return a.dist < b.dist end)
+        for _, entry in ipairs(near) do
+            if #list >= count then break end
+            table.insert(list, entry.mob)
+        end
+    end
+
+    local stillHeld = {}
+    for _, mob in ipairs(list) do
+        stillHeld[mob] = true
+        local part = anchorOf(mob)
+        if part then
+            -- every mob keeps its own step of the row, so the pack does not
+            -- shuffle around when the order of the list changes
+            local slot = state.bringSlot[mob]
+            if not slot then
+                state.bringSlotCount = (state.bringSlotCount or 0) + 1
+                slot = state.bringSlotCount
+                state.bringSlot[mob] = slot
+            end
+            -- A fixed step of a tight block on the camp, so the pack stands on
+            -- top of itself and one swing reaches all of them. Only the ground
+            -- under the mob is steered: the mob keeps its own height, so
+            -- nothing is ever lifted or dropped and the view does not bob.
+            local i = slot - 1
+            local col = i % 3
+            local row = math.floor(i / 3)
+            local goal = Vector3.new(point.X + (col - 1) * 1.8, part.Position.Y,
+                point.Z + row * 1.8)
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+
+            -- every part of the mob goes ghost and is stopped. One part that
+            -- still collides with the ground is enough to hold the whole mob
+            -- back, so the hub does this to all of them, and it does it once.
+            if not state.bringHeld[mob] then
+                for _, d in ipairs(mob:GetDescendants()) do
+                    if d:IsA("BasePart") then
                         pcall(function()
-                            hum.PlatformStand = true
-                            hum.Sit = true
-                            hum.WalkSpeed = 0
-                            hum.JumpPower = 0
+                            d.CanCollide = false
+                            d.CanTouch = false
+                            d.Massless = true
+                            d.AssemblyLinearVelocity = Vector3.zero
+                            d.AssemblyAngularVelocity = Vector3.zero
                         end)
-                        hrp.CanCollide = false
-                    end
-                    
-                    -- 2. คำนวณตำแหน่งแบบตาราง (Grid) โดยล็อกความสูงไว้ที่พื้นดิน (groundY)
-                    local col = broughtCount % gridX
-                    local row = math.floor(broughtCount / gridX)
-                    local goal = Vector3.new(targetPos.X + (col - 1) * spacing, groundY + 2.5, targetPos.Z + row * spacing)
-                    
-                    -- 3. หยุดความเร็วและย้าย CFrame ไปที่พื้นดิน
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    hrp.AssemblyAngularVelocity = Vector3.zero
-                    hrp.CFrame = CFrame.new(goal)
-                    
-                    -- 4. ล็อกมอนไว้กับที่
-                    hrp.Anchored = true
-                    
-                    state.bringAnchored[enemy] = hrp
-                    state.bringMoved[enemy] = now
-                    
-                    broughtCount = broughtCount + 1
-                    if maxBring > 0 and broughtCount >= maxBring then
-                        break
                     end
                 end
             end
+
+            if hum then
+                pcall(function()
+                    hum.AutoRotate = false
+                    hum.BreakJointsOnDeath = false
+                    -- the hub leaves PlatformStand alone: a standing mob is
+                    -- rigid and the pull does not move it
+                    hum.PlatformStand = false
+                end)
+            end
+
+            -- the hold: a body velocity named Lock drags the mob to its step
+            local lock = part:FindFirstChild("Lock")
+            if not lock then
+                lock = Instance.new("BodyVelocity")
+                lock.Name = "Lock"
+                lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                lock.P = 9000
+                lock.Velocity = Vector3.zero
+                lock.Parent = part
+                pcall(function() part:SetAttribute("BeingBrought", true) end)
+            end
+            -- the gyro keeps the mob upright, so the pull is a slide and not a
+            -- tumble the humanoid then has to get back up from
+            local gyro = part:FindFirstChild("BringGyro")
+            if not gyro then
+                gyro = Instance.new("BodyGyro")
+                gyro.Name = "BringGyro"
+                gyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+                gyro.P = 30000
+                gyro.D = 1000
+                gyro.Parent = part
+            end
+            gyro.CFrame = root.CFrame
+            if hum then
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+            end
+            pcall(function()
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
+            end)
+            -- The mob is put on its step once, it is not slid there. A body
+            -- velocity pull makes the mob skate over the ground, and a mob that
+            -- is re-placed every tick never stops moving. So one placement, and
+            -- the hold below (speed zero) keeps it on the spot after that: a hit
+            -- cannot push it off and it does not drift on its own.
+            --
+            -- The enemy of the fight is never moved: the player stands on it,
+            -- so moving it would drag the player after it, and the two of them
+            -- would drift for ever.
+            if mob ~= target then
+                local dx, dz = part.Position.X - point.X, part.Position.Z - point.Z
+                local close = math.sqrt(dx * dx + dz * dz) <= (CONFIG.BringMobSearch or 200)
+                if close and (goal - part.Position).Magnitude > 3 then
+                    pcall(function() part.CFrame = CFrame.new(goal) end)
+                end
+            end
+            lock.Velocity = Vector3.zero
+
+            state.bringHeld[mob] = part
+            state.bringMoved[mob] = now
+            state.bringHealth[mob] = hum and hum.Health
+        end
+    end
+
+    -- the mobs of the last pack that are not in this one any more go free
+    for mob, part in pairs(state.bringHeld) do
+        if not stillHeld[mob] then
+            letGoMob(mob, part)
         end
     end
 end
@@ -2543,27 +2745,16 @@ end
 
 -- ================= MAIN LOOP =================
 -- The mobs that were frozen for the farm are let go again with this.
+
 local function releaseBringMobs()
-    -- วนลูปปลดล็อกมอนทุกตัวที่เราเคยแช่แข็งไว้
-    for mob, hrp in pairs(state.bringAnchored) do
-        if hrp and hrp.Parent then
-            pcall(function()
-                hrp.Anchored = false -- ปลดล็อกให้Physicsทำงานปกติ
-                local hum = mob:FindFirstChildOfClass("Humanoid")
-                if hum then
-                    hum.PlatformStand = false
-                    hum.Sit = false
-                end
-            end)
-        end
+    for mob, part in pairs(state.bringHeld) do
+        letGoMob(mob, part)
     end
-    -- ล้างค่าที่บันทึกไว้ทั้งหมด
-    state.bringAnchored = setmetatable({}, {__mode = "k"})
-    state.bringMoved = setmetatable({}, {__mode = "k"})
-    state.bringIgnored = setmetatable({}, {__mode = "k"})
-    state.bringHealth = setmetatable({}, {__mode = "k"})
-    state.bringAt = 0
+    state.bringHeld = setmetatable({}, {__mode = "k"})
+    state.bringSlot = setmetatable({}, {__mode = "k"})
+    state.bringSlotCount = 0
 end
+
 
 -- Everything that pointed at the character that just died is dropped here.
 -- Without this the farm keeps chasing a corpse: the old target, the old
@@ -2576,10 +2767,13 @@ local function fullReset(reason)
     state.farming = false
     state.fruit, state.fruitTools, state.fruitTries = nil, nil, 0
     state.lastTarget, state.targetHealth, state.targetAt, state.targetDist = nil, nil, 0, nil
-    state.bringPoint, state.bringTarget = nil, nil
+    state.bringPoint, state.bringTarget, state.bringCentre = nil, nil, nil
     state.bringMoved = setmetatable({}, {__mode = "k"})
     state.bringIgnored = setmetatable({}, {__mode = "k"})
     state.bringHealth = setmetatable({}, {__mode = "k"})
+    state.bringHeld = setmetatable({}, {__mode = "k"})
+    state.bringSlot = setmetatable({}, {__mode = "k"})
+    state.bringSlotCount = 0
     state.bringAt = 0
     state.flying, state.shopping, state.questing, state.whirlpooling = false, false, false, false
     state.lastSafe, state.lastPos, state.movedAt = nil, nil, 0
@@ -2942,7 +3136,7 @@ task.spawn(function()
             -- let the held mobs go the moment the bot is stopped, once
             if not state.wasStopped then
                 state.wasStopped = true
-                if next(state.bringAnchored) ~= nil then releaseBringMobs() end
+                if next(state.bringHeld) ~= nil then releaseBringMobs() end
             end
         end
         task.wait(0.05)
