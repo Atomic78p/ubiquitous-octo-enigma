@@ -1580,7 +1580,6 @@ local function bringMob(target, root)
                 lock.Velocity = toGo.Unit * math.clamp(mag * 10, 20, 1200)
             else
                 lock.Velocity = Vector3.zero
-                pcall(function() part.CFrame = CFrame.new(goal) end)
             end
 
             state.bringHeld[mob] = part
