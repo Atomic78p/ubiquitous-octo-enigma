@@ -1372,6 +1372,34 @@ local function mobSpawnPoint(target, fallback)
     return best or fallback
 end
 
+-- The middle of a camp, straight from the game: the spawn points of that kind
+-- that stand around the player. Mobs are born there, so dragging them onto
+-- their own camp is a short move - a mob that is far from its spawn is the one
+-- that gets stuck, and that is what this avoids. The camp with no spawn point
+-- next to the player is the player.
+local function spawnCentre(target, near)
+    local origin = Workspace:FindFirstChild("_WorldOrigin")
+    local spawns = origin and origin:FindFirstChild("EnemySpawns")
+    if not spawns then return nil end
+    local key = mobKey(target.Name)
+    local sum, n = nil, 0
+    for _, part in ipairs(spawns:GetChildren()) do
+        if part:IsA("BasePart") and not part:GetAttribute("Disabled") then
+            local display = nil
+            pcall(function() display = part:GetAttribute("DisplayName") end)
+            local clean = tostring(display or part.Name)
+            clean = clean:gsub("%s*%(Lv%.?%s*%d+%)", "")
+            if mobKey(clean) == key
+                and (part.Position - near).Magnitude <= (CONFIG.BringMobSearch or 200) then
+                sum = sum and (sum + part.Position) or part.Position
+                n = n + 1
+            end
+        end
+    end
+    if n == 0 or not sum then return nil end
+    return sum / n
+end
+
 -- A mob is let go: the drag goes away and the physics the pack changed is put
 -- back, so the mob can stand on its own again. It is a global because the
 -- chunk is at the limit of 200 locals.
@@ -1468,11 +1496,12 @@ local function bringMob(target, root)
         return
     end
 
-    -- The middle of the pack is the player, but it is only taken again when
-    -- the player has really gone somewhere. A player that hovers creeps by a
-    -- stud or two, and a middle that creeps with it never lets a mob rest.
+    -- The middle of the pack is the camp of that kind, taken from the game.
+    -- It is only looked up again when the middle has really moved: the player
+    -- hovers and creeps by a stud, and a middle that creeps with it never lets
+    -- a mob rest.
     state.bringTarget = target
-    local point = root.Position
+    local point = spawnCentre(target, root.Position) or root.Position
     local centre = state.bringCentre
     if not centre or (point - centre).Magnitude > 6 then
         state.bringCentre = point
@@ -1519,18 +1548,15 @@ local function bringMob(target, root)
                 slot = state.bringSlotCount
                 state.bringSlot[mob] = slot
             end
-            -- A fixed step of a ring around the player. Only the ground under
-            -- the mob is steered: the mob keeps its own height, so nothing is
-            -- ever lifted or dropped and the view does not bob.
+            -- A fixed step of a tight block on the camp, so the pack stands on
+            -- top of itself and one swing reaches all of them. Only the ground
+            -- under the mob is steered: the mob keeps its own height, so
+            -- nothing is ever lifted or dropped and the view does not bob.
             local i = slot - 1
-            local ring = i % 8
-            local loop = math.floor(i / 8)
-            local ang = ring * (math.pi / 4)
-            -- the enemy itself (step one) goes right under the player, so the
-            -- player never has to chase it. The rest stand on a ring around it.
-            local rad = (i == 0) and 0 or (4.5 + loop * 3)
-            local goal = Vector3.new(point.X + math.cos(ang) * rad, part.Position.Y,
-                point.Z + math.sin(ang) * rad)
+            local col = i % 3
+            local row = math.floor(i / 3)
+            local goal = Vector3.new(point.X + (col - 1) * 1.8, part.Position.Y,
+                point.Z + row * 1.8)
             local hum = mob:FindFirstChildOfClass("Humanoid")
 
             -- every part of the mob goes ghost and is stopped. One part that
