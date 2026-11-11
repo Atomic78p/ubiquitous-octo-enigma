@@ -1467,15 +1467,12 @@ local function bringMob(target, root)
         return
     end
 
-    -- the point the pack stands on, and the pack itself
-    if state.bringTarget ~= target or not state.bringPoint then
-        state.bringTarget = target
-        -- the pack gathers where the enemy is: the hub pulls every mob of the
-        -- kind onto the enemy it fights. On the spawn point of the kind, a mob
-        -- that already stands there is only held still and never comes over.
-        state.bringPoint = anchor.Position
-    end
-    local point = state.bringPoint
+    -- The middle of the pack is the player. The player is not part of the
+    -- pack, so it is a steady anchor and the pack can never chase itself: the
+    -- enemy goes right under the player, the rest stand on a ring around it.
+    state.bringTarget = target
+    local point = root.Position
+    state.bringPoint = point
 
     local list = {target}
     local count = CONFIG.BringMobCount or 0
@@ -1515,14 +1512,18 @@ local function bringMob(target, root)
                 slot = state.bringSlotCount
                 state.bringSlot[mob] = slot
             end
-            -- the enemy keeps the point itself; the rest of the pack stands in
-            -- a small ring around it. Nothing is lifted: the root of every mob
-            -- goes to the height of the root of the enemy.
+            -- A fixed step of a ring around the player. Only the ground under
+            -- the mob is steered: the mob keeps its own height, so nothing is
+            -- ever lifted or dropped and the view does not bob.
             local i = slot - 1
-            local col = i % 3
-            local row = math.floor(i / 3)
-            local offx = (col == 1 and 2.6) or (col == 2 and -2.6) or 0
-            local goal = Vector3.new(point.X + offx, point.Y, point.Z + row * 2.6)
+            local ring = i % 8
+            local loop = math.floor(i / 8)
+            local ang = ring * (math.pi / 4)
+            -- the enemy itself (step one) goes right under the player, so the
+            -- player never has to chase it. The rest stand on a ring around it.
+            local rad = (i == 0) and 0 or (4.5 + loop * 3)
+            local goal = Vector3.new(point.X + math.cos(ang) * rad, part.Position.Y,
+                point.Z + math.sin(ang) * rad)
             local hum = mob:FindFirstChildOfClass("Humanoid")
 
             -- every part of the mob goes ghost and is stopped. One part that
@@ -1584,11 +1585,11 @@ local function bringMob(target, root)
             end)
             local toGo = goal - part.Position
             local mag = toGo.Magnitude
-            -- the speed follows the distance with no floor under it. A floor
-            -- makes a mob that is nearly there step past the point and slide
+            -- The speed follows the distance with no floor under it. A floor
+            -- makes a mob that is nearly there step past its step and slide
             -- back and forth for ever, which is what the buzzing was.
             if mag > 0.2 then
-                lock.Velocity = toGo.Unit * math.min(mag * 10, 1200)
+                lock.Velocity = toGo.Unit * math.min(mag * 6, 900)
             else
                 lock.Velocity = Vector3.zero
             end
