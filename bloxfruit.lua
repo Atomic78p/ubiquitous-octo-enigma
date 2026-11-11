@@ -1371,6 +1371,34 @@ local function mobSpawnPoint(target, fallback)
     return best or fallback
 end
 
+-- A mob is let go: the drag goes away and the physics the pack changed is put
+-- back, so the mob can stand on its own again. It is a global because the
+-- chunk is at the limit of 200 locals.
+letGoMob = function(mob, part)
+    part = part or anchorOf(mob)
+    if part and part.Parent then
+        pcall(function()
+            local lock = part:FindFirstChild("Lock")
+            if lock then lock:Destroy() end
+            part:SetAttribute("BeingBrought", false)
+            part.CanCollide = true
+            part.Massless = false
+            part.AssemblyLinearVelocity = Vector3.zero
+            part.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+    local hum = mob:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function()
+            hum.PlatformStand = false
+            hum.AutoRotate = true
+        end)
+    end
+    state.bringHeld[mob] = nil
+    state.bringMoved[mob] = nil
+    state.bringHealth[mob] = nil
+end
+
 -- Bring Mob, the way the good hubs do it: the pack is gathered on one point
 -- and every mob is held there by a body velocity named Lock (unlimited force,
 -- so a hit cannot knock it off), not by a teleport. The point is the spawn
@@ -1404,10 +1432,7 @@ local function bringMob(target, root)
                 and not mob:FindFirstChild("Ignored") then
                 local part = anchorOf(mob)
                 if part then
-                    local lock = part:FindFirstChild("Lock")
-                    if lock then pcall(function() lock:Destroy() end) end
-                    pcall(function() part:SetAttribute("BeingBrought", false) end)
-                    state.bringHeld[mob] = nil
+                    letGoMob(mob, part)
                     state.bringSlot[mob] = nil
                     local home = mobSpawnPoint(mob, part.Position)
                     if home then pcall(function() part.CFrame = CFrame.new(home) end) end
@@ -1465,7 +1490,9 @@ local function bringMob(target, root)
         end
     end
 
+    local stillHeld = {}
     for _, mob in ipairs(list) do
+        stillHeld[mob] = true
         local part = anchorOf(mob)
         if part then
             -- every mob keeps its own step of the row, so the pack does not
@@ -1517,6 +1544,13 @@ local function bringMob(target, root)
             state.bringHeld[mob] = part
             state.bringMoved[mob] = now
             state.bringHealth[mob] = hum and hum.Health
+        end
+    end
+
+    -- the mobs of the last pack that are not in this one any more go free
+    for mob, part in pairs(state.bringHeld) do
+        if not stillHeld[mob] then
+            letGoMob(mob, part)
         end
     end
 end
@@ -2620,16 +2654,8 @@ end
 -- The mobs that were frozen for the farm are let go again with this.
 
 local function releaseBringMobs()
-    for _, part in pairs(state.bringHeld) do
-        if part and part.Parent then
-            pcall(function()
-                local lock = part:FindFirstChild("Lock")
-                if lock then lock:Destroy() end
-                part:SetAttribute("BeingBrought", false)
-                part.CanCollide = true
-                part.AssemblyLinearVelocity = Vector3.zero
-            end)
-        end
+    for mob, part in pairs(state.bringHeld) do
+        letGoMob(mob, part)
     end
     state.bringHeld = setmetatable({}, {__mode = "k"})
     state.bringSlot = setmetatable({}, {__mode = "k"})
