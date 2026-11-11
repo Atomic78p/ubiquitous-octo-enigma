@@ -1371,36 +1371,65 @@ end
 
 local function bringMob(target, root)
     if not CONFIG.BringMob or not target or not target.Parent then return end
-    
+
     local anchor = anchorOf(target)
     if not anchor then return end
 
     local searchDist = CONFIG.BringMobSearch or 200
     local targetPos = anchor.Position
-
     local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
     if not folder then return end
 
     local broughtCount = 0
     local maxBring = CONFIG.BringMobCount or 5
+    local now = tick()
+
+    -- ตั้งค่าระยะห่างระหว่างมอนในตาราง (Grid) กัน Hitbox ซ้อนทับ
+    local gridX = 3
+    local spacing = 4.5
 
     for _, enemy in ipairs(folder:GetChildren()) do
+        -- ตรวจสอบว่ามอนตัวนี้ชื่อเดียวกับเป้าหมาย และยังมีชีวิตอยู่
         if enemy and enemy.Parent and enemy.Name == target.Name then
             local hum = enemy:FindFirstChildOfClass("Humanoid")
             local hrp = enemy:FindFirstChild("HumanoidRootPart")
 
             if hum and hrp and hum.Health > 0 then
-                -- แก้ไขคำนวณระยะทางด้วย Vector3 ปกติของ Roblox
                 local diff = hrp.Position - targetPos
                 local distSq = diff.X * diff.X + diff.Y * diff.Y + diff.Z * diff.Z
 
                 if distSq <= (searchDist * searchDist) then
-                    hrp.CanCollide = false
+                    -- 1. ขอ Network Ownership (สำคัญมาก! ถ้าไม่ขอมอนจะดีดกลับ)
+                    if not state.bringAnchored[enemy] then
+                        pcall(function() hrp:SetNetworkOwner(LocalPlayer) end)
+                        
+                        -- 2. แช่แข็งท่าทางของมอน (Freeze Humanoid)
+                        pcall(function()
+                            hum.PlatformStand = true
+                            hum.Sit = true
+                            hum.WalkSpeed = 0
+                            hum.JumpPower = 0
+                        end)
+                        hrp.CanCollide = false
+                    end
+                    
+                    -- 3. คำนวณตำแหน่งแบบตาราง (Grid 3x3) ไม่ให้มอนทับกัน
+                    local col = broughtCount % gridX
+                    local row = math.floor(broughtCount / gridX)
+                    local goal = targetPos + Vector3.new((col - 1) * spacing, 2.5, row * spacing)
+                    
+                    -- 4. หยุดความเร็วและย้าย CFrame
                     hrp.AssemblyLinearVelocity = Vector3.zero
                     hrp.AssemblyAngularVelocity = Vector3.zero
+                    hrp.CFrame = CFrame.new(goal)
                     
-                    hrp.CFrame = anchor.CFrame * CFrame.new(0, 0, -2)
-
+                    -- 5. ล็อกมอนไว้กับที่ (Anchored) ไม่ให้ Physics ดีดออก
+                    hrp.Anchored = true
+                    
+                    -- บันทึกสถานะไว้ให้ระบบอื่นๆ รู้
+                    state.bringAnchored[enemy] = hrp
+                    state.bringMoved[enemy] = now
+                    
                     broughtCount = broughtCount + 1
                     if maxBring > 0 and broughtCount >= maxBring then
                         break
@@ -1410,7 +1439,6 @@ local function bringMob(target, root)
         end
     end
 end
-
 
 -- The client only simulates the mobs that stand inside its simulation radius.
 -- The hubs raise it, and that is the whole reason their bring mob holds: the
@@ -2510,22 +2538,25 @@ end
 -- ================= MAIN LOOP =================
 -- The mobs that were frozen for the farm are let go again with this.
 local function releaseBringMobs()
-    local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
-    if not folder then return end
-    for _, mob in ipairs(folder:GetChildren()) do
-        local hrp = mob:FindFirstChild("HumanoidRootPart")
-        if hrp then
+    -- วนลูปปลดล็อกมอนทุกตัวที่เราเคยแช่แข็งไว้
+    for mob, hrp in pairs(state.bringAnchored) do
+        if hrp and hrp.Parent then
             pcall(function()
-                local lock = hrp:FindFirstChild("Lock")
-                if lock then lock:Destroy() end
-                local gyro = hrp:FindFirstChild("BringGyro")
-                if gyro then gyro:Destroy() end
-                hrp:SetAttribute("BeingBrought", false)
-                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.Anchored = false -- ปลดล็อกให้Physicsทำงานปกติ
+                local hum = mob:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    hum.PlatformStand = false
+                    hum.Sit = false
+                end
             end)
         end
     end
+    -- ล้างค่าที่บันทึกไว้ทั้งหมด
     state.bringAnchored = setmetatable({}, {__mode = "k"})
+    state.bringMoved = setmetatable({}, {__mode = "k"})
+    state.bringIgnored = setmetatable({}, {__mode = "k"})
+    state.bringHealth = setmetatable({}, {__mode = "k"})
+    state.bringAt = 0
 end
 
 -- Everything that pointed at the character that just died is dropped here.
