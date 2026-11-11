@@ -1370,128 +1370,57 @@ local function mobSpawnPoint(target, fallback)
 end
 
 local function bringMob(target, root)
-    if not CONFIG.BringMob then return end
-    if not target or not target.Parent then return end
+    if not CONFIG.BringMob or not target or not target.Parent then return end
     
     local anchor = anchorOf(target)
     if not anchor then return end
-    
-    local searchDist = CONFIG.BringMobSearch or 300
+
+    local searchDist = CONFIG.BringMobSearch or 200
     local searchDistSq = searchDist * searchDist
     local targetPos = anchor.Position
 
+    -- ขยายรัศมี Simulation ให้กว้างที่สุดเท่าที่จะทำได้
     pcall(function()
-        sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge)
-        sethiddenproperty(LocalPlayer, "MaxSimulationRadius", math.huge)
+        sethiddenproperty(LocalPlayer, "SimulationRadius", 100000)
+        sethiddenproperty(LocalPlayer, "MaxSimulationRadius", 100000)
     end)
 
     local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
     if not folder then return end
 
-    for _, v19 in ipairs(folder:GetChildren()) do
-        if v19 and v19.Name == target.Name and not table.find({ "Shark", "Piranha", "Terrorshark" }, v19.Name) then
-            local humanoid = v19:FindFirstChildOfClass("Humanoid")
-            local humanoidRootPart = v19:FindFirstChild("HumanoidRootPart")
+    local broughtCount = 0
+    local maxBring = CONFIG.BringMobCount or 5
 
-            if humanoid and humanoidRootPart and humanoid.Health > 0 and humanoidRootPart:IsDescendantOf(Workspace) then
-                local dx = humanoidRootPart.Position.X - targetPos.X
-                local dy = humanoidRootPart.Position.Y - targetPos.Y
-                local dz = humanoidRootPart.Position.Z - targetPos.Z
+    for _, enemy in ipairs(folder:GetChildren()) do
+        if enemy:IsA("Model") and enemy.Name == target.Name then
+            local hum = enemy:FindFirstChildOfClass("Humanoid")
+            local hrp = enemy:FindFirstChild("HumanoidRootPart")
 
-                if dx * dx + dy * dy + dz * dz <= searchDistSq then
-                    if not humanoidRootPart:GetAttribute("BeingBrought") then
-                        humanoidRootPart:SetAttribute("BeingBrought", true)
-                        humanoidRootPart.CanCollide = false
-                        humanoidRootPart.Massless = true
-                        
-                        for _, v20 in ipairs(v19:GetDescendants()) do
-                            if v20:IsA("BasePart") then
-                                v20.CanCollide = false
-                                v20.CanTouch = false
-                                v20.Massless = true
-                                v20.AssemblyLinearVelocity = Vector3.zero
-                                v20.AssemblyAngularVelocity = Vector3.zero
-                            end
+            if hum and hrp and hum.Health > 0 then
+                local distSq = (hrp.Position - targetPos).SquareMagnitude
+                if distSq <= searchDistSq then
+                    -- ปิด Collide เพื่อไม่ให้มอนสเตอร์เบียดกันจนบินขึ้นฟ้า
+                    for _, part in ipairs(enemy:GetChildren()) do
+                        if part:IsA("BasePart") then
+                            part.CanCollide = false
                         end
+                    end
+                    
+                    -- ดึงเข้ามาซ้อนไว้ที่จุดเดียวกันหน้าตัวผู้เล่น
+                    hrp.CFrame = anchor.CFrame * CFrame.new(0, 0, -2)
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
 
-                        local lock = humanoidRootPart:FindFirstChild("Lock")
-                        if not lock or not lock.Parent then
-                            lock = Instance.new("BodyVelocity")
-                            lock.Name = "Lock"
-                            lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                            lock.P = 9000
-                            lock.Velocity = Vector3.zero
-                            lock.Parent = humanoidRootPart
-                        end
-
-                        local bringGyro = humanoidRootPart:FindFirstChild("BringGyro")
-                        if not bringGyro or not bringGyro.Parent then
-                            bringGyro = Instance.new("BodyGyro")
-                            bringGyro.Name = "BringGyro"
-                            bringGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-                            bringGyro.P = 30000
-                            bringGyro.D = 1000
-                            bringGyro.Parent = humanoidRootPart
-                        end
-
-                        lock.P = 9000
-                        bringGyro.CFrame = anchor.CFrame
-                        humanoid.AutoRotate = false
-                        humanoid.PlatformStand = false
-                        humanoid.BreakJointsOnDeath = false
-
-                        pcall(function()
-                            humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-                        end)
-
-                        humanoidRootPart.AssemblyLinearVelocity = Vector3.zero
-                        humanoidRootPart.AssemblyAngularVelocity = Vector3.zero
-
-                        task.spawn(function()
-                            local n8 = targetPos + Vector3.new(math.random(-20, 20) / 100, math.random(-20, 20) / 100, math.random(-20, 20) / 100)
-                            local n9 = n8 - humanoidRootPart.Position
-                            local magnitude = n9.Magnitude
-
-                            if magnitude > 0.5 then
-                                lock.Velocity = n9.Unit * math.clamp(magnitude * 10, 20, 1200)
-                            else
-                                lock.Velocity = Vector3.zero
-                                pcall(function()
-                                    humanoidRootPart.CFrame = CFrame.new(n8)
-                                end)
-                            end
-
-                            bringGyro.CFrame = anchor.CFrame
-                            humanoid.AutoRotate = false
-                            humanoid.PlatformStand = false
-                            humanoid.BreakJointsOnDeath = false
-
-                            pcall(function()
-                                humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-                            end)
-
-                            humanoidRootPart.AssemblyLinearVelocity = Vector3.zero
-                            humanoidRootPart.AssemblyAngularVelocity = Vector3.zero
-                            task.wait(0.12)
-
-                            pcall(function()
-                                if lock and lock.Parent then
-                                    lock:Destroy()
-                                end
-                                if bringGyro and bringGyro.Parent then
-                                    bringGyro:Destroy()
-                                end
-                                if humanoidRootPart and humanoidRootPart.Parent then
-                                    humanoidRootPart:SetAttribute("BeingBrought", false)
-                                end
-                            end)
-                        end)
+                    broughtCount = broughtCount + 1
+                    if maxBring > 0 and broughtCount >= maxBring then
+                        break
                     end
                 end
             end
         end
     end
 end
+
 
 -- The client only simulates the mobs that stand inside its simulation radius.
 -- The hubs raise it, and that is the whole reason their bring mob holds: the
