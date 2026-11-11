@@ -1370,152 +1370,125 @@ local function mobSpawnPoint(target, fallback)
 end
 
 local function bringMob(target, root)
+    if not CONFIG.BringMob then return end
+    if not target or not target.Parent then return end
+    
     local anchor = anchorOf(target)
     if not anchor then return end
-    local now = tick()
+    
+    local searchDist = CONFIG.BringMobSearch or 300
+    local searchDistSq = searchDist * searchDist
+    local targetPos = anchor.Position
 
-    for _, mob in ipairs(collectEnemies(now)) do
-        local marker = mob:FindFirstChild("Ignored")
-        if marker and not state.bringIgnored[mob] then
-            state.bringIgnored[mob] = now
-        end
-    end
-    for mob, at in pairs(state.bringIgnored) do
-        if now - at > 30 then
-            local marker = mob:FindFirstChild("Ignored")
-            if marker then pcall(function() marker:Destroy() end) end
-            state.bringIgnored[mob] = nil
-        end
-    end
-    for mob, at in pairs(state.bringMoved) do
-        if now - at > 2.2 then
-            state.bringMoved[mob] = nil
-            local hum = mob:FindFirstChildOfClass("Humanoid")
-            local hp = hum and hum.Health
-            if mob ~= target and hp and state.bringHealth[mob] == hp
-                and not mob:FindFirstChild("Ignored") then
-                -- It is not being hurt: the hold is taken off, it is put back
-                -- on its spawn ground and left alone.
-                local part = anchorOf(mob)
-                if part then
-                    local lock = part:FindFirstChild("Lock")
-                    if lock then pcall(function() lock:Destroy() end) end
-                    pcall(function() part:SetAttribute("BeingBrought", false) end)
-                    state.bringAnchored[part] = nil
-                    local home = mobSpawnPoint(mob, part.Position)
-                    if home then pcall(function() part.CFrame = CFrame.new(home) end) end
+    pcall(function()
+        sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge)
+        sethiddenproperty(LocalPlayer, "MaxSimulationRadius", math.huge)
+    end)
+
+    local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
+    if not folder then return end
+
+    for _, v19 in ipairs(folder:GetChildren()) do
+        if v19 and v19.Name == target.Name and not table.find({ "Shark", "Piranha", "Terrorshark" }, v19.Name) then
+            local humanoid = v19:FindFirstChildOfClass("Humanoid")
+            local humanoidRootPart = v19:FindFirstChild("HumanoidRootPart")
+
+            if humanoid and humanoidRootPart and humanoid.Health > 0 and humanoidRootPart:IsDescendantOf(Workspace) then
+                local dx = humanoidRootPart.Position.X - targetPos.X
+                local dy = humanoidRootPart.Position.Y - targetPos.Y
+                local dz = humanoidRootPart.Position.Z - targetPos.Z
+
+                if dx * dx + dy * dy + dz * dz <= searchDistSq then
+                    if not humanoidRootPart:GetAttribute("BeingBrought") then
+                        humanoidRootPart:SetAttribute("BeingBrought", true)
+                        humanoidRootPart.CanCollide = false
+                        humanoidRootPart.Massless = true
+                        
+                        for _, v20 in ipairs(v19:GetDescendants()) do
+                            if v20:IsA("BasePart") then
+                                v20.CanCollide = false
+                                v20.CanTouch = false
+                                v20.Massless = true
+                                v20.AssemblyLinearVelocity = Vector3.zero
+                                v20.AssemblyAngularVelocity = Vector3.zero
+                            end
+                        end
+
+                        local lock = humanoidRootPart:FindFirstChild("Lock")
+                        if not lock or not lock.Parent then
+                            lock = Instance.new("BodyVelocity")
+                            lock.Name = "Lock"
+                            lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                            lock.P = 9000
+                            lock.Velocity = Vector3.zero
+                            lock.Parent = humanoidRootPart
+                        end
+
+                        local bringGyro = humanoidRootPart:FindFirstChild("BringGyro")
+                        if not bringGyro or not bringGyro.Parent then
+                            bringGyro = Instance.new("BodyGyro")
+                            bringGyro.Name = "BringGyro"
+                            bringGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+                            bringGyro.P = 30000
+                            bringGyro.D = 1000
+                            bringGyro.Parent = humanoidRootPart
+                        end
+
+                        lock.P = 9000
+                        bringGyro.CFrame = anchor.CFrame
+                        humanoid.AutoRotate = false
+                        humanoid.PlatformStand = false
+                        humanoid.BreakJointsOnDeath = false
+
+                        pcall(function()
+                            humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+                        end)
+
+                        humanoidRootPart.AssemblyLinearVelocity = Vector3.zero
+                        humanoidRootPart.AssemblyAngularVelocity = Vector3.zero
+
+                        task.spawn(function()
+                            local n8 = targetPos + Vector3.new(math.random(-20, 20) / 100, math.random(-20, 20) / 100, math.random(-20, 20) / 100)
+                            local n9 = n8 - humanoidRootPart.Position
+                            local magnitude = n9.Magnitude
+
+                            if magnitude > 0.5 then
+                                lock.Velocity = n9.Unit * math.clamp(magnitude * 10, 20, 1200)
+                            else
+                                lock.Velocity = Vector3.zero
+                                pcall(function()
+                                    humanoidRootPart.CFrame = CFrame.new(n8)
+                                end)
+                            end
+
+                            bringGyro.CFrame = anchor.CFrame
+                            humanoid.AutoRotate = false
+                            humanoid.PlatformStand = false
+                            humanoid.BreakJointsOnDeath = false
+
+                            pcall(function()
+                                humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+                            end)
+
+                            humanoidRootPart.AssemblyLinearVelocity = Vector3.zero
+                            humanoidRootPart.AssemblyAngularVelocity = Vector3.zero
+                            task.wait(0.12)
+
+                            pcall(function()
+                                if lock and lock.Parent then
+                                    lock:Destroy()
+                                end
+                                if bringGyro and bringGyro.Parent then
+                                    bringGyro:Destroy()
+                                end
+                                if humanoidRootPart and humanoidRootPart.Parent then
+                                    humanoidRootPart:SetAttribute("BeingBrought", false)
+                                end
+                            end)
+                        end)
+                    end
                 end
-                state.bringIgnored[mob] = now
-                Instance.new("IntValue", mob).Name = "Ignored"
             end
-            state.bringHealth[mob] = hp
-        end
-    end
-
-    local dx = root.Position.X - anchor.Position.X
-    local dz = root.Position.Z - anchor.Position.Z
-    if math.sqrt(dx * dx + dz * dz) > CONFIG.BringMobRange then return end
-    if now < (state.bringAt or 0) then return end
-    state.bringAt = now + 0.15
-
-    if target:FindFirstChild("Ignored") then return end
-
-    if ownedByOther(anchor) then
-        dbg("The mob belongs to another player")
-        return
-    end
-
-    -- The pack has one fixed point to stand on and the player comes to it.
-    -- Pulling to the player instead drags the whole pack around every time
-    -- the player turns or walks to the next fruit.
-    if state.bringTarget ~= target or not state.bringPoint then
-        state.bringTarget = target
-        state.bringPoint = mobSpawnPoint(target, anchor.Position)
-    end
-    local point = state.bringPoint
-
-    local list = {target}
-    local count = CONFIG.BringMobCount or 0
-    if count <= 0 then
-        -- zero means every mob of the kind, up to the cap of the pull
-        count = math.huge
-    end
-    count = math.min(count, CONFIG.BringMobMax or 8)
-    local key = mobKey(target.Name)
-    if count > 1 then
-        local near = {}
-        for _, mob in ipairs(collectEnemies(now)) do
-            if mob ~= target and not mob:FindFirstChild("Ignored")
-                and mobKey(mob.Name) == key then
-                local part = anchorOf(mob)
-                local hum = mob:FindFirstChildOfClass("Humanoid")
-                if part and hum and hum.Health > 0 and not ownedByOther(part)
-                    and (part.Position - anchor.Position).Magnitude <= CONFIG.BringMobSearch then
-                    table.insert(near, {mob = mob, dist = (part.Position - anchor.Position).Magnitude})
-                end
-            end
-        end
-        table.sort(near, function(a, b) return a.dist < b.dist end)
-        for _, entry in ipairs(near) do
-            if #list >= count then break end
-            table.insert(list, entry.mob)
-        end
-    end
-
-    -- The pack is put down as one group: each mob gets its own small step of
-    -- the same point, so five of them stand next to each other and one swing
-    -- takes them all.
-    for i, mob in ipairs(list) do
-        local part = anchorOf(mob)
-        if part then
-            -- Three to a row on the ground of the spawn point: the height is
-            -- the one of the ground, not the one the mob happened to float at.
-            local col = (i - 1) % 3
-            local row = math.floor((i - 1) / 3)
-            local goal = Vector3.new(point.X + (col - 1) * 2.3, point.Y + 1.8,
-                point.Z + row * 2.3)
-            local off = (part.Position - goal).Magnitude
-            local vel = part.AssemblyLinearVelocity
-            local speed = vel and vel.Magnitude or 0
-            -- A mob that already stands still on its step is left alone: it is
-            -- only handled when it drifted away or something is moving it.
-            if off > 2.5 or speed > 2 then
-                local hum = mob:FindFirstChildOfClass("Humanoid")
-                if hum then
-                    pcall(function() hum.PlatformStand = true end)
-                    pcall(function() hum.Sit = true end)
-                    pcall(function() hum.WalkSpeed = 0 end)
-                    pcall(function() hum.JumpPower = 0 end)
-                end
-                pcall(function() part.CanCollide = false end)
-                if speed > 2 then
-                    pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
-                    pcall(function() part.AssemblyAngularVelocity = Vector3.zero end)
-                end
-                -- The hold: a body velocity named Lock drags the mob to its
-                -- step. It is what the hubs use: smooth, and no hit can knock
-                -- the mob off the row because the force is unlimited.
-                local lock = part:FindFirstChild("Lock")
-                if not lock then
-                    lock = Instance.new("BodyVelocity")
-                    lock.Name = "Lock"
-                    lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                    lock.P = 9000
-                    lock.Velocity = Vector3.zero
-                    lock.Parent = part
-                    pcall(function() part.Massless = true end)
-                    pcall(function() part:SetAttribute("BeingBrought", true) end)
-                end
-                local toGo = goal - part.Position
-                local mag = toGo.Magnitude
-                if mag > 0.5 then
-                    lock.Velocity = toGo.Unit * math.clamp(mag * 10, 25, 400)
-                else
-                    lock.Velocity = Vector3.zero
-                end
-                state.bringAnchored[part] = true
-            end
-            state.bringMoved[mob] = now
         end
     end
 end
@@ -2618,15 +2591,20 @@ end
 -- ================= MAIN LOOP =================
 -- The mobs that were frozen for the farm are let go again with this.
 local function releaseBringMobs()
-    for part in pairs(state.bringAnchored) do
-        pcall(function()
-            if part and part.Parent then
-                local lock = part:FindFirstChild("Lock")
+    local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
+    if not folder then return end
+    for _, mob in ipairs(folder:GetChildren()) do
+        local hrp = mob:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            pcall(function()
+                local lock = hrp:FindFirstChild("Lock")
                 if lock then lock:Destroy() end
-                part:SetAttribute("BeingBrought", false)
-                part.AssemblyLinearVelocity = Vector3.zero
-            end
-        end)
+                local gyro = hrp:FindFirstChild("BringGyro")
+                if gyro then gyro:Destroy() end
+                hrp:SetAttribute("BeingBrought", false)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end)
+        end
     end
     state.bringAnchored = setmetatable({}, {__mode = "k"})
 end
