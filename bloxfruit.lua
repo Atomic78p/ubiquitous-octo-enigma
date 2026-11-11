@@ -1585,14 +1585,16 @@ local function bringMob(target, root)
             end)
             local toGo = goal - part.Position
             local mag = toGo.Magnitude
-            -- The speed follows the distance with no floor under it. A floor
-            -- makes a mob that is nearly there step past its step and slide
-            -- back and forth for ever, which is what the buzzing was.
-            if mag > 0.2 then
-                lock.Velocity = toGo.Unit * math.min(mag * 6, 900)
-            else
-                lock.Velocity = Vector3.zero
+            -- The mob is put on its step, it is not slid there. A body velocity
+            -- pull makes the mob skate over the ground. The move is a snap and
+            -- the hold below (speed zero) keeps it on the spot after that, so
+            -- nothing knocks it off and nothing makes it drift.
+            local dx, dz = part.Position.X - point.X, part.Position.Z - point.Z
+            local close = math.sqrt(dx * dx + dz * dz) <= (CONFIG.BringMobSearch or 200)
+            if close and mag > 1 then
+                pcall(function() part.CFrame = CFrame.new(goal) end)
             end
+            lock.Velocity = Vector3.zero
 
             state.bringHeld[mob] = part
             state.bringMoved[mob] = now
