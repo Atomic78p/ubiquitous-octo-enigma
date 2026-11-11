@@ -1375,7 +1375,7 @@ local function bringMob(target, root)
     local anchor = anchorOf(target)
     if not anchor then return end
 
-    local searchDistSq = (CONFIG.BringMobSearch or 200) ^ 2
+    local searchDist = CONFIG.BringMobSearch or 200
     local targetPos = anchor.Position
 
     local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
@@ -1384,22 +1384,21 @@ local function bringMob(target, root)
     local broughtCount = 0
     local maxBring = CONFIG.BringMobCount or 5
 
-    -- ดึงเฉพาะมอนสเตอร์ที่ตรงกับ Target และยังมีชีวิตอยู่
     for _, enemy in ipairs(folder:GetChildren()) do
         if enemy and enemy.Parent and enemy.Name == target.Name then
             local hum = enemy:FindFirstChildOfClass("Humanoid")
             local hrp = enemy:FindFirstChild("HumanoidRootPart")
 
             if hum and hrp and hum.Health > 0 then
-                local distSq = (hrp.Position - targetPos).SquareMagnitude
-                if distSq <= searchDistSq then
-                    
-                    -- ปรับเฉพาะ HumanoidRootPart เพื่อลด Overhead ไม่ให้เกมค้าง
+                -- แก้ไขคำนวณระยะทางด้วย Vector3 ปกติของ Roblox
+                local diff = hrp.Position - targetPos
+                local distSq = diff.X * diff.X + diff.Y * diff.Y + diff.Z * diff.Z
+
+                if distSq <= (searchDist * searchDist) then
                     hrp.CanCollide = false
                     hrp.AssemblyLinearVelocity = Vector3.zero
                     hrp.AssemblyAngularVelocity = Vector3.zero
                     
-                    -- ย้ายตำแหน่งมาที่ด้านหน้า Target
                     hrp.CFrame = anchor.CFrame * CFrame.new(0, 0, -2)
 
                     broughtCount = broughtCount + 1
@@ -1411,7 +1410,6 @@ local function bringMob(target, root)
         end
     end
 end
-
 
 
 -- The client only simulates the mobs that stand inside its simulation radius.
