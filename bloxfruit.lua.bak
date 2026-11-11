@@ -2538,22 +2538,25 @@ end
 -- ================= MAIN LOOP =================
 -- The mobs that were frozen for the farm are let go again with this.
 local function releaseBringMobs()
-    local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
-    if not folder then return end
-    for _, mob in ipairs(folder:GetChildren()) do
-        local hrp = mob:FindFirstChild("HumanoidRootPart")
-        if hrp then
+    -- วนลูปปลดล็อกมอนทุกตัวที่เราเคยแช่แข็งไว้
+    for mob, hrp in pairs(state.bringAnchored) do
+        if hrp and hrp.Parent then
             pcall(function()
-                local lock = hrp:FindFirstChild("Lock")
-                if lock then lock:Destroy() end
-                local gyro = hrp:FindFirstChild("BringGyro")
-                if gyro then gyro:Destroy() end
-                hrp:SetAttribute("BeingBrought", false)
-                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.Anchored = false -- ปลดล็อกให้Physicsทำงานปกติ
+                local hum = mob:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    hum.PlatformStand = false
+                    hum.Sit = false
+                end
             end)
         end
     end
+    -- ล้างค่าที่บันทึกไว้ทั้งหมด
     state.bringAnchored = setmetatable({}, {__mode = "k"})
+    state.bringMoved = setmetatable({}, {__mode = "k"})
+    state.bringIgnored = setmetatable({}, {__mode = "k"})
+    state.bringHealth = setmetatable({}, {__mode = "k"})
+    state.bringAt = 0
 end
 
 -- Everything that pointed at the character that just died is dropped here.

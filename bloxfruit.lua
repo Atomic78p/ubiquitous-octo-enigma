@@ -1377,6 +1377,15 @@ local function bringMob(target, root)
 
     local searchDist = CONFIG.BringMobSearch or 200
     local targetPos = anchor.Position
+    
+    -- 🛠️ หาพื้นดิน (Ground) ด้วย Raycast เพื่อไม่ให้มอนลอยขึ้นฟ้า
+    local groundY = targetPos.Y
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {target, LocalPlayer.Character}
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    local result = Workspace:Raycast(targetPos + Vector3.new(0, 50, 0), Vector3.new(0, -100, 0), rayParams)
+    if result then groundY = result.Position.Y end
+
     local folder = findEnemiesFolder() or Workspace:FindFirstChild("Enemies")
     if not folder then return end
 
@@ -1399,11 +1408,9 @@ local function bringMob(target, root)
                 local distSq = diff.X * diff.X + diff.Y * diff.Y + diff.Z * diff.Z
 
                 if distSq <= (searchDist * searchDist) then
-                    -- 1. ขอ Network Ownership (สำคัญมาก! ถ้าไม่ขอมอนจะดีดกลับ)
+                    -- 1. ขอ Network Ownership และแช่แข็งท่าทางมอน
                     if not state.bringAnchored[enemy] then
                         pcall(function() hrp:SetNetworkOwner(LocalPlayer) end)
-                        
-                        -- 2. แช่แข็งท่าทางของมอน (Freeze Humanoid)
                         pcall(function()
                             hum.PlatformStand = true
                             hum.Sit = true
@@ -1413,20 +1420,19 @@ local function bringMob(target, root)
                         hrp.CanCollide = false
                     end
                     
-                    -- 3. คำนวณตำแหน่งแบบตาราง (Grid 3x3) ไม่ให้มอนทับกัน
+                    -- 2. คำนวณตำแหน่งแบบตาราง (Grid) โดยล็อกความสูงไว้ที่พื้นดิน (groundY)
                     local col = broughtCount % gridX
                     local row = math.floor(broughtCount / gridX)
-                    local goal = targetPos + Vector3.new((col - 1) * spacing, 2.5, row * spacing)
+                    local goal = Vector3.new(targetPos.X + (col - 1) * spacing, groundY + 2.5, targetPos.Z + row * spacing)
                     
-                    -- 4. หยุดความเร็วและย้าย CFrame
+                    -- 3. หยุดความเร็วและย้าย CFrame ไปที่พื้นดิน
                     hrp.AssemblyLinearVelocity = Vector3.zero
                     hrp.AssemblyAngularVelocity = Vector3.zero
                     hrp.CFrame = CFrame.new(goal)
                     
-                    -- 5. ล็อกมอนไว้กับที่ (Anchored) ไม่ให้ Physics ดีดออก
+                    -- 4. ล็อกมอนไว้กับที่
                     hrp.Anchored = true
                     
-                    -- บันทึกสถานะไว้ให้ระบบอื่นๆ รู้
                     state.bringAnchored[enemy] = hrp
                     state.bringMoved[enemy] = now
                     
