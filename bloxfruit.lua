@@ -139,6 +139,7 @@ state = {
     bringHealth   = setmetatable({}, {__mode = "k"}),
     bringPoint    = nil,
     bringTarget   = nil,
+    bringCentre   = nil,
     questVerified = false,
     questGaveUp   = false,
     hitsConfirmed = 0,
@@ -1467,11 +1468,17 @@ local function bringMob(target, root)
         return
     end
 
-    -- The middle of the pack is the player. The player is not part of the
-    -- pack, so it is a steady anchor and the pack can never chase itself: the
-    -- enemy goes right under the player, the rest stand on a ring around it.
+    -- The middle of the pack is the player, but it is only taken again when
+    -- the player has really gone somewhere. A player that hovers creeps by a
+    -- stud or two, and a middle that creeps with it never lets a mob rest.
     state.bringTarget = target
     local point = root.Position
+    local centre = state.bringCentre
+    if not centre or (point - centre).Magnitude > 6 then
+        state.bringCentre = point
+        centre = point
+    end
+    point = centre
     state.bringPoint = point
 
     local list = {target}
@@ -1583,16 +1590,21 @@ local function bringMob(target, root)
                 part.AssemblyLinearVelocity = Vector3.zero
                 part.AssemblyAngularVelocity = Vector3.zero
             end)
-            local toGo = goal - part.Position
-            local mag = toGo.Magnitude
-            -- The mob is put on its step, it is not slid there. A body velocity
-            -- pull makes the mob skate over the ground. The move is a snap and
-            -- the hold below (speed zero) keeps it on the spot after that, so
-            -- nothing knocks it off and nothing makes it drift.
-            local dx, dz = part.Position.X - point.X, part.Position.Z - point.Z
-            local close = math.sqrt(dx * dx + dz * dz) <= (CONFIG.BringMobSearch or 200)
-            if close and mag > 1 then
-                pcall(function() part.CFrame = CFrame.new(goal) end)
+            -- The mob is put on its step once, it is not slid there. A body
+            -- velocity pull makes the mob skate over the ground, and a mob that
+            -- is re-placed every tick never stops moving. So one placement, and
+            -- the hold below (speed zero) keeps it on the spot after that: a hit
+            -- cannot push it off and it does not drift on its own.
+            --
+            -- The enemy of the fight is never moved: the player stands on it,
+            -- so moving it would drag the player after it, and the two of them
+            -- would drift for ever.
+            if mob ~= target then
+                local dx, dz = part.Position.X - point.X, part.Position.Z - point.Z
+                local close = math.sqrt(dx * dx + dz * dz) <= (CONFIG.BringMobSearch or 200)
+                if close and (goal - part.Position).Magnitude > 3 then
+                    pcall(function() part.CFrame = CFrame.new(goal) end)
+                end
             end
             lock.Velocity = Vector3.zero
 
@@ -2729,7 +2741,7 @@ local function fullReset(reason)
     state.farming = false
     state.fruit, state.fruitTools, state.fruitTries = nil, nil, 0
     state.lastTarget, state.targetHealth, state.targetAt, state.targetDist = nil, nil, 0, nil
-    state.bringPoint, state.bringTarget = nil, nil
+    state.bringPoint, state.bringTarget, state.bringCentre = nil, nil, nil
     state.bringMoved = setmetatable({}, {__mode = "k"})
     state.bringIgnored = setmetatable({}, {__mode = "k"})
     state.bringHealth = setmetatable({}, {__mode = "k"})
