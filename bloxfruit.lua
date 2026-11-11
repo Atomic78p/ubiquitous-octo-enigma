@@ -1515,10 +1515,14 @@ local function bringMob(target, root)
                 slot = state.bringSlotCount
                 state.bringSlot[mob] = slot
             end
-            local col = (slot - 1) % 3
-            local row = math.floor((slot - 1) / 3)
-            local goal = Vector3.new(point.X + (col - 1) * 2.3, point.Y + 1.8,
-                point.Z + row * 2.3)
+            -- the enemy keeps the point itself; the rest of the pack stands in
+            -- a small ring around it. Nothing is lifted: the root of every mob
+            -- goes to the height of the root of the enemy.
+            local i = slot - 1
+            local col = i % 3
+            local row = math.floor(i / 3)
+            local offx = (col == 1 and 2.6) or (col == 2 and -2.6) or 0
+            local goal = Vector3.new(point.X + offx, point.Y, point.Z + row * 2.6)
             local hum = mob:FindFirstChildOfClass("Humanoid")
 
             -- every part of the mob goes ghost and is stopped. One part that
@@ -1580,8 +1584,11 @@ local function bringMob(target, root)
             end)
             local toGo = goal - part.Position
             local mag = toGo.Magnitude
-            if mag > 0.5 then
-                lock.Velocity = toGo.Unit * math.clamp(mag * 10, 20, 1200)
+            -- the speed follows the distance with no floor under it. A floor
+            -- makes a mob that is nearly there step past the point and slide
+            -- back and forth for ever, which is what the buzzing was.
+            if mag > 0.2 then
+                lock.Velocity = toGo.Unit * math.min(mag * 10, 1200)
             else
                 lock.Velocity = Vector3.zero
             end
