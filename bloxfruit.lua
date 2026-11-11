@@ -1382,14 +1382,18 @@ letGoMob = function(mob, part)
             if lock then lock:Destroy() end
             local gyro = part:FindFirstChild("BringGyro")
             if gyro then gyro:Destroy() end
+            -- the whole rig was made ghost and weightless on the way in, so
+            -- the whole rig is put back, not only the root
+            for _, d in ipairs(mob:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    d.CanCollide = true
+                    d.CanTouch = true
+                    d.Massless = false
+                    d.AssemblyLinearVelocity = Vector3.zero
+                    d.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
             part:SetAttribute("BeingBrought", false)
-            part.CanCollide = true
-            part.CanTouch = true
-            part.Massless = false
-            part.AssemblyLinearVelocity = Vector3.zero
-            part.AssemblyAngularVelocity = Vector3.zero
-            -- and the mob goes back to the server's physics
-            part:SetNetworkOwner(nil)
         end)
     end
     local hum = mob:FindFirstChildOfClass("Humanoid")
@@ -1410,7 +1414,7 @@ end
 -- point of that mob in the world, and each mob keeps its own step of the row
 -- so the pack never shuffles.
 local function bringMob(target, root)
-    if not CONFIG.BringMob or not target or not target.Parent then return end
+    if not CONFIG.BringMob or not target or not target.Parent or not root then return end
     local anchor = anchorOf(target)
     if not anchor then return end
     if ownedByOther(anchor) then return end
@@ -1466,7 +1470,10 @@ local function bringMob(target, root)
     -- the point the pack stands on, and the pack itself
     if state.bringTarget ~= target or not state.bringPoint then
         state.bringTarget = target
-        state.bringPoint = mobSpawnPoint(target, anchor.Position)
+        -- the pack gathers where the enemy is: the hub pulls every mob of the
+        -- kind onto the enemy it fights. On the spawn point of the kind, a mob
+        -- that already stands there is only held still and never comes over.
+        state.bringPoint = anchor.Position
     end
     local point = state.bringPoint
 
@@ -1529,9 +1536,6 @@ local function bringMob(target, root)
                         end)
                     end
                 end
-                -- if the client may take the mob over the pull sticks. When it
-                -- may not, the call fails and nothing is lost.
-                pcall(function() part:SetNetworkOwner(LocalPlayer) end)
             end
 
             if hum then
