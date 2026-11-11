@@ -30,7 +30,7 @@ CONFIG = {
     RemoteAttack    = true,
     HitboxMagnitude = 120,
     WeaponMode      = "Melee",
-    MeleeRange      = 70,
+    MeleeRange      = 10,
     GunRange        = 70,
     FruitRange      = 70,
     AutoBuyStyles   = false,
@@ -131,6 +131,7 @@ state = {
     flying        = false,
     whirlpooling  = false,
     questing      = false,
+    bringAnchored = setmetatable({}, {__mode = "k"}),
     bringMoved    = setmetatable({}, {__mode = "k"}),
     bringIgnored  = setmetatable({}, {__mode = "k"}),
     bringHealth   = setmetatable({}, {__mode = "k"}),
@@ -1393,9 +1394,14 @@ local function bringMob(target, root)
             local hp = hum and hum.Health
             if mob ~= target and hp and state.bringHealth[mob] == hp
                 and not mob:FindFirstChild("Ignored") then
-                -- It is not being hurt: it is put back and left alone.
+                -- It is not being hurt: the hold is taken off, it is put back
+                -- on its spawn ground and left alone.
                 local part = anchorOf(mob)
                 if part then
+                    local lock = part:FindFirstChild("Lock")
+                    if lock then pcall(function() lock:Destroy() end) end
+                    pcall(function() part:SetAttribute("BeingBrought", false) end)
+                    state.bringAnchored[part] = nil
                     local home = mobSpawnPoint(mob, part.Position)
                     if home then pcall(function() part.CFrame = CFrame.new(home) end) end
                 end
@@ -1486,14 +1492,46 @@ local function bringMob(target, root)
                     pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
                     pcall(function() part.AssemblyAngularVelocity = Vector3.zero end)
                 end
-                if off > 2.5 then
-                    pcall(function() part.CFrame = CFrame.new(goal) end)
+                -- The hold: a body velocity named Lock drags the mob to its
+                -- step. It is what the hubs use: smooth, and no hit can knock
+                -- the mob off the row because the force is unlimited.
+                local lock = part:FindFirstChild("Lock")
+                if not lock then
+                    lock = Instance.new("BodyVelocity")
+                    lock.Name = "Lock"
+                    lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                    lock.P = 9000
+                    lock.Velocity = Vector3.zero
+                    lock.Parent = part
+                    pcall(function() part.Massless = true end)
+                    pcall(function() part:SetAttribute("BeingBrought", true) end)
                 end
-                pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
+                local toGo = goal - part.Position
+                local mag = toGo.Magnitude
+                if mag > 0.5 then
+                    lock.Velocity = toGo.Unit * math.clamp(mag * 10, 25, 400)
+                else
+                    lock.Velocity = Vector3.zero
+                end
+                state.bringAnchored[part] = true
             end
             state.bringMoved[mob] = now
         end
     end
+end
+
+-- The client only simulates the mobs that stand inside its simulation radius.
+-- The hubs raise it, and that is the whole reason their bring mob holds: the
+-- mobs far away keep being simulated instead of being dropped by the client.
+local function raiseSimulationRadius()
+    local player = LocalPlayer
+    if not player then return end
+    if sethiddenproperty then
+        pcall(function() sethiddenproperty(player, "SimulationRadius", math.huge) end)
+        pcall(function() sethiddenproperty(player, "MaxSimulationRadius", math.huge) end)
+    end
+    pcall(function() player.SimulationRadius = math.huge end)
+    pcall(function() player.MaxSimulationRadius = math.huge end)
 end
 
 -- ================= MOVEMENT =================
@@ -2578,12 +2616,29 @@ local function buyAbility(remote, what)
 end
 
 -- ================= MAIN LOOP =================
+-- The mobs that were frozen for the farm are let go again with this.
+local function releaseBringMobs()
+    for part in pairs(state.bringAnchored) do
+        pcall(function()
+            if part and part.Parent then
+                local lock = part:FindFirstChild("Lock")
+                if lock then lock:Destroy() end
+                part:SetAttribute("BeingBrought", false)
+                part.AssemblyLinearVelocity = Vector3.zero
+            end
+        end)
+    end
+    state.bringAnchored = setmetatable({}, {__mode = "k"})
+end
+
 -- Everything that pointed at the character that just died is dropped here.
 -- Without this the farm keeps chasing a corpse: the old target, the old
 -- bring point, the old fruit and the old tween all stay behind.
 local function fullReset(reason)
     stopTween()
     restoreNoclip()
+    releaseBringMobs()
+    raiseSimulationRadius()
     state.farming = false
     state.fruit, state.fruitTools, state.fruitTries = nil, nil, 0
     state.lastTarget, state.targetHealth, state.targetAt, state.targetDist = nil, nil, 0, nil
@@ -2813,11 +2868,12 @@ local function step()
         return
     end
 
-    -- A target that was marked ignored or stuck earlier is cleared before it
-    -- is attacked: one old mark is what left a single mob unkillable.
+    -- The mark the game itself puts on a mob is cleared before it is attacked:
+    -- a stale one is what left a single mob unkillable. The stuck book of the
+    -- script is left alone here, it is what gives up on a mob that cannot be
+    -- reached or killed.
     local stale = target:FindFirstChild("Ignored")
     if stale then pcall(function() stale:Destroy() end) end
-    stuckTargets[target] = nil
 
     local er = anchorOf(target)
     if not er then return end
@@ -2927,6 +2983,7 @@ local function step()
     end
 end
 
+raiseSimulationRadius()
 pcall(function()
     LocalPlayer.CharacterAdded:Connect(function()
         fullReset("a new character came in")
@@ -2941,12 +2998,18 @@ end)
 task.spawn(function()
     while true do
         if state.enabled then
+            state.wasStopped = false
             local ok, err = pcall(step)
             if not ok then dbg("Loop error: " .. tostring(err)) end
         else
             state.farming = false
             state.status = "Stopped"
             stopTween()
+            -- let the held mobs go the moment the bot is stopped, once
+            if not state.wasStopped then
+                state.wasStopped = true
+                if next(state.bringAnchored) ~= nil then releaseBringMobs() end
+            end
         end
         task.wait(0.05)
     end
@@ -3218,6 +3281,7 @@ end)
 task.spawn(function()
     while true do
         task.wait(1)
+        raiseSimulationRadius()
         if CONFIG.AntiAfk then
             state.afkTimer += 1
             if state.afkTimer >= (CONFIG.AntiAfkInterval or 120) then
