@@ -62,6 +62,9 @@ CONFIG = {
     WarpClose       = true,
     WarpDistance    = 60,
     HoverHeight     = 7,
+    Dodge           = true,
+    DodgeRadius     = 14,
+    DodgeSpeed      = 90,
     FruitScanRadius = 5000,
     MovementMode    = "Tween",
     MoveSpeed       = 200,
@@ -2680,6 +2683,8 @@ local function flyTo(position)
             local now = getRoot()
             if not now then break end
             if (now.Position - position).Magnitude <= 12 then break end
+            -- a flight that is going somewhere is not a task that got stuck
+            state.blockAt = tick()
             task.wait(0.2)
         end
     end)
@@ -2925,6 +2930,45 @@ local function fullReset(reason)
     dbg("Reset after: " .. tostring(reason))
 end
 
+-- The game makes the player sit on the death screen for a few seconds before
+-- it brings the character back, and that is slow when a farm kills the player.
+-- The screen has its own respawn button: pressing it brings the character back
+-- at once. When that button is not there nothing is done, the game still
+-- respawns on its own, only slower.
+pressRespawn = function()
+    local player = LocalPlayer
+    local gui = player and (player.PlayerGui or player:FindFirstChild("PlayerGui"))
+    if not gui then return false end
+    local ok, list = pcall(function() return gui:GetDescendants() end)
+    if not ok then return false end
+    local button = nil
+    for _, obj in ipairs(list) do
+        if obj:IsA("GuiButton") and obj.Visible then
+            local text = tostring(obj.Text or "")
+            if text:lower():find("respawn", 1, true)
+                or obj.Name:lower():find("respawn", 1, true) then
+                button = obj
+                break
+            end
+        end
+    end
+    if not button then return false end
+    local pressed = false
+    pcall(function()
+        if firesignal and button.Activated then
+            firesignal(button.Activated)
+            pressed = true
+        end
+    end)
+    pcall(function()
+        if firesignal and button.MouseButton1Click then
+            firesignal(button.MouseButton1Click)
+            pressed = true
+        end
+    end)
+    return pressed
+end
+
 local function step()
     local root, hum = getRoot(), getHumanoid()
     local now = tick()
@@ -2934,6 +2978,11 @@ local function step()
             fullReset("the character died")
         end
         state.status = "Respawning..."
+        -- the death screen is looked at twice a second, not every tick
+        if not state.respawnAt or now - state.respawnAt > 0.5 then
+            state.respawnAt = now
+            pcall(pressRespawn)
+        end
         return
     end
     if state.dead then
@@ -3265,7 +3314,22 @@ local function step()
     local top = er.Position.Y + (er.Size and er.Size.Y or 0) / 2
     hoverPos = Vector3.new(hoverPos.X, math.max(hoverPos.Y, top - 1), hoverPos.Z)
 
-    travelTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0))
+    -- The player does not sit on the head of the mob: it slides around it on a
+    -- little ring, so the skills that are thrown where the mob is look at the
+    -- player and miss. The ring goes the whole way round, it never runs back
+    -- and forth over the same line.
+    if CONFIG.Dodge and CONFIG.RemoteAttack then
+        state.dodgeAngle = ((state.dodgeAngle or 0) + (CONFIG.DodgeSpeed or 90) * 0.05) % 360
+        local a = math.rad(state.dodgeAngle)
+        local ring = CONFIG.DodgeRadius or 14
+        local around = Vector3.new(hoverPos.X + math.cos(a) * ring, hoverPos.Y,
+            hoverPos.Z + math.sin(a) * ring)
+        pcall(function()
+            root.CFrame = CFrame.new(around) * CFrame.Angles(math.rad(-90), 0, 0)
+        end)
+    else
+        travelTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0))
+    end
 
     local swingHit = anchorOf(swingTarget) or er
     local sx = root.Position.X - swingHit.Position.X
@@ -3395,11 +3459,15 @@ local function saberStep(step, root)
     -- the pieces of the puzzle are streamed in only when the player is on
     -- their island, so the island is flown to before anything is searched
     if step.island then
-        local place = islandPosByName(step.island)
-        if place and (root.Position - place).Magnitude > 600 then
-            state.status = "Saber: flying to " .. step.island
-            flyTo(place)
-            return false
+        state.saberFlown = state.saberFlown or {}
+        if not state.saberFlown[step.island] then
+            state.saberFlown[step.island] = true
+            local place = islandPosByName(step.island)
+            if place and (root.Position - place).Magnitude > 600 then
+                state.status = "Saber: flying to " .. step.island
+                flyTo(place)
+                return false
+            end
         end
     end
     if step.act == "press" then
@@ -3509,8 +3577,17 @@ task.spawn(function()
         task.wait(1)
         state.questing = CONFIG.AutoSaber and state.enabled
         if CONFIG.AutoSaber and state.enabled then
+            state.blockAt = tick()
             local root = getRoot()
             if root then
+                -- a step that made no progress for half a minute is allowed to
+                -- fly to its island again
+                if state.saberIndex ~= saberIndex then
+                    state.saberIndex, state.saberIndexAt = saberIndex, tick()
+                elseif state.saberIndexAt and tick() - state.saberIndexAt > 30 then
+                    state.saberFlown = {}
+                    state.saberIndexAt = tick()
+                end
                 local step = SABER_STEPS[saberIndex]
                 if step then
                     if not state.saberAt or state.saberAt ~= step.note then
@@ -3543,6 +3620,7 @@ task.spawn(function()
     while true do
         task.wait(5)
         if CONFIG.AutoBuyStyles and state.enabled and not state.shopping and not state.flying then
+            state.blockAt = tick()
             styleBuyIndex = styleBuyIndex % #STYLE_SHOP + 1
             local style = STYLE_SHOP[styleBuyIndex]
             dbg("Auto buy style: " .. style.name)
