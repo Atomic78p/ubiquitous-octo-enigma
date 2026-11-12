@@ -40,7 +40,10 @@ CONFIG = {
     BringMobRange   = 60,
     BringMobCount   = 5,
     BringMobSearch  = 300,
-    BringMover      = "Game",
+    -- "Lock" is the mover of this script and it is what works. "Game" tries
+    -- the body mover of the game instead, but that one is made for the local
+    -- character, so a mob is left where it stands (kept for testing only).
+    BringMover      = "Lock",
     AutoStats       = false,
     AutoStatTarget  = "Melee",
     AutoStatWait    = 3,
@@ -1699,19 +1702,16 @@ local function bringMob(target, root)
                     lock.Parent = part
                     pcall(function() part:SetAttribute("BeingBrought", true) end)
                 end
-                lock.Velocity = Vector3.zero
-
-                -- re-snap every update so knockback cannot slide the mob away
-                -- target stays put (player stands on it); others get forced to their slot
-                if mob ~= target then
-                    local dx = part.Position.X - point.X
-                    local dz = part.Position.Z - point.Z
-                    local close = math.sqrt(dx * dx + dz * dz) <= (CONFIG.BringMobSearch or 200)
-                    if close then
-                        pcall(function()
-                            part.CFrame = CFrame.new(goal.X, part.Position.Y, goal.Z)
-                        end)
-                    end
+                -- The hold drags the mob over with the same body velocity the
+                -- hubs use (the one that really moves a server mob), and the
+                -- speed follows the distance with no floor under it: a floor
+                -- makes a mob step past its step and slide back and forth.
+                -- The enemy of the fight is not moved, the player stands on it.
+                local toGo = (mob ~= target) and (goal - part.Position) or nil
+                if toGo and toGo.Magnitude > 0.2 then
+                    lock.Velocity = toGo.Unit * math.min(toGo.Magnitude * 6, 900)
+                else
+                    lock.Velocity = Vector3.zero
                 end
             else
                 -- the game carries it, no private mover may stay on the rig
