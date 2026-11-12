@@ -1896,7 +1896,12 @@ end
 RunService.Stepped:Connect(function()
     pcall(function()
         local root = getRoot()
-        if not CONFIG.AutoFarm or not state.farming or not state.enabled or not root then
+        if not CONFIG.AutoFarm or not state.enabled or not root then
+            if #noclipParts > 0 then restoreNoclip() end
+            return
+        end
+        -- a flight or a quest walk needs no clipping as much as the farm does
+        if not (state.farming or state.flying or state.questing or state.shopping) then
             if #noclipParts > 0 then restoreNoclip() end
             return
         end
@@ -2331,6 +2336,18 @@ end
 
 local function storeFruit(tool)
     if not tool then return false end
+    -- The game stores a fruit itself when the remote gets the tool: the server
+    -- moves it into the bank at once. This is the path the hubs use; the GUI
+    -- of the storage npc is only the fallback for builds without the remote.
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local commF = remotes and remotes:FindFirstChild("CommF_")
+    if commF then
+        local ok = pcall(function() commF:InvokeServer("StoreFruit", tool) end)
+        if ok then
+            dbg("Asked the game to store " .. tool.Name)
+            return true
+        end
+    end
     if useFruitMenu(tool.Name, {"store", "deposit", "stash"}) then
         dbg("Asked the game to store " .. tool.Name)
         return true
@@ -2936,36 +2953,43 @@ end
 -- at once. When that button is not there nothing is done, the game still
 -- respawns on its own, only slower.
 pressRespawn = function()
-    local player = LocalPlayer
-    local gui = player and (player.PlayerGui or player:FindFirstChild("PlayerGui"))
-    if not gui then return false end
-    local ok, list = pcall(function() return gui:GetDescendants() end)
-    if not ok then return false end
-    local button = nil
-    for _, obj in ipairs(list) do
-        if obj:IsA("GuiButton") and obj.Visible then
-            local text = tostring(obj.Text or "")
-            if text:lower():find("respawn", 1, true)
-                or obj.Name:lower():find("respawn", 1, true) then
-                button = obj
-                break
+    local pressed = false
+    -- Every way a death screen is answered: its own signal, the two mouse
+    -- signals and, when the executor has it, a real click at its place on the
+    -- screen. The screen of the game is not always the one the script expects,
+    -- so both the gui of the player and the core gui are walked.
+    local function press(button)
+        pcall(function() if firesignal and button.Activated then firesignal(button.Activated) end end)
+        pcall(function() if firesignal and button.MouseButton1Click then firesignal(button.MouseButton1Click) end end)
+        pcall(function() if firesignal and button.MouseButton1Down then firesignal(button.MouseButton1Down) end end)
+        pcall(function()
+            if mouse1click and button.AbsolutePosition then
+                local size = button.AbsoluteSize
+                local x = button.AbsolutePosition.X + (size and size.X or 0) / 2
+                local y = button.AbsolutePosition.Y + (size and size.Y or 0) / 2
+                mouse1click(x, y)
+            end
+        end)
+    end
+    local function look(folder)
+        if not folder then return end
+        local ok, list = pcall(function() return folder:GetDescendants() end)
+        if not ok then return end
+        for _, obj in ipairs(list) do
+            if obj:IsA("GuiButton") and obj.Visible then
+                local word = (tostring(obj.Text or "") .. " " .. tostring(obj.Name or "")):lower()
+                if word:find("respawn", 1, true) or word:find("spawn", 1, true)
+                    or word:find("play again", 1, true) or word:find("retry", 1, true)
+                    or word:find("continue", 1, true) then
+                    press(obj)
+                    pressed = true
+                end
             end
         end
     end
-    if not button then return false end
-    local pressed = false
-    pcall(function()
-        if firesignal and button.Activated then
-            firesignal(button.Activated)
-            pressed = true
-        end
-    end)
-    pcall(function()
-        if firesignal and button.MouseButton1Click then
-            firesignal(button.MouseButton1Click)
-            pressed = true
-        end
-    end)
+    local player = LocalPlayer
+    look(player and (player.PlayerGui or player:FindFirstChild("PlayerGui")))
+    pcall(function() look(game:GetService("CoreGui")) end)
     return pressed
 end
 
@@ -3318,7 +3342,9 @@ local function step()
     -- little ring, so the skills that are thrown where the mob is look at the
     -- player and miss. The ring goes the whole way round, it never runs back
     -- and forth over the same line.
-    if CONFIG.Dodge and CONFIG.RemoteAttack then
+    local tweenMoving = activeTween
+        and activeTween.PlaybackState == Enum.PlaybackState.Playing
+    if CONFIG.Dodge and CONFIG.RemoteAttack and not tweenMoving and flat <= reach + 8 then
         state.dodgeAngle = ((state.dodgeAngle or 0) + (CONFIG.DodgeSpeed or 90) * 0.05) % 360
         local a = math.rad(state.dodgeAngle)
         local ring = CONFIG.DodgeRadius or 14
@@ -3555,17 +3581,34 @@ local function saberStep(step, root)
             return false
         end
         interactWith(npc, prompt)
-        state.status = "Saber: talked to " .. step.name
-        return true
+        -- One press is not a finished talk: the dialogs of the game want a few
+        -- of them. Calling it done after the first one is what left the door
+        -- of the Saber shut while the script said the quest was over.
+        state.saberTalk = (state.saberTalk or 0) + 1
+        state.status = "Saber: talked to " .. step.name .. " (" .. state.saberTalk .. ")"
+        if state.saberTalk >= 3 then
+            state.saberTalk = 0
+            return true
+        end
+        return false
     elseif step.act == "kill" then
         state.saberTarget = step.name
         local mob = findMob(step.name)
-        if not mob then
-            state.saberTarget = nil
+        if mob then
+            state.saberSeen = state.saberSeen or {}
+            state.saberSeen[step.name] = true
+            state.status = "Saber: fighting " .. step.name
+            return false
+        end
+        state.saberTarget = nil
+        -- The mob is only called down when it was seen and then went away. A
+        -- mob that was never seen is behind a door or not streamed in yet, and
+        -- calling that done is how the quest ended with the door still shut.
+        if state.saberSeen and state.saberSeen[step.name] then
             state.status = "Saber: " .. step.name .. " is down"
             return true
         end
-        state.status = "Saber: fighting " .. step.name
+        state.status = "Saber: no " .. step.name .. " yet"
         return false
     end
     return true
