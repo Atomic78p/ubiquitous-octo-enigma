@@ -25,7 +25,7 @@ CONFIG = {
     QuestTurnIn     = true,
     AntiAfk         = true,
     AntiAfkInterval = 120,
-    AttackCooldown  = 0.05,
+    AttackCooldown  = 0.06,
     FastAttack      = true,
     RemoteAttack    = true,
     HitboxMagnitude = 120,
@@ -37,9 +37,9 @@ CONFIG = {
     AutoSaber       = false,
     MeleeHover      = 4,
     BringMob        = true,
-    BringMobRange   = 55,
+    BringMobRange   = 60,
     BringMobCount   = 5,
-    BringMobSearch  = 200,
+    BringMobSearch  = 300,
     AutoStats       = false,
     AutoStatTarget  = "Melee",
     AutoStatWait    = 3,
@@ -1430,6 +1430,7 @@ letGoMob = function(mob, part)
         pcall(function()
             hum.PlatformStand = false
             hum.AutoRotate = true
+            -- leave WalkSpeed/JumpPower to the game; forcing defaults can break some mobs
         end)
     end
     state.bringHeld[mob] = nil
@@ -1483,7 +1484,7 @@ local function bringMob(target, root)
     end
 
     if now < (state.bringAt or 0) then return end
-    state.bringAt = now + 0.15
+    state.bringAt = now + 0.05
 
     if target:FindFirstChild("Ignored") then
         local part = anchorOf(target)
@@ -1580,56 +1581,50 @@ local function bringMob(target, root)
                 pcall(function()
                     hum.AutoRotate = false
                     hum.BreakJointsOnDeath = false
-                    -- the hub leaves PlatformStand alone: a standing mob is
-                    -- rigid and the pull does not move it
-                    hum.PlatformStand = false
+                    hum.PlatformStand = true
+                    hum.WalkSpeed = 0
+                    hum.JumpPower = 0
+                    hum:ChangeState(Enum.HumanoidStateType.Physics)
                 end)
             end
 
-            -- the hold: a body velocity named Lock drags the mob to its step
+            -- hold with unlimited BodyVelocity + BodyGyro
             local lock = part:FindFirstChild("Lock")
             if not lock then
                 lock = Instance.new("BodyVelocity")
                 lock.Name = "Lock"
                 lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                lock.P = 9000
+                lock.P = 12500
                 lock.Velocity = Vector3.zero
                 lock.Parent = part
                 pcall(function() part:SetAttribute("BeingBrought", true) end)
             end
-            -- the gyro keeps the mob upright, so the pull is a slide and not a
-            -- tumble the humanoid then has to get back up from
             local gyro = part:FindFirstChild("BringGyro")
             if not gyro then
                 gyro = Instance.new("BodyGyro")
                 gyro.Name = "BringGyro"
                 gyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-                gyro.P = 30000
-                gyro.D = 1000
+                gyro.P = 50000
+                gyro.D = 500
                 gyro.Parent = part
             end
-            gyro.CFrame = root.CFrame
-            if hum then
-                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
-            end
+            gyro.CFrame = CFrame.new(part.Position, part.Position + root.CFrame.LookVector)
+
             pcall(function()
                 part.AssemblyLinearVelocity = Vector3.zero
                 part.AssemblyAngularVelocity = Vector3.zero
             end)
-            -- The mob is put on its step once, it is not slid there. A body
-            -- velocity pull makes the mob skate over the ground, and a mob that
-            -- is re-placed every tick never stops moving. So one placement, and
-            -- the hold below (speed zero) keeps it on the spot after that: a hit
-            -- cannot push it off and it does not drift on its own.
-            --
-            -- The enemy of the fight is never moved: the player stands on it,
-            -- so moving it would drag the player after it, and the two of them
-            -- would drift for ever.
+
+            -- re-snap every update so knockback cannot slide the mob away
+            -- target stays put (player stands on it); others get forced to their slot
             if mob ~= target then
-                local dx, dz = part.Position.X - point.X, part.Position.Z - point.Z
+                local dx = part.Position.X - point.X
+                local dz = part.Position.Z - point.Z
                 local close = math.sqrt(dx * dx + dz * dz) <= (CONFIG.BringMobSearch or 200)
-                if close and (goal - part.Position).Magnitude > 3 then
-                    pcall(function() part.CFrame = CFrame.new(goal) end)
+                if close then
+                    pcall(function()
+                        part.CFrame = CFrame.new(goal.X, part.Position.Y, goal.Z)
+                    end)
                 end
             end
             lock.Velocity = Vector3.zero
