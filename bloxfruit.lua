@@ -40,6 +40,7 @@ CONFIG = {
     BringMobRange   = 60,
     BringMobCount   = 5,
     BringMobSearch  = 300,
+    BringMover      = "Game",
     AutoStats       = false,
     AutoStatTarget  = "Melee",
     AutoStatWait    = 3,
@@ -140,6 +141,8 @@ state = {
     bringPoint    = nil,
     bringTarget   = nil,
     bringCentre   = nil,
+    bringMoverId  = setmetatable({}, {__mode = "k"}),
+    bringMoverSeq = 0,
     questVerified = false,
     questGaveUp   = false,
     hitsConfirmed = 0,
@@ -1400,11 +1403,36 @@ local function spawnCentre(target, near)
     return sum / n
 end
 
+-- The game itself knows how to push a body: the server sends a message and the
+-- client module ReplicatedStorage.Util.BodyMover builds a BodyVelocity on a
+-- character with a speed, a priority and a duration, then takes it down again.
+-- Firing that very handler with our own message is the way to move a mob the
+-- game is willing to carry: the game does the work, we only say where. When
+-- the remote or the firesignal helper of the executor is not there this says
+-- false and the caller keeps its own mover.
+gameBodyMove = function(char, velocity, duration, id, action)
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local mover = remotes and remotes:FindFirstChild("BodyMover")
+    if not mover or not firesignal then return false end
+    local message = {
+        Character = char, Priority = -10, ID = id,
+        Velocity = velocity, Duration = duration, Meta = {},
+    }
+    local ok = pcall(function()
+        firesignal(mover.OnClientEvent, message, action or "Create", "BodyVelocity", message)
+    end)
+    return ok
+end
+
 -- A mob is let go: the drag goes away and the physics the pack changed is put
 -- back, so the mob can stand on its own again. It is a global because the
 -- chunk is at the limit of 200 locals.
 letGoMob = function(mob, part)
     part = part or anchorOf(mob)
+    if state.bringMoverId[mob] then
+        pcall(function() gameBodyMove(mob, Vector3.zero, 0, state.bringMoverId[mob], "Destroy") end)
+        state.bringMoverId[mob] = nil
+    end
     if part and part.Parent then
         pcall(function()
             local lock = part:FindFirstChild("Lock")
@@ -1588,17 +1616,59 @@ local function bringMob(target, root)
                 end)
             end
 
-            -- hold with unlimited BodyVelocity + BodyGyro
-            local lock = part:FindFirstChild("Lock")
-            if not lock then
-                lock = Instance.new("BodyVelocity")
-                lock.Name = "Lock"
-                lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                lock.P = 12500
-                lock.Velocity = Vector3.zero
-                lock.Parent = part
-                pcall(function() part:SetAttribute("BeingBrought", true) end)
+            -- Move with the mover of the game when it can be had: fire its own
+            -- handler with a speed towards the step and a short duration, so
+            -- the game carries the mob. Only when that is not there is the
+            -- private Lock used, as before.
+            local gameMoved = false
+            if CONFIG.BringMover == "Game" then
+                local id = state.bringMoverId[mob]
+                if not id then
+                    state.bringMoverSeq = (state.bringMoverSeq or 0) + 1
+                    id = state.bringMoverSeq
+                    state.bringMoverId[mob] = id
+                end
+                local vel = Vector3.zero
+                if mob ~= target then
+                    local toGo = goal - part.Position
+                    if toGo.Magnitude > 0.2 then
+                        vel = toGo.Unit * math.min(toGo.Magnitude * 6, 900)
+                    end
+                end
+                gameMoved = gameBodyMove(mob, vel, 0.2, id, "Create")
             end
+
+            if not gameMoved then
+                local lock = part:FindFirstChild("Lock")
+                if not lock then
+                    lock = Instance.new("BodyVelocity")
+                    lock.Name = "Lock"
+                    lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                    lock.P = 12500
+                    lock.Velocity = Vector3.zero
+                    lock.Parent = part
+                    pcall(function() part:SetAttribute("BeingBrought", true) end)
+                end
+                lock.Velocity = Vector3.zero
+
+                -- re-snap every update so knockback cannot slide the mob away
+                -- target stays put (player stands on it); others get forced to their slot
+                if mob ~= target then
+                    local dx = part.Position.X - point.X
+                    local dz = part.Position.Z - point.Z
+                    local close = math.sqrt(dx * dx + dz * dz) <= (CONFIG.BringMobSearch or 200)
+                    if close then
+                        pcall(function()
+                            part.CFrame = CFrame.new(goal.X, part.Position.Y, goal.Z)
+                        end)
+                    end
+                end
+            else
+                -- the game carries it, no private mover may stay on the rig
+                local lock = part:FindFirstChild("Lock")
+                if lock then pcall(function() lock:Destroy() end) end
+            end
+
             local gyro = part:FindFirstChild("BringGyro")
             if not gyro then
                 gyro = Instance.new("BodyGyro")
@@ -1614,20 +1684,6 @@ local function bringMob(target, root)
                 part.AssemblyLinearVelocity = Vector3.zero
                 part.AssemblyAngularVelocity = Vector3.zero
             end)
-
-            -- re-snap every update so knockback cannot slide the mob away
-            -- target stays put (player stands on it); others get forced to their slot
-            if mob ~= target then
-                local dx = part.Position.X - point.X
-                local dz = part.Position.Z - point.Z
-                local close = math.sqrt(dx * dx + dz * dz) <= (CONFIG.BringMobSearch or 200)
-                if close then
-                    pcall(function()
-                        part.CFrame = CFrame.new(goal.X, part.Position.Y, goal.Z)
-                    end)
-                end
-            end
-            lock.Velocity = Vector3.zero
 
             state.bringHeld[mob] = part
             state.bringMoved[mob] = now
@@ -3048,27 +3104,35 @@ local function step()
     local dz = root.Position.Z - er.Position.Z
     local flat = math.sqrt(dx * dx + dz * dz)
 
-    local swingTarget, swingAnchor = target, er
+    local swingTarget = target
     if CONFIG.AutoAttack then
         local close = mobInReach(root, reach)
         -- A boss is not given up for a normal mob that happens to stand near:
         -- the boss is what the boss farm went there for.
         local onBoss = CONFIG.BossFarm and bossKeyOf(target)
-        if close and close ~= target and flat > reach and not onBoss then
-            if (state.autoBurst or 0) <= now then state.autoBurst = now + 2 end
-            if state.autoBurst > now then
-                swingTarget = close
-                swingAnchor = anchorOf(close) or er
-            end
+        -- A swipe at a mob that stands in the way is fine, but the window has
+        -- to close and then stay closed for a while. If it is armed again on
+        -- the next tick the bot farms the mob beside it for ever and never
+        -- walks to the mob of the quest at all.
+        if close and close ~= target and flat > reach and not onBoss
+            and (state.autoBurstCd or 0) <= now then
+            state.autoBurst = now + 2
+            state.autoBurstCd = now + 8
+        end
+        if (state.autoBurst or 0) > now and close then
+            swingTarget = close
         end
     end
 
     if CONFIG.BigHitbox then enlargeHitbox(swingTarget) end
 
-    local head = swingTarget:FindFirstChild("Head")
+    -- The hover and the trip follow the mob of the quest. A swipe at a mob
+    -- that stands beside us is only a swipe: it must not pull the trip off
+    -- the quest mob, or the bot farms the neighbour beside it for ever.
+    local head = target:FindFirstChild("Head")
     if not head or not head:IsA("BasePart") then
         head = nil
-        for _, d in ipairs(swingTarget:GetDescendants()) do
+        for _, d in ipairs(target:GetDescendants()) do
             if d:IsA("BasePart") and d.Name:lower():find("head", 1, true) then
                 head = d
                 break
@@ -3080,15 +3144,16 @@ local function step()
         local above = CONFIG.RemoteAttack and math.max(hover, CONFIG.HeadHover) or CONFIG.HeadHover
         hoverPos = head.Position + Vector3.new(0, above, 0)
     else
-        hoverPos = swingAnchor.Position + Vector3.new(0, hover, 0)
+        hoverPos = er.Position + Vector3.new(0, hover, 0)
     end
-    local top = swingAnchor.Position.Y + (swingAnchor.Size and swingAnchor.Size.Y or 0) / 2
+    local top = er.Position.Y + (er.Size and er.Size.Y or 0) / 2
     hoverPos = Vector3.new(hoverPos.X, math.max(hoverPos.Y, top - 1), hoverPos.Z)
 
     travelTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0))
 
-    local sx = root.Position.X - swingAnchor.Position.X
-    local sz = root.Position.Z - swingAnchor.Position.Z
+    local swingHit = anchorOf(swingTarget) or er
+    local sx = root.Position.X - swingHit.Position.X
+    local sz = root.Position.Z - swingHit.Position.Z
     local swingFlat = math.sqrt(sx * sx + sz * sz)
     if now - state.lastAttack >= CONFIG.AttackCooldown
         and swingFlat <= reach then
