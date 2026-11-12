@@ -393,12 +393,27 @@ local function equipWeapon()
     return equipped
 end
 
+-- A mob that was made big for the swing is put back the moment the bot turns
+-- to another mob: the size and the collide of the part are only the client's,
+-- but a mob left blown up on screen is a bug the player can see.
+local function restoreHitbox()
+    local part = state.hitboxPart
+    if not part then return end
+    state.hitboxPart = nil
+    pcall(function() part.Size = state.hitboxOrigSize end)
+    pcall(function() part.CanCollide = state.hitboxOrigCollide end)
+end
+
 local function enlargeHitbox(target)
     local anchor = anchorOf(target)
     if not anchor or not anchor.Size then return end
+    if state.hitboxPart and state.hitboxPart ~= anchor then restoreHitbox() end
     local size = CONFIG.HitboxSize or 16
     if anchor.Size.X >= size then return end
     state.hitboxAt = tick()
+    state.hitboxOrigSize = anchor.Size
+    state.hitboxOrigCollide = anchor.CanCollide
+    state.hitboxPart = anchor
     pcall(function() anchor.Size = Vector3.new(size, size, size) end)
     pcall(function() anchor.CanCollide = false end)
 end
@@ -766,6 +781,7 @@ end
 local questRemote, questRemoteState, questRemoteHooked = nil, nil, false
 
 local function hookQuestRemote()
+    -- the guard lives in the callback below
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local q = remotes and remotes:FindFirstChild("QuestUpdate")
     if not q then return nil end
@@ -791,6 +807,10 @@ local function hookQuestRemote()
                     state.questIndexTry = nil
                 end
                 dbg("Quest cleared by the game")
+                return
+            end
+            if type(data) ~= "table" then
+                dbg("The game sent a quest update that is not a table")
                 return
             end
             questRemoteState = data
@@ -1341,11 +1361,21 @@ end
 local function ownedByOther(part)
     local chars = Workspace:FindFirstChild("Characters")
     if not chars then return false end
-    for _, c in ipairs(chars:GetChildren()) do
-        if c ~= LocalPlayer.Character then
-            local hrp = c:FindFirstChild("HumanoidRootPart")
-            if hrp and (hrp.Position - part.Position).Magnitude <= 300 then return true end
+    local now = tick()
+    local cache = state.otherPlayerCache
+    if not cache or now - cache.at > 0.1 then
+        local list = {}
+        for _, c in ipairs(chars:GetChildren()) do
+            if c ~= LocalPlayer.Character then
+                local hrp = c:FindFirstChild("HumanoidRootPart")
+                if hrp then table.insert(list, hrp) end
+            end
         end
+        cache = {at = now, list = list}
+        state.otherPlayerCache = cache
+    end
+    for _, hrp in ipairs(cache.list) do
+        if (hrp.Position - part.Position).Magnitude <= 300 then return true end
     end
     return false
 end
@@ -1385,6 +1415,15 @@ local function spawnCentre(target, near)
     local spawns = origin and origin:FindFirstChild("EnemySpawns")
     if not spawns then return nil end
     local key = mobKey(target.Name)
+    -- The list of spawn points does not change while a camp is farmed, and the
+    -- whole folder is walked for every pull otherwise (twenty times a second).
+    local cache = state.spawnCentreCache
+    if cache and cache.key == key and tick() - cache.at < 0.5 then
+        if not cache.value then return nil end
+        if (cache.value - near).Magnitude <= (CONFIG.BringMobSearch or 200) then
+            return cache.value
+        end
+    end
     local sum, n = nil, 0
     for _, part in ipairs(spawns:GetChildren()) do
         if part:IsA("BasePart") and not part:GetAttribute("Disabled") then
@@ -1399,8 +1438,10 @@ local function spawnCentre(target, near)
             end
         end
     end
-    if n == 0 or not sum then return nil end
-    return sum / n
+    local value = nil
+    if n > 0 and sum then value = sum / n end
+    state.spawnCentreCache = {key = key, at = tick(), value = value}
+    return value
 end
 
 -- The game itself knows how to push a body: the server sends a message and the
@@ -1464,6 +1505,15 @@ letGoMob = function(mob, part)
     state.bringHeld[mob] = nil
     state.bringMoved[mob] = nil
     state.bringHealth[mob] = nil
+    -- the step is given back, so the block never marches away from the camp
+    local slot = state.bringSlot[mob]
+    if slot then
+        state.bringSlot[mob] = nil
+        if slot < (state.bringSlotCount or 0) then
+            state.bringSlotCount = slot
+            state.bringSlotCount = math.max(slot - 1, 0)
+        end
+    end
 end
 
 -- Bring Mob, the way the good hubs do it: the pack is gathered on one point
@@ -1581,7 +1631,7 @@ local function bringMob(target, root)
             -- top of itself and one swing reaches all of them. Only the ground
             -- under the mob is steered: the mob keeps its own height, so
             -- nothing is ever lifted or dropped and the view does not bob.
-            local i = slot - 1
+            local i = (slot - 1) % 12
             local col = i % 3
             local row = math.floor(i / 3)
             local goal = Vector3.new(point.X + (col - 1) * 1.8, part.Position.Y,
@@ -1774,8 +1824,13 @@ function moveTo(cf, noWarp)
     -- taken at once instead of being walked. The shop turns that off: the
     -- teacher of a style has to see the player walk up to it.
     if CONFIG.WarpClose and not noWarp and hop <= (CONFIG.WarpDistance or 60) then
-        stopTween()
-        root.CFrame = cf
+        -- The hover asks for the very spot the player already stands on twenty
+        -- times a second. Snapping there is what made the view stutter, so a
+        -- step under a stud is left alone and a real hop is taken at once.
+        if hop > 1 then
+            stopTween()
+            root.CFrame = cf
+        end
         return
     end
 
@@ -1844,11 +1899,12 @@ RunService.Stepped:Connect(function()
         end
         applyNoclip()
         -- A tween is moving the character itself: zeroing its speed here
-        -- every frame is what made the flight stutter. Only a character that
-        -- is not on a tween is held in place.
+        -- every frame is what made the flight stutter. In walk mode the
+        -- humanoid is the one moving the character, so its speed is left
+        -- alone as well.
         local tweenPlaying = activeTween
             and activeTween.PlaybackState == Enum.PlaybackState.Playing
-        if not tweenPlaying then
+        if not tweenPlaying and CONFIG.MovementMode ~= "Walk" then
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
         end
@@ -1902,8 +1958,12 @@ local function combatUtilModule()
     local modules = ReplicatedStorage:FindFirstChild("Modules")
     local util = modules and modules:FindFirstChild("CombatUtil")
     if not util then return nil end
+    -- the module does not change while a server is played: require it once.
+    -- The cache lives in state, the chunk is at the limit of 200 locals.
+    if state.combatUtil and state.combatUtilMod == util then return state.combatUtil end
     local ok, combatUtil = pcall(require, util)
     if not ok or not combatUtil then return nil end
+    state.combatUtil, state.combatUtilMod = combatUtil, util
     return combatUtil
 end
 
@@ -1967,22 +2027,43 @@ local function aoePairs(root, target)
     return out
 end
 
+-- The folder that holds the remotes of the game is looked up once: it does not
+-- change while a server runs, and the way to it was walked on every swing.
+local function netFolder()
+    if state.netCache and state.netCache.Parent then return state.netCache end
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    state.netCache = modules and modules:FindFirstChild("Net")
+    return state.netCache
+end
+
 -- The hub fires the hit remote through the Net wrapper of the game; the raw
 -- remote is the fallback when that wrapper is not there.
 local function hitRemote()
-    local modules = ReplicatedStorage:FindFirstChild("Modules")
-    local net = modules and modules:FindFirstChild("Net")
+    if state.hitRemoteCache and state.hitRemoteCache.Parent then
+        return state.hitRemoteCache, state.hitRemoteWrapped
+    end
+    local net = netFolder()
     if not net then return nil, false end
     local ok, wrapped = pcall(function() return net:RemoteEvent("RegisterHit", true) end)
-    if ok and wrapped then return wrapped, true end
-    return net:FindFirstChild("RE/RegisterHit"), false
+    if ok and wrapped then
+        state.hitRemoteCache, state.hitRemoteWrapped = wrapped, true
+    else
+        state.hitRemoteCache, state.hitRemoteWrapped = net:FindFirstChild("RE/RegisterHit"), false
+    end
+    return state.hitRemoteCache, state.hitRemoteWrapped
+end
+
+local function attackRemote()
+    if state.attackRemoteCache and state.attackRemoteCache.Parent then
+        return state.attackRemoteCache
+    end
+    local net = netFolder()
+    state.attackRemoteCache = net and net:FindFirstChild("RE/RegisterAttack")
+    return state.attackRemoteCache
 end
 
 local function remoteAttack(target, tool)
-    local modules = ReplicatedStorage:FindFirstChild("Modules")
-    local net = modules and modules:FindFirstChild("Net")
-    if not net then return false end
-    local regAttack = net:FindFirstChild("RE/RegisterAttack")
+    local regAttack = attackRemote()
     if not regAttack then return false end
     local root = getRoot()
     local pairs_ = aoePairs(root, target)
@@ -2458,26 +2539,36 @@ takeWhirlpool = nil
 -- Is this destination a place under the sea, and is the player still up here?
 -- Then walking or tweening there is hopeless: the whirlpool is the way in.
 local function islandPositions()
-    local list, known = {}, {}
-    local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
-    if ok and type(map) == "table" then
-        for name, pos in pairs(map) do
-            if pos and pos.X and pos.Y and pos.Z then
-                table.insert(list, {name = tostring(name), pos = pos})
-                known[tostring(name)] = true
+    -- The map of the game and its island parts do not change while a server
+    -- runs, so they are read once a second instead of on every tick of a walk.
+    local now = tick()
+    local cache = state.islandCache
+    if not cache or now - cache.at >= 1 then
+        local list, known = {}, {}
+        local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
+        if ok and type(map) == "table" then
+            for name, pos in pairs(map) do
+                if pos and pos.X and pos.Y and pos.Z then
+                    table.insert(list, {name = tostring(name), pos = pos})
+                    known[tostring(name)] = true
+                end
             end
         end
-    end
-    local origin = Workspace:FindFirstChild("_WorldOrigin")
-    local locations = origin and origin:FindFirstChild("Locations")
-    if locations then
-        for _, island in ipairs(locations:GetChildren()) do
-            if island:IsA("BasePart") and not known[island.Name] then
-                table.insert(list, {name = island.Name, pos = island.Position})
-                known[island.Name] = true
+        local origin = Workspace:FindFirstChild("_WorldOrigin")
+        local locations = origin and origin:FindFirstChild("Locations")
+        if locations then
+            for _, island in ipairs(locations:GetChildren()) do
+                if island:IsA("BasePart") and not known[island.Name] then
+                    table.insert(list, {name = island.Name, pos = island.Position})
+                    known[island.Name] = true
+                end
             end
         end
+        cache = {list = list, at = now}
+        state.islandCache = cache
     end
+    local list = {}
+    for _, entry in ipairs(cache.list) do table.insert(list, entry) end
     local root = getRoot()
     table.sort(list, function(a, b)
         if root then
@@ -2814,6 +2905,7 @@ local function fullReset(reason)
     stopTween()
     restoreNoclip()
     releaseBringMobs()
+    restoreHitbox()
     raiseSimulationRadius()
     state.farming = false
     state.fruit, state.fruitTools, state.fruitTries = nil, nil, 0
@@ -2869,8 +2961,22 @@ local function step()
         return
     end
 
-    -- A shop buy, a flight or a quest owns the movement while it runs.
-    if state.shopping or state.flying or state.questing then return end
+    -- A shop buy, a flight or a quest owns the movement while it runs. One of
+    -- them that never comes back (an error in the middle) is let go after a
+    -- while, or the whole farm would stand still for ever.
+    if state.shopping or state.flying or state.questing then
+        if not state.blockAt then state.blockAt = now end
+        if now - state.blockAt > 25 then
+            state.shopping, state.flying, state.questing = false, false, false
+            state.blockAt = nil
+            stopTween()
+            dbg("A long task got stuck, farming again")
+        else
+            return
+        end
+    else
+        state.blockAt = nil
+    end
 
     if not state.lastPos or (root.Position - state.lastPos).Magnitude > 1 then
         state.lastPos = root.Position
@@ -2885,7 +2991,17 @@ local function step()
         if handleFruit(root) then return end
     end
 
-    local info = CONFIG.AutoQuest and questPanelInfo() or nil
+    -- The panel is walked and parsed at its own pace: it changes slowly and
+    -- the walk through every text 20 times a second is a waste. Between two
+    -- parses the last answer is kept, so nothing flickers.
+    local info = nil
+    if CONFIG.AutoQuest then
+        if not state.panelAt or now - state.panelAt > 0.3 then
+            state.panelAt = now
+            state.panelInfo = questPanelInfo()
+        end
+        info = state.panelInfo
+    end
 
     if CONFIG.AutoQuest then
         hookQuestRemote()
