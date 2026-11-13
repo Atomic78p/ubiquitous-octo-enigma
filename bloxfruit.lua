@@ -1712,7 +1712,9 @@ local function bringMob(target, root)
                 -- The enemy of the fight is not moved, the player stands on it.
                 local toGo = (mob ~= target) and (goal - part.Position) or nil
                 if toGo and toGo.Magnitude > 0.2 then
-                    lock.Velocity = toGo.Unit * math.min(toGo.Magnitude * 6, 900)
+                    -- calm on purpose: a mob that is yanked dives past the
+                    -- player and the two of them skate away together
+                    lock.Velocity = toGo.Unit * math.min(toGo.Magnitude * 4, 400)
                 else
                     lock.Velocity = Vector3.zero
                 end
@@ -1896,12 +1898,14 @@ end
 RunService.Stepped:Connect(function()
     pcall(function()
         local root = getRoot()
-        if not CONFIG.AutoFarm or not state.enabled or not root then
+        if not state.enabled or not root then
             if #noclipParts > 0 then restoreNoclip() end
             return
         end
-        -- a flight or a quest walk needs no clipping as much as the farm does
-        if not (state.farming or state.flying or state.questing or state.shopping) then
+        -- A flight or a quest walk needs no clipping as much as the farm does.
+        -- The fruit sniper alone is not a reason to walk through walls.
+        if not (state.flying or state.questing or state.shopping
+            or (state.farming and CONFIG.AutoFarm)) then
             if #noclipParts > 0 then restoreNoclip() end
             return
         end
@@ -2342,11 +2346,11 @@ local function storeFruit(tool)
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if commF then
-        local ok = pcall(function() commF:InvokeServer("StoreFruit", tool) end)
-        if ok then
-            dbg("Asked the game to store " .. tool.Name)
-            return true
-        end
+        pcall(function() commF:InvokeServer("StoreFruit", tool) end)
+        -- some builds want the name of the fruit instead of the tool itself
+        pcall(function() commF:InvokeServer("StoreFruit", tool.Name) end)
+        dbg("Asked the game to store " .. tool.Name)
+        return true
     end
     if useFruitMenu(tool.Name, {"store", "deposit", "stash"}) then
         dbg("Asked the game to store " .. tool.Name)
@@ -2693,16 +2697,26 @@ local function flyTo(position)
     dbg("Flying to the island (" .. tostring(math.floor(distance)) .. " studs)")
     setFlying()
     local ok, err = pcall(function()
-        -- the very same tween as the walk to a mob
-        tweenTo(CFrame.new(position + Vector3.new(0, 6, 0)))
-        local deadline = tick() + math.max(distance / CONFIG.MoveSpeed, 0.12) + 5
-        while tick() < deadline do
-            local now = getRoot()
-            if not now then break end
-            if (now.Position - position).Magnitude <= 12 then break end
-            -- a flight that is going somewhere is not a task that got stuck
-            state.blockAt = tick()
-            task.wait(0.2)
+        -- A long flight goes up first, then over, then down. A straight line
+        -- across the sea dips into the water, and the game drops a character
+        -- that touches it. Each leg is the very same tween as the walk to a mob.
+        local high = math.max(here.Y, position.Y) + 60
+        local legs = {
+            {point = Vector3.new(here.X, high, here.Z), slack = 12},
+            {point = Vector3.new(position.X, high, position.Z), slack = 24},
+            {point = position + Vector3.new(0, 6, 0), slack = 12},
+        }
+        for _, leg in ipairs(legs) do
+            tweenTo(CFrame.new(leg.point))
+            local deadline = tick() + math.max(distance / CONFIG.MoveSpeed, 0.12) + 8
+            while tick() < deadline do
+                local now = getRoot()
+                if not now then break end
+                if (now.Position - leg.point).Magnitude <= leg.slack then break end
+                -- a flight that is going somewhere is not a task that got stuck
+                state.blockAt = tick()
+                task.wait(0.2)
+            end
         end
     end)
     state.flying = false
@@ -2760,7 +2774,7 @@ local STYLE_SHOP = {
     {name = "Dragon Breath",   remote = "BuyDragonBreath",   teacher = "Sabi"},
     {name = "Superhuman",      remote = "BuySuperhuman",     teacher = "Martial Arts Master", level = 300},
     {name = "Death Step",      remote = "BuyDeathStep",      teacher = "Phoeyu, the Reformed",
-        item = "Library Key", needs = "Dark Step", mastery = 400},
+        item = "Library Key", needs = "Dark Step", mastery = 400, cost = 2500000},
     {name = "Electric Claw",   remote = "BuyElectricClaw",   teacher = "Previous Hero",
         level = 1000, needs = "Electric", mastery = 400},
     {name = "Sharkman Karate", remote = "BuySharkmanKarate", teacher = "Sharkman Teacher",
@@ -2774,6 +2788,33 @@ local STYLE_SHOP = {
 
 -- The item a teacher asks for is carried as a tool or kept as a value of the
 -- player data: the backpack, the hand and the values are all looked at.
+-- The money of the player, wherever this build keeps it: the folder of the
+-- player data, a leaderstat or a plain value on the player are all looked at.
+-- When none of them is there the number is nil and nothing is blocked.
+myBeli = function()
+    local player = LocalPlayer
+    if not player then return nil end
+    local v = nil
+    local function read(obj)
+        if type(obj) == "number" then return obj end
+        if type(obj) == "table" and type(obj.Value) == "number" then return obj.Value end
+        return nil
+    end
+    pcall(function() v = read(player:FindFirstChild("Beli")) end)
+    if not v then pcall(function() v = read(player.leaderstats and player.leaderstats:FindFirstChild("Beli")) end) end
+    if not v then
+        pcall(function()
+            local data = player:FindFirstChild("Data")
+            v = read(data and data:FindFirstChild("Beli"))
+        end)
+    end
+    if not v then
+        pcall(function() v = player:GetAttribute("Beli") end)
+    end
+    if type(v) ~= "number" then return nil end
+    return v
+end
+
 hasItem = function(name)
     local wanted = tostring(name):lower()
     local char = LocalPlayer.Character
@@ -2892,6 +2933,13 @@ local function buyStyle(style)
     end
     if style.item and not hasItem(style.item) then
         dbg("Auto buy: " .. style.name .. " needs " .. style.item .. " first")
+        return false
+    end
+    -- money first: the walk to the teacher is only worth it when it can be paid
+    local beli = myBeli()
+    if style.cost and beli and beli < style.cost then
+        dbg("Auto buy: " .. style.name .. " costs " .. style.cost
+            .. " Beli, we have " .. math.floor(beli))
         return false
     end
     state.shopping = true
@@ -3653,6 +3701,14 @@ local function saberStep(step, root)
             return false
         end
         state.saberTarget = nil
+        -- A boss stands far away, on his own island: the mob is only there when
+        -- the player is. Fly to his spawn point before looking again.
+        local spawn = findSpawn(step.name)
+        if spawn and (root.Position - spawn.Position).Magnitude > 700 then
+            state.status = "Saber: flying to the " .. step.name
+            flyTo(spawn.Position)
+            return false
+        end
         -- The mob is only called down when it was seen and then went away. A
         -- mob that was never seen is behind a door or not streamed in yet, and
         -- calling that done is how the quest ended with the door still shut.
