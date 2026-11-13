@@ -2750,20 +2750,52 @@ end
 -- The styles of the wiki, in the order they can be bought: the first form
 -- of a style comes before its second form (Death Step needs Dark Step, and
 -- so on), and Superhuman comes before Godhuman.
+-- level = the level the player has to be, item = an item the teacher asks for
+-- before it takes the buy, needs/mastery = the older form whose mastery is
+-- asked for (the wiki). The game itself is the last judge of all of them.
 local STYLE_SHOP = {
     {name = "Dark Step",       remote = "BuyBlackLeg",       teacher = "Dark Step Teacher"},
     {name = "Electric",        remote = "BuyElectro",        teacher = "Mad Scientist"},
     {name = "Water Kung Fu",   remote = "BuyFishmanKarate",  teacher = "Water Kung Fu Teacher"},
     {name = "Dragon Breath",   remote = "BuyDragonBreath",   teacher = "Sabi"},
-    {name = "Superhuman",      remote = "BuySuperhuman",     teacher = "Martial Arts Master"},
-    {name = "Death Step",      remote = "BuyDeathStep",      teacher = "Phoeyu, the Reformed"},
-    {name = "Electric Claw",   remote = "BuyElectricClaw",   teacher = "Previous Hero"},
-    {name = "Sharkman Karate", remote = "BuySharkmanKarate", teacher = "Sharkman Teacher"},
-    {name = "Dragon Talon",    remote = "BuyDragonTalon",    teacher = "Uzoth"},
-    {name = "Godhuman",        remote = "BuyGodhuman",       teacher = "Ancient Monk"},
-    {name = "Sanguine Art",    remote = "BuySanguineArt",    teacher = "Shafi"},
+    {name = "Superhuman",      remote = "BuySuperhuman",     teacher = "Martial Arts Master", level = 300},
+    {name = "Death Step",      remote = "BuyDeathStep",      teacher = "Phoeyu, the Reformed",
+        item = "Library Key", needs = "Dark Step", mastery = 400},
+    {name = "Electric Claw",   remote = "BuyElectricClaw",   teacher = "Previous Hero",
+        level = 1000, needs = "Electric", mastery = 400},
+    {name = "Sharkman Karate", remote = "BuySharkmanKarate", teacher = "Sharkman Teacher",
+        level = 1000, needs = "Water Kung Fu", mastery = 400},
+    {name = "Dragon Talon",    remote = "BuyDragonTalon",    teacher = "Uzoth",
+        level = 1500, needs = "Dragon Breath", mastery = 400},
+    {name = "Godhuman",        remote = "BuyGodhuman",       teacher = "Ancient Monk", level = 3000},
+    {name = "Sanguine Art",    remote = "BuySanguineArt",    teacher = "Shafi", level = 3000},
     {name = "Advanced Combat", remote = "BuyAdvancedCombat", teacher = "Secrets Master"},
 }
+
+-- The item a teacher asks for is carried as a tool or kept as a value of the
+-- player data: the backpack, the hand and the values are all looked at.
+hasItem = function(name)
+    local wanted = tostring(name):lower()
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    for _, folder in ipairs({char, backpack}) do
+        if folder then
+            for _, t in ipairs(folder:GetChildren()) do
+                if t.Name:lower():find(wanted, 1, true) then return true end
+            end
+        end
+    end
+    local hit = false
+    pcall(function()
+        for _, d in ipairs(LocalPlayer:GetDescendants()) do
+            if d:IsA("StringValue") and d.Name:lower():find(wanted, 1, true)
+                and d.Value ~= nil and d.Value ~= false then
+                hit = true
+            end
+        end
+    end)
+    return hit
+end
 
 local function shopRemote()
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
@@ -2851,6 +2883,17 @@ local function buyStyle(style)
         dbg("A buy is already running")
         return false
     end
+    -- What the style needs is checked before the walk: a teacher that will
+    -- refuse is a wasted trip, and the player has to see why nothing happened.
+    if style.level and getMyLevel() < style.level then
+        dbg("Auto buy: " .. style.name .. " needs level " .. style.level
+            .. ", we are " .. getMyLevel())
+        return false
+    end
+    if style.item and not hasItem(style.item) then
+        dbg("Auto buy: " .. style.name .. " needs " .. style.item .. " first")
+        return false
+    end
     state.shopping = true
     if WHIRLPOOL_STYLES[style.name] then
         takeWhirlpool()
@@ -2881,9 +2924,11 @@ local function buyStyle(style)
         task.wait(0.4)
     end
     state.shopping = false
+    local bought = ok and reply ~= false
     dbg("Buy " .. style.name .. " from " .. (npc and "the teacher" or "far away")
-        .. (npc and (near and " (stood at it)" or " (could not reach it)") or " (no teacher was seen)"))
-    return true
+        .. (npc and (near and " (stood at it)" or " (could not reach it)") or " (no teacher was seen)")
+        .. (bought and " (the game took it)" or " (the game refused it)"))
+    return bought
 end
 
 local function buyAbility(remote, what)
@@ -2983,6 +3028,13 @@ pressRespawn = function()
                     or word:find("continue", 1, true) then
                     press(obj)
                     pressed = true
+                else
+                    -- Nothing on the death screen is worth keeping: while the
+                    -- character is down the buttons that are on show are the
+                    -- way out of it. Every visible one is pressed as a last
+                    -- resort, or the game keeps the player waiting.
+                    press(obj)
+                    pressed = pressed or true
                 end
             end
         end
