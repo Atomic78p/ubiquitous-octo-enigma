@@ -58,6 +58,7 @@ CONFIG = {
     AoeRange        = 130,
     BringMobMax     = 5,
     BossFarm        = false,
+    BossQuestPriority = true,
     BossRange       = 3000,
     WarpClose       = true,
     WarpDistance    = 60,
@@ -554,10 +555,18 @@ end
 
 -- ================= QUEST =================
 local function pickQuest(list, level, only)
-    local best, fallback, bestLevel, fallbackLevel
+    local best, fallback, bossQ, bestLevel, fallbackLevel, bossLevel
+    -- A boss quest that just could not be finished is left alone for a while,
+    -- or the bot would chase the same boss for ever.
+    local bossAllowed = CONFIG.BossQuestPriority ~= false
+        and (not state.bossQuestCd or tick() > state.bossQuestCd)
     for _, q in ipairs(list) do
         if type(q.level) == "number" and q.level <= level and (not only or only[q.name]) then
-            if (q.count or 0) > 1 then
+            if bossAllowed and bossNameIs(q.mob or "") then
+                if bossLevel == nil or q.level > bossLevel then
+                    bossQ, bossLevel = q, q.level
+                end
+            elseif (q.count or 0) > 1 then
                 if bestLevel == nil or q.level > bestLevel then
                     best, bestLevel = q, q.level
                 end
@@ -568,7 +577,7 @@ local function pickQuest(list, level, only)
             end
         end
     end
-    return best or fallback
+    return bossQ or best or fallback
 end
 
 local function gameQuestFor(level)
@@ -1067,6 +1076,12 @@ local function tryAcceptQuest(info)
     state.questSentAt = tick()
     state.lastQuestTry = now
     state.questAsked = q.name
+    if bossNameIs(q.mob or "") then
+        state.bossQuestName = q.mob
+        state.bossQuestUntil = tick() + 180
+    else
+        state.bossQuestName, state.bossQuestUntil = nil, nil
+    end
     state.questNpc = q.npc
     state.questPos = q.pos
     state.questAskedAt = tick()
@@ -1317,6 +1332,20 @@ local function bossKeyOf(mob)
         if BOSS_NAMES[dkey] then return dkey end
     end
     return nil
+end
+
+-- A quest whose mob is a boss is worth more than a quest of plain mobs, and
+-- the picker asks this. It is a global on purpose: the picker sits earlier in
+-- the chunk than the boss tables, and the chunk is at the limit of 200 locals.
+bossNameIs = function(name)
+    if not name or not BOSS_NAMES then return false end
+    -- the tables of the bosses write the names both with and without the
+    -- leading "the" of the game ("The Gorilla King" / "Gorilla King")
+    local key = mobKey(name):lower()
+    if BOSS_NAMES[key] then return true end
+    if BOSS_NAMES["the " .. key] then return true end
+    if key:sub(1, 4) == "the " and BOSS_NAMES[key:sub(5)] then return true end
+    return false
 end
 
 local function pickBoss(root, range)
@@ -3047,49 +3076,94 @@ end
 -- respawns on its own, only slower.
 pressRespawn = function()
     local pressed = false
-    -- Every way a death screen is answered: its own signal, the two mouse
-    -- signals and, when the executor has it, a real click at its place on the
-    -- screen. The screen of the game is not always the one the script expects,
-    -- so both the gui of the player and the core gui are walked.
+    -- Every way a death screen is answered: its own signal, the connections of
+    -- that signal, the two mouse signals, a real click at its place on the
+    -- screen and the virtual mouse of the game. The screen of the game is not
+    -- always the one the script expects, so the gui of the player and the core
+    -- gui are both walked.
     local function press(button)
         pcall(function() if firesignal and button.Activated then firesignal(button.Activated) end end)
         pcall(function() if firesignal and button.MouseButton1Click then firesignal(button.MouseButton1Click) end end)
         pcall(function() if firesignal and button.MouseButton1Down then firesignal(button.MouseButton1Down) end end)
         pcall(function()
-            if mouse1click and button.AbsolutePosition then
-                local size = button.AbsoluteSize
-                local x = button.AbsolutePosition.X + (size and size.X or 0) / 2
-                local y = button.AbsolutePosition.Y + (size and size.Y or 0) / 2
-                mouse1click(x, y)
+            if getconnections and button.MouseButton1Click then
+                for _, c in ipairs(getconnections(button.MouseButton1Click)) do
+                    pcall(function() c.Function() end)
+                end
             end
         end)
+        pcall(function()
+            if mouse1click and button.AbsolutePosition then
+                local size = button.AbsoluteSize
+                mouse1click(button.AbsolutePosition.X + (size and size.X or 0) / 2,
+                    button.AbsolutePosition.Y + (size and size.Y or 0) / 2)
+            end
+        end)
+        pcall(function()
+            if button.AbsolutePosition and button.AbsoluteSize then
+                local vim = game:GetService("VirtualInputManager")
+                local x = button.AbsolutePosition.X + button.AbsoluteSize.X / 2
+                local y = button.AbsolutePosition.Y + button.AbsoluteSize.Y / 2
+                vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+                vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+            end
+        end)
+    end
+    local function shown(button)
+        local node = button
+        while node do
+            if node:IsA("GuiObject") and node.Visible == false then return false end
+            node = node.Parent
+        end
+        return true
     end
     local function look(folder)
         if not folder then return end
         local ok, list = pcall(function() return folder:GetDescendants() end)
         if not ok then return end
         for _, obj in ipairs(list) do
-            if obj:IsA("GuiButton") and obj.Visible then
+            if obj:IsA("GuiButton") and obj.Visible and shown(obj)
+                and not (ownGui ~= nil and obj:IsDescendantOf(ownGui)) then
                 local word = (tostring(obj.Text or "") .. " " .. tostring(obj.Name or "")):lower()
                 if word:find("respawn", 1, true) or word:find("spawn", 1, true)
-                    or word:find("play again", 1, true) or word:find("retry", 1, true)
-                    or word:find("continue", 1, true) then
+                    or word:find("revive", 1, true) or word:find("retry", 1, true)
+                    or word:find("play again", 1, true) or word:find("continue", 1, true)
+                    or word:find("rebirth", 1, true) or word:find("เกิดใหม่", 1, true) then
                     press(obj)
                     pressed = true
-                else
-                    -- Nothing on the death screen is worth keeping: while the
-                    -- character is down the buttons that are on show are the
-                    -- way out of it. Every visible one is pressed as a last
-                    -- resort, or the game keeps the player waiting.
-                    press(obj)
-                    pressed = pressed or true
+                    dbg("Pressed respawn: " .. tostring(obj.Name))
                 end
             end
         end
     end
+    -- The gui of this script is not a death screen: pressing its own switches
+    -- is how the farm got turned off by a respawn press.
+    local ownGui = nil
+    pcall(function() ownGui = game:GetService("CoreGui"):FindFirstChild("CustomFarmGui") end)
+    local function isOurs(obj)
+        return ownGui ~= nil and obj:IsDescendantOf(ownGui)
+    end
     local player = LocalPlayer
     look(player and (player.PlayerGui or player:FindFirstChild("PlayerGui")))
     pcall(function() look(game:GetService("CoreGui")) end)
+    if not pressed then
+        -- The screen may be a plain button with no telling name: everything on
+        -- show while the character is down is the way out of it.
+        local function hammer(folder)
+            if not folder then return end
+            local ok, list = pcall(function() return folder:GetDescendants() end)
+            if not ok then return end
+            for _, obj in ipairs(list) do
+                if obj:IsA("GuiButton") and obj.Visible and shown(obj) and not isOurs(obj) then
+                    press(obj)
+                    pressed = true
+                end
+            end
+        end
+        hammer(player and (player.PlayerGui or player:FindFirstChild("PlayerGui")))
+        pcall(function() hammer(game:GetService("CoreGui")) end)
+    end
+    if not pressed then dbg("Death screen: no respawn button found yet") end
     return pressed
 end
 
@@ -3103,7 +3177,8 @@ local function step()
         end
         state.status = "Respawning..."
         -- the death screen is looked at twice a second, not every tick
-        if not state.respawnAt or now - state.respawnAt > 0.5 then
+        -- the death screen is asked twice a second until it answers
+        if not state.respawnAt or now - state.respawnAt > 0.2 then
             state.respawnAt = now
             pcall(pressRespawn)
         end
@@ -3117,6 +3192,14 @@ local function step()
     if state.shakerAt == nil or now - state.shakerAt > 30 then
         state.shakerAt = now
         stopCameraShaker()
+    end
+
+    -- A boss that never shows up must not keep the bot away from the mobs:
+    -- after the deadline the boss quests are left alone for a while.
+    if state.bossQuestName and state.bossQuestUntil and now > state.bossQuestUntil then
+        state.bossQuestCd = now + 300
+        state.bossQuestName, state.bossQuestUntil = nil, nil
+        dbg("Boss quest timed out, back to the mobs for a while")
     end
 
     if root.Position.Y < CONFIG.SafeY and now >= state.recoverUntil then
@@ -3729,6 +3812,25 @@ task.spawn(function()
         state.questing = CONFIG.AutoSaber and state.enabled
         if CONFIG.AutoSaber and state.enabled then
             state.blockAt = tick()
+            -- The quest is over when the Saber itself is in hand: the steps can
+            -- say one thing or another, the tool is the proof.
+            local hasSaber = false
+            local char = LocalPlayer.Character
+            local backpack = LocalPlayer:FindFirstChild("Backpack")
+            for _, folder in ipairs({char, backpack}) do
+                if folder then
+                    for _, t in ipairs(folder:GetChildren()) do
+                        if t:IsA("Tool") and t.Name:lower():find("saber", 1, true)
+                            and not t.Name:lower():find("expert", 1, true) then
+                            hasSaber = true
+                        end
+                    end
+                end
+            end
+            if hasSaber then
+                dbg("Saber obtained, the quest is over")
+                CONFIG.AutoSaber = false
+            end
             local root = getRoot()
             if root then
                 -- a step that made no progress for half a minute is allowed to
