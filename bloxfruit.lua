@@ -140,6 +140,7 @@ state = {
     whirlpooling  = false,
     questing      = false,
     bringHeld     = setmetatable({}, {__mode = "k"}),
+    bringSaved    = setmetatable({}, {__mode = "k"}),
     bringSlot     = setmetatable({}, {__mode = "k"}),
     bringSlotCount = 0,
     bringMoved    = setmetatable({}, {__mode = "k"}),
@@ -1501,8 +1502,8 @@ gameBodyMove = function(char, velocity, duration, id, action)
 end
 
 -- A mob is let go: the drag goes away and the physics the pack changed is put
--- back, so the mob can stand on its own again. It is a global because the
--- chunk is at the limit of 200 locals.
+-- back exactly as the game had it, so the mob can stand and walk on its own
+-- again. It is a global because the chunk is at the limit of 200 locals.
 letGoMob = function(mob, part)
     part = part or anchorOf(mob)
     if state.bringMoverId[mob] then
@@ -1515,40 +1516,40 @@ letGoMob = function(mob, part)
             if lock then lock:Destroy() end
             local gyro = part:FindFirstChild("BringGyro")
             if gyro then gyro:Destroy() end
-            -- the whole rig was made ghost and weightless on the way in, so
-            -- the whole rig is put back, not only the root
-            for _, d in ipairs(mob:GetDescendants()) do
-                if d:IsA("BasePart") then
-                    d.CanCollide = true
-                    d.CanTouch = true
-                    d.Massless = false
-                    d.AssemblyLinearVelocity = Vector3.zero
-                    d.AssemblyAngularVelocity = Vector3.zero
-                end
-            end
             part:SetAttribute("BeingBrought", false)
         end)
     end
-    local hum = mob:FindFirstChildOfClass("Humanoid")
-    if hum then
-        pcall(function()
-            hum.PlatformStand = false
-            hum.AutoRotate = true
-            -- leave WalkSpeed/JumpPower to the game; forcing defaults can break some mobs
-        end)
+    local saved = state.bringSaved[mob]
+    if saved then
+        for d, orig in pairs(saved.parts) do
+            if d.Parent then
+                pcall(function()
+                    d.CanCollide = orig.collide
+                    d.CanTouch = orig.touch
+                    d.Massless = orig.massless
+                    d.AssemblyLinearVelocity = Vector3.zero
+                    d.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function()
+                hum.PlatformStand = false
+                hum.AutoRotate = true
+                if saved.walk then hum.WalkSpeed = saved.walk end
+                if saved.jump then hum.JumpPower = saved.jump end
+                if saved.breakJoints ~= nil then hum.BreakJointsOnDeath = saved.breakJoints end
+            end)
+        end
+        state.bringSaved[mob] = nil
     end
     state.bringHeld[mob] = nil
     state.bringMoved[mob] = nil
     state.bringHealth[mob] = nil
-    -- the step is given back, so the block never marches away from the camp
-    local slot = state.bringSlot[mob]
-    if slot then
-        state.bringSlot[mob] = nil
-        if slot < (state.bringSlotCount or 0) then
-            state.bringSlotCount = slot
-            state.bringSlotCount = math.max(slot - 1, 0)
-        end
-    end
+    -- the slot is only given back; the counter never walks back, or a new mob
+    -- would take a step a mob that is still held already stands on
+    state.bringSlot[mob] = nil
 end
 
 -- Bring Mob, the way the good hubs do it: the pack is gathered on one point
@@ -1676,9 +1677,13 @@ local function bringMob(target, root)
             -- every part of the mob goes ghost and is stopped. One part that
             -- still collides with the ground is enough to hold the whole mob
             -- back, so the hub does this to all of them, and it does it once.
+            -- The values the game had are written down on the way in, so the
+            -- mob can be put back exactly, not just made solid again.
             if not state.bringHeld[mob] then
+                local saved = { parts = {} }
                 for _, d in ipairs(mob:GetDescendants()) do
                     if d:IsA("BasePart") then
+                        saved.parts[d] = { collide = d.CanCollide, touch = d.CanTouch, massless = d.Massless }
                         pcall(function()
                             d.CanCollide = false
                             d.CanTouch = false
@@ -1688,6 +1693,12 @@ local function bringMob(target, root)
                         end)
                     end
                 end
+                if hum then
+                    saved.walk = hum.WalkSpeed
+                    saved.jump = hum.JumpPower
+                    saved.breakJoints = hum.BreakJointsOnDeath
+                end
+                state.bringSaved[mob] = saved
             end
 
             if hum then
@@ -3059,6 +3070,7 @@ local function fullReset(reason)
     state.bringIgnored = setmetatable({}, {__mode = "k"})
     state.bringHealth = setmetatable({}, {__mode = "k"})
     state.bringHeld = setmetatable({}, {__mode = "k"})
+    state.bringSaved = setmetatable({}, {__mode = "k"})
     state.bringSlot = setmetatable({}, {__mode = "k"})
     state.bringSlotCount = 0
     state.bringAt = 0
