@@ -235,8 +235,17 @@ local function getMyLevel()
     return 1
 end
 
+local function toolKind(tool)
+    local tip = tool.ToolTip
+    if type(tip) == "string" and tip ~= "" then return tip:lower() end
+    return nil
+end
+
 local function isFruit(t)
-    return t.Name:lower():find("fruit", 1, true) ~= nil
+    if t.Name:lower():find("fruit", 1, true) then return true end
+    -- the fruits of the game carry their kind in the tooltip, not in the name:
+    -- a tool named "Magma" with the tooltip "Fruit" is a fruit all the same
+    return toolKind(t) == "fruit"
 end
 
 local WEAPON_GROUPS = {
@@ -1305,7 +1314,7 @@ local BOSS_NAMES = {
     ["cake queen"] = true, ["heaven's guardian"] = true, ["hell's messenger"] = true,
     -- the raid bosses the hubs farm as well
     ["darkbeard"] = true, ["soul reaper"] = true, ["dough king"] = true,
-    ["cake prince"] = true, ["rip_indra true form"] = true,
+    ["cake prince"] = true, ["rip indra"] = true, ["rip indra true form"] = true,
 }
 
 -- The level of each boss quest (the table of the wiki), so the boss farm
@@ -2386,11 +2395,19 @@ local function storeFruit(tool)
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if commF then
-        pcall(function() commF:InvokeServer("StoreFruit", tool) end)
-        -- some builds want the name of the fruit instead of the tool itself
-        pcall(function() commF:InvokeServer("StoreFruit", tool.Name) end)
-        dbg("Asked the game to store " .. tool.Name)
-        return true
+        -- some builds want the name of the fruit instead of the tool itself,
+        -- so the name is only tried when the call with the tool did not go
+        -- through: asking twice can make the game eat or drop the fruit
+        local ok = pcall(function() commF:InvokeServer("StoreFruit", tool) end)
+        if not ok then
+            ok = pcall(function() commF:InvokeServer("StoreFruit", tool.Name) end)
+        end
+        if ok then
+            dbg("Asked the game to store " .. tool.Name)
+        else
+            dbg("The store remote refused " .. tool.Name)
+        end
+        return ok
     end
     if useFruitMenu(tool.Name, {"store", "deposit", "stash"}) then
         dbg("Asked the game to store " .. tool.Name)
@@ -3129,6 +3146,16 @@ pressRespawn = function()
         end
         return true
     end
+    -- The gui of this script is not a death screen: pressing its own switches
+    -- is how the farm got turned off by a respawn press. It lives in CoreGui
+    -- when the executor allows that and in PlayerGui otherwise, so both are
+    -- looked at before any button is pressed.
+    local ownGui = nil
+    pcall(function()
+        ownGui = game:GetService("CoreGui"):FindFirstChild("CustomFarmGui")
+            or (LocalPlayer:FindFirstChild("PlayerGui")
+                and LocalPlayer:FindFirstChild("PlayerGui"):FindFirstChild("CustomFarmGui"))
+    end)
     local function look(folder)
         if not folder then return end
         local ok, list = pcall(function() return folder:GetDescendants() end)
@@ -3148,33 +3175,12 @@ pressRespawn = function()
             end
         end
     end
-    -- The gui of this script is not a death screen: pressing its own switches
-    -- is how the farm got turned off by a respawn press.
-    local ownGui = nil
-    pcall(function() ownGui = game:GetService("CoreGui"):FindFirstChild("CustomFarmGui") end)
-    local function isOurs(obj)
-        return ownGui ~= nil and obj:IsDescendantOf(ownGui)
-    end
     local player = LocalPlayer
     look(player and (player.PlayerGui or player:FindFirstChild("PlayerGui")))
     pcall(function() look(game:GetService("CoreGui")) end)
-    if not pressed then
-        -- The screen may be a plain button with no telling name: everything on
-        -- show while the character is down is the way out of it.
-        local function hammer(folder)
-            if not folder then return end
-            local ok, list = pcall(function() return folder:GetDescendants() end)
-            if not ok then return end
-            for _, obj in ipairs(list) do
-                if obj:IsA("GuiButton") and obj.Visible and shown(obj) and not isOurs(obj) then
-                    press(obj)
-                    pressed = true
-                end
-            end
-        end
-        hammer(player and (player.PlayerGui or player:FindFirstChild("PlayerGui")))
-        pcall(function() hammer(game:GetService("CoreGui")) end)
-    end
+    -- A button with no telling name is never pressed: a blind press over every
+    -- button on screen hits the shops and the switches of the game, and the
+    -- game respawns the character on its own when no button is found.
     if not pressed then dbg("Death screen: no respawn button found yet") end
     return pressed
 end
