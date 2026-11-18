@@ -171,7 +171,7 @@ local grabbedFruits = setmetatable({}, {__mode = "k"})
 
 local function dbg(msg)
     if msg == state.debugMsg then
-        state.debugCount += 1
+        state.debugCount = state.debugCount + 1
         state.debugLine = msg .. " (x" .. state.debugCount .. ")"
     else
         state.debugMsg = msg
@@ -2473,7 +2473,7 @@ local function fruitWasTaken(fruit)
 end
 
 local function confirmFruitPickup(fruit)
-    state.fruitsFound += 1
+    state.fruitsFound = state.fruitsFound + 1
     local name = fruit.Name
     local tool = newTool(state.fruitTools) or findFruitTool(name)
     state.fruit = nil
@@ -3358,7 +3358,7 @@ local function step()
             local stored = 0
             for _, f in ipairs(fruits) do
                 if stored >= 4 then break end
-                if storeFruit(f) then stored += 1 end
+                if storeFruit(f) then stored = stored + 1 end
             end
             stored = before - #carriedFruits()
             if stored > 0 then
@@ -3375,7 +3375,7 @@ local function step()
                     task.wait(0.5)
                     for _, f in ipairs(fruits) do
                         if stored >= 4 then break end
-                        if useFruitMenu(f.Name, {"deposit", "store"}) then stored += 1 end
+                        if useFruitMenu(f.Name, {"deposit", "store"}) then stored = stored + 1 end
                     end
                     stored = before - #carriedFruits()
                     if stored > 0 then
@@ -4033,7 +4033,7 @@ task.spawn(function()
         task.wait(1)
         raiseSimulationRadius()
         if CONFIG.AntiAfk then
-            state.afkTimer += 1
+            state.afkTimer = state.afkTimer + 1
             if state.afkTimer >= (CONFIG.AntiAfkInterval or 120) then
                 state.afkTimer = 0
                 local cam = Workspace.CurrentCamera
