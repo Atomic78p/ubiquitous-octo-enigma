@@ -1,4 +1,5 @@
 -- // Blox Fruits Auto-Farm — Fixed Build
+print("[Farm] build start")
 -- The services are put in the global table on purpose: the script has a hard
 -- limit of 200 locals in one chunk, and it is already close to it.
 Players           = game:GetService("Players")
@@ -2084,10 +2085,12 @@ end
 
 local function hitPartOf(mob)
     if not mob then return nil end
-    -- the game registers a hit against the body part: the root of the rig is
-    -- what the server expects first, the head and any part are the fallback
-    return mob:FindFirstChild("HumanoidRootPart")
+    -- logs show the game often uses limb parts (RightHand, LeftUpperLeg, etc.)
+    return mob:FindFirstChild("RightHand")
+        or mob:FindFirstChild("LeftHand")
+        or mob:FindFirstChild("RightUpperArm")
         or mob:FindFirstChild("Head")
+        or mob:FindFirstChild("HumanoidRootPart")
         or anchorOf(mob)
 end
 
@@ -2157,15 +2160,18 @@ local function remoteAttack(target, tool)
     local root = getRoot()
     local pairs_ = aoePairs(root, target)
     if #pairs_ == 0 then return false end
-    -- The click delay is one number, the way every working fast attack sends
-    -- it: the second argument this used to pass was a guess and is not read.
-    pcall(function() regAttack:FireServer(attackAnimLength(tool)) end)
+    -- From remote logs: RegisterAttack(animLength, comboIndex)
+    state.attackCombo = ((state.attackCombo or 0) % 4) + 1
+    pcall(function()
+        regAttack:FireServer(attackAnimLength(tool), state.attackCombo)
+    end)
     state.aoeCount = #pairs_
-    -- Every entry of the list is a pair of the rig and the part that was hit,
-    -- and the mob that was struck is in the list as well; the first argument
-    -- is only the part the swing is drawn on. This is the shape the working
-    -- fast attack scripts send, and the game takes the whole list with it.
-    local ok = pcall(function() hit:FireServer(pairs_[1][2], pairs_) end)
+    -- From remote logs: RegisterHit(primaryPart, {{mob, part}, ...}, nil, hexId)
+    state.attackId = (state.attackId or 0) + 1
+    local id = string.format("%08x", state.attackId)
+    local ok = pcall(function()
+        hit:FireServer(pairs_[1][2], pairs_, nil, id)
+    end)
     return ok
 end
 
@@ -2361,8 +2367,12 @@ local function useFruitMenu(fruitName, actions)
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     if not pg then return false end
     local function press(d)
-        pcall(function() d.MouseButton1Click:Fire() end)
-        pcall(function() d.Activated:Fire() end)
+        -- MouseButton1Click is a signal, not a BindableEvent: it has no
+        -- :Fire(). The executor helper is the way to click a game button.
+        if firesignal then
+            pcall(function() if d.MouseButton1Click then firesignal(d.MouseButton1Click) end end)
+            pcall(function() if d.Activated then firesignal(d.Activated) end end)
+        end
     end
     local function shown(d) return d.Visible ~= false end
     if fruitName then
@@ -2370,7 +2380,10 @@ local function useFruitMenu(fruitName, actions)
         local compact = want:gsub("%s", "")
         for _, d in ipairs(pg:GetDescendants()) do
             if (d:IsA("TextButton") or d:IsA("ImageButton")) and shown(d) then
-                local text = (d.Text or ""):lower()
+                -- an ImageButton has no Text property: reading it threw and
+                -- that error stopped every fruit menu action
+                local text = ""
+                if d:IsA("TextButton") then text = (d.Text or ""):lower() end
                 local nm = (d.Name or ""):lower()
                 if text == want or nm:find(compact, 1, true) then
                     press(d)
@@ -2383,7 +2396,9 @@ local function useFruitMenu(fruitName, actions)
     for _, action in ipairs(actions) do
         for _, d in ipairs(pg:GetDescendants()) do
             if (d:IsA("TextButton") or d:IsA("ImageButton")) and shown(d) then
-                local text = ((d.Text or "") .. " " .. (d.Name or "")):lower()
+                local t = ""
+                if d:IsA("TextButton") then t = d.Text or "" end
+                local text = (t .. " " .. (d.Name or "")):lower()
                 if text:find("%f[%w]" .. action .. "%f[^%w]") then
                     press(d)
                     return true
@@ -2446,12 +2461,22 @@ local function storeFruit(tool)
         if not ok then
             ok = pcall(function() commF:InvokeServer("StoreFruit", tool.Name) end)
         end
-        if ok then
-            dbg("Asked the game to store " .. tool.Name)
-        else
+        if not ok then
             dbg("The store remote refused " .. tool.Name)
+            return false
         end
-        return ok
+        -- the answer of the invoke is not the proof: the fruit has to leave
+        -- the player. The old code returned true here and the farm counted a
+        -- store that never happened.
+        for _ = 1, 8 do
+            if tool.Parent == nil or not tool:IsDescendantOf(LocalPlayer) then
+                dbg("Stored " .. tool.Name)
+                return true
+            end
+            task.wait(0.1)
+        end
+        dbg("The store remote did not take " .. tool.Name)
+        return false
     end
     if useFruitMenu(tool.Name, {"store", "deposit", "stash"}) then
         dbg("Asked the game to store " .. tool.Name)
@@ -4051,6 +4076,10 @@ task.spawn(function()
 end)
 
 -- ================= GUI HELPERS =================
+-- The panel is built inside its own function on purpose: the top level of a
+-- Lua chunk can only hold 200 locals, and some executors add their own to the
+-- chunk that runs this file. In a function the panel gets a fresh frame.
+local function buildPanel()
 local function corner(p, r) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r or 6); c.Parent=p; return c end
 local function stroke(p) local s=Instance.new("UIStroke"); s.Color=Color3.fromRGB(50,50,65); s.Thickness=1; s.Parent=p; return s end
 
@@ -4659,5 +4688,9 @@ UserInputService.InputBegan:Connect(function(i, gpe)
     if i.KeyCode == Enum.KeyCode.RightShift then gui.Enabled = not gui.Enabled end
     if i.KeyCode == Enum.KeyCode.F9 and setDebug then setDebug(not CONFIG.Debug) end
 end)
+
+end
+
+buildPanel()
 
 print("[Farm] Fixed build loaded.")
