@@ -264,12 +264,6 @@ local WEAPON_GROUPS = {
     },
 }
 
-local function toolKind(tool)
-    local tip = tool.ToolTip
-    if type(tip) == "string" and tip ~= "" then return tip:lower() end
-    return nil
-end
-
 local function isGun(tool)
     if toolKind(tool) == "gun" then return true end
     local n = tool.Name:lower()
@@ -346,6 +340,11 @@ local function equipWeapon()
                     equipRemote:FireServer(false)
                 end
             end)
+        end
+        -- the plain reparent is what really equips a tool on the client when
+        -- the humanoid call of this build did not take it
+        if item.Parent ~= char then
+            pcall(function() item.Parent = char end)
         end
         
         if item.Parent ~= char then
@@ -1277,7 +1276,8 @@ local function collectEnemies(now)
             local hum = e:FindFirstChildOfClass("Humanoid")
             local stuck = stuckTargets[e]
             if hum and hum.Health > 0 and (not stuck or stuck < now)
-                and not e:FindFirstChild("Ignored") then
+                and not e:FindFirstChild("Ignored")
+                and not e:FindFirstChild("FarmIgnored") then
                 table.insert(list, e)
             end
         end
@@ -1287,7 +1287,8 @@ local function collectEnemies(now)
                 local hum = child:FindFirstChildOfClass("Humanoid")
                 local stuck = stuckTargets[child]
                 if hum and hum.Health > 0 and (not stuck or stuck < now)
-                    and not child:FindFirstChild("Ignored") then
+                    and not child:FindFirstChild("Ignored")
+                    and not child:FindFirstChild("FarmIgnored") then
                     table.insert(list, child)
                 end
             end
@@ -1564,43 +1565,53 @@ end
 -- Bring Mob, the way the good hubs do it: the pack is gathered on one point
 -- and every mob is held there by a body velocity named Lock (unlimited force,
 -- so a hit cannot knock it off), not by a teleport. The point is the spawn
--- point of that mob in the world, and each mob keeps its own step of the row
--- so the pack never shuffles.
+-- point of that mob in the world when it is already close, the player
+-- otherwise, and each mob keeps its own step of the row so the pack never
+-- shuffles.
 local function bringMob(target, root)
     if not CONFIG.BringMob or not target or not target.Parent or not root then return end
     local anchor = anchorOf(target)
     if not anchor then return end
-    if ownedByOther(anchor) then return end
+    if ownedByOther(anchor) then
+        -- the mob is in the fight of another player: let go of it instead of
+        -- leaving it locked where it stands
+        if state.bringHeld[target] then letGoMob(target, anchor) end
+        return
+    end
 
     local now = tick()
 
     -- the mark of a mob that was given up is taken off again
     for mob, at in pairs(state.bringIgnored) do
         if now - at > 30 then
-            local marker = mob:FindFirstChild("Ignored")
+            local marker = mob:FindFirstChild("FarmIgnored")
             if marker then pcall(function() marker:Destroy() end) end
             state.bringIgnored[mob] = nil
         end
     end
 
-    -- a held mob that is not being hurt is let go, put back on its spawn
-    -- ground and left alone for a while
+    -- a held mob that is not being hurt is let go and left alone for a while
     for mob, at in pairs(state.bringMoved) do
         if now - at > 2.2 then
             state.bringMoved[mob] = nil
             local hum = mob:FindFirstChildOfClass("Humanoid")
             local hp = hum and hum.Health
             if mob ~= target and hp and state.bringHealth[mob] == hp
-                and not mob:FindFirstChild("Ignored") then
+                and not mob:FindFirstChild("FarmIgnored") then
                 local part = anchorOf(mob)
                 if part then
                     letGoMob(mob, part)
                     state.bringSlot[mob] = nil
-                    local home = mobSpawnPoint(mob, part.Position)
-                    if home then pcall(function() part.CFrame = CFrame.new(home) end) end
+                    -- The mob is left where it stands: the game walks it back
+                    -- to its camp on its own. Snapping it home was the visible
+                    -- "dragged and thrown back" jitter of the pack.
                 end
                 state.bringIgnored[mob] = now
-                Instance.new("IntValue", mob).Name = "Ignored"
+                pcall(function()
+                    local marker = Instance.new("IntValue")
+                    marker.Name = "FarmIgnored"
+                    marker.Parent = mob
+                end)
             end
             state.bringHealth[mob] = hp
         end
@@ -1620,14 +1631,22 @@ local function bringMob(target, root)
         return
     end
 
-    -- The middle of the pack is the camp of that kind, taken from the game.
-    -- It is only looked up again when the middle has really moved: the player
-    -- hovers and creeps by a stud, and a middle that creeps with it never lets
-    -- a mob rest.
+    -- The middle of the pack is the camp of that kind, taken from the game -
+    -- but only when the camp is already a short move away. A spawn centre can
+    -- stand up to the whole search range off, and a pack pulled there is the
+    -- "mobs dragged away" the farm used to show. Further than BringMobRange
+    -- the pack is gathered where the player stands instead.
     state.bringTarget = target
-    local point = spawnCentre(target, root.Position) or root.Position
+    local maxPull = CONFIG.BringMobRange or 60
+    local point = spawnCentre(target, root.Position)
+    if not point or (point - root.Position).Magnitude > maxPull then
+        point = root.Position
+    end
+    -- The middle only moves when the player has really travelled or the camp
+    -- changed: refreshing it on every little hover step would drag the pack
+    -- back and forth under the player for the whole fight.
     local centre = state.bringCentre
-    if not centre or (point - centre).Magnitude > 6 then
+    if not centre or (point - centre).Magnitude > maxPull then
         state.bringCentre = point
         centre = point
     end
@@ -1643,6 +1662,7 @@ local function bringMob(target, root)
         local near = {}
         for _, mob in ipairs(collectEnemies(now)) do
             if mob ~= target and not mob:FindFirstChild("Ignored")
+                and not mob:FindFirstChild("FarmIgnored")
                 and mobKey(mob.Name) == key then
                 local part = anchorOf(mob)
                 local hum = mob:FindFirstChildOfClass("Humanoid")
@@ -1661,9 +1681,13 @@ local function bringMob(target, root)
 
     local stillHeld = {}
     for _, mob in ipairs(list) do
-        stillHeld[mob] = true
         local part = anchorOf(mob)
-        if part then
+        -- The mob of the fight is not held: the player stands over its head
+        -- and hits it there, and it is left walking the way the game made it.
+        -- Carrying it is what turned a missed swing into a frozen statue.
+        -- Only the extra mobs of the pack are frozen and dragged.
+        if part and mob ~= target then
+            stillHeld[mob] = true
             -- every mob keeps its own step of the row, so the pack does not
             -- shuffle around when the order of the list changes
             local slot = state.bringSlot[mob]
@@ -2060,7 +2084,9 @@ end
 
 local function hitPartOf(mob)
     if not mob then return nil end
-    return mob:FindFirstChild("RightHand")
+    -- the game registers a hit against the body part: the root of the rig is
+    -- what the server expects first, the head and any part are the fallback
+    return mob:FindFirstChild("HumanoidRootPart")
         or mob:FindFirstChild("Head")
         or anchorOf(mob)
 end
@@ -2101,17 +2127,17 @@ end
 -- remote is the fallback when that wrapper is not there.
 local function hitRemote()
     if state.hitRemoteCache and state.hitRemoteCache.Parent then
-        return state.hitRemoteCache, state.hitRemoteWrapped
+        return state.hitRemoteCache
     end
     local net = netFolder()
-    if not net then return nil, false end
+    if not net then return nil end
     local ok, wrapped = pcall(function() return net:RemoteEvent("RegisterHit", true) end)
     if ok and wrapped then
-        state.hitRemoteCache, state.hitRemoteWrapped = wrapped, true
+        state.hitRemoteCache = wrapped
     else
-        state.hitRemoteCache, state.hitRemoteWrapped = net:FindFirstChild("RE/RegisterHit"), false
+        state.hitRemoteCache = net:FindFirstChild("RE/RegisterHit")
     end
-    return state.hitRemoteCache, state.hitRemoteWrapped
+    return state.hitRemoteCache
 end
 
 local function attackRemote()
@@ -2126,39 +2152,57 @@ end
 local function remoteAttack(target, tool)
     local regAttack = attackRemote()
     if not regAttack then return false end
+    local hit = hitRemote()
+    if not hit then return false end
     local root = getRoot()
     local pairs_ = aoePairs(root, target)
     if #pairs_ == 0 then return false end
-    local id = nil
-    pcall(function() id = regAttack:FireServer(attackAnimLength(tool), 1) end)
-    if type(id) ~= "string" then
-        state.attackId = (state.attackId or 0) + 1
-        id = string.format("%08x", state.attackId)
-    end
+    -- The click delay is one number, the way every working fast attack sends
+    -- it: the second argument this used to pass was a guess and is not read.
+    pcall(function() regAttack:FireServer(attackAnimLength(tool)) end)
     state.aoeCount = #pairs_
-    local hit, wrapped = hitRemote()
-    if not hit then return false end
-    local rest = {}
-    for i = 2, #pairs_ do rest[i - 1] = pairs_[i] end
-    if wrapped then
-        pcall(function() hit:FireServer(pairs_[1][2], rest) end)
-    else
-        pcall(function() hit:FireServer(pairs_[1][2], rest, nil, id) end)
-    end
-    return true
+    -- Every entry of the list is a pair of the rig and the part that was hit,
+    -- and the mob that was struck is in the list as well; the first argument
+    -- is only the part the swing is drawn on. This is the shape the working
+    -- fast attack scripts send, and the game takes the whole list with it.
+    local ok = pcall(function() hit:FireServer(pairs_[1][2], pairs_) end)
+    return ok
 end
 
 local function doAttack(tool, target)
-    if CONFIG.FastAttack then fastAttack() end
+    if not tool then return false end
     local char = LocalPlayer.Character
+    -- The stun of this game is a client value that can stay up while the mobs
+    -- are around: refusing to swing on it is what made the farm hit nothing.
+    -- It is zeroed here instead, the way the hubs do it.
     local stun = char and char:FindFirstChild("Stun")
-    local stunned = false
-    pcall(function() stunned = (stun and stun.Value and stun.Value ~= 0) end)
-    if stunned then return false end
-    if not canAttack(tool) then return false end
-    if CONFIG.RemoteAttack and remoteAttack(target, tool) then return true end
+    if stun then
+        pcall(function()
+            if stun:IsA("BoolValue") then
+                stun.Value = false
+            else
+                stun.Value = 0
+            end
+        end)
+    end
+    if CONFIG.FastAttack then fastAttack() end
+    -- The combat-state helper of the game is not a gate here: the cooldown of
+    -- the script and the stun above already decide. A helper that reports a
+    -- stale "cannot attack" is what left the bot swinging at nothing.
+    local remote = false
+    if CONFIG.RemoteAttack then
+        remote = remoteAttack(target, tool)
+    else
+        state.aoeCount = 1
+    end
+    -- a fruit in hand is eaten by its activation, never used as a swing
+    if isFruit(tool) then return remote end
+    -- The real swing goes out as well: it is the fallback of the packet. A
+    -- remote the server drops still counts as fired here, and the old early
+    -- return left the bot standing over a mob that never lost health. In
+    -- reach the swing costs nothing; out of reach it simply misses.
     local ok = pcall(function() tool:Activate() end)
-    return ok
+    return ok or remote
 end
 
 local function mobInReach(root, reach)
@@ -3067,6 +3111,17 @@ local function releaseBringMobs()
     state.bringHeld = setmetatable({}, {__mode = "k"})
     state.bringSlot = setmetatable({}, {__mode = "k"})
     state.bringSlotCount = 0
+    -- the point of the last pack dies with it, so the next fight is gathered
+    -- where the fight actually is
+    state.bringPoint, state.bringTarget, state.bringCentre = nil, nil, nil
+    -- The "given up" mark only makes sense while the pack is being carried.
+    -- Left behind after a stop it would hide those mobs from every later
+    -- target scan, so it is taken off with the pack.
+    for mob in pairs(state.bringIgnored) do
+        local marker = mob:FindFirstChild("FarmIgnored")
+        if marker then pcall(function() marker:Destroy() end) end
+    end
+    state.bringIgnored = setmetatable({}, {__mode = "k"})
 end
 
 
@@ -3402,6 +3457,11 @@ local function step()
     if not CONFIG.AutoFarm then
         state.farming = false
         state.status = "Idle"
+        -- nothing is being farmed: the pack of the last mob is let go and the
+        -- hitbox that was made big for the swing is put back
+        restoreHitbox()
+        if next(state.bringHeld) ~= nil or next(state.bringIgnored) ~= nil then releaseBringMobs() end
+        state.lastTarget, state.targetHealth, state.targetAt = nil, nil, 0
         if CONFIG.AutoAttack then autoAttackSwing(nil) end
         return
     end
@@ -3426,6 +3486,12 @@ local function step()
         end
     end
     if not target then
+        -- there is no mob to farm at this moment: the pack of the last target
+        -- is released and the enlarged hitbox restored, or the mobs would stay
+        -- frozen and big while the bot only flies to a spawn
+        restoreHitbox()
+        if next(state.bringHeld) ~= nil or next(state.bringIgnored) ~= nil then releaseBringMobs() end
+        state.lastTarget, state.targetHealth, state.targetAt = nil, nil, 0
         local sp = findSpawn(mob)
         local anchor = sp and anchorOf(sp)
         if anchor then
@@ -3447,9 +3513,10 @@ local function step()
     local er = anchorOf(target)
     if not er then return end
 
+    local tool = equipWeapon()
     local th = target:FindFirstChildOfClass("Humanoid")
     local dist = (root.Position - er.Position).Magnitude
-    local reach = attackRange(LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool"))
+    local reach = attackRange(tool)
     local inRange = dist <= reach + 6
     if th then
         if target ~= state.lastTarget then
@@ -3478,8 +3545,6 @@ local function step()
         end
     end
 
-    local tool = equipWeapon()
-    local reach = attackRange(tool)
     local hover = CONFIG.HoverHeight
     -- The hits go through the remote of the game, so the player can stay high
     -- above the mob where its swings cannot reach. Only the plain swing has to
@@ -3488,11 +3553,25 @@ local function step()
         hover = math.min(hover, CONFIG.MeleeHover)
     end
 
-    if CONFIG.BringMob then bringMob(target, root) end
-
     local dx = root.Position.X - er.Position.X
     local dz = root.Position.Z - er.Position.Z
     local flat = math.sqrt(dx * dx + dz * dz)
+
+    -- The pack is only gathered at the fight. Carrying it while the bot flies
+    -- to a mob is what dragged the held mobs across the map behind the player:
+    -- they are let go the moment the target is out of reach and picked up
+    -- again when the bot has arrived.
+    if CONFIG.BringMob then
+        if flat <= reach + 10 then
+            bringMob(target, root)
+        elseif next(state.bringHeld) ~= nil then
+            releaseBringMobs()
+            restoreHitbox()
+        end
+    elseif next(state.bringHeld) ~= nil or next(state.bringIgnored) ~= nil then
+        releaseBringMobs()
+        restoreHitbox()
+    end
 
     local swingTarget = target
     if CONFIG.AutoAttack then
@@ -3513,8 +3592,6 @@ local function step()
             swingTarget = close
         end
     end
-
-    if CONFIG.BigHitbox then enlargeHitbox(swingTarget) end
 
     -- The hover and the trip follow the mob of the quest. A swipe at a mob
     -- that stands beside us is only a swipe: it must not pull the trip off
@@ -3562,15 +3639,26 @@ local function step()
     local sx = root.Position.X - swingHit.Position.X
     local sz = root.Position.Z - swingHit.Position.Z
     local swingFlat = math.sqrt(sx * sx + sz * sz)
+    -- The big hitbox is a thing of the swing, not of the trip: a mob left
+    -- blown up while the bot flies somewhere else is the giant rig players
+    -- see. It is put back the moment there is no swing to make.
+    if CONFIG.BigHitbox and swingFlat <= reach then
+        enlargeHitbox(swingTarget)
+    elseif state.hitboxPart then
+        restoreHitbox()
+    end
     if now - state.lastAttack >= CONFIG.AttackCooldown
         and swingFlat <= reach then
         if not tool then dbg("No weapon in backpack!"); return end
         if doAttack(tool, swingTarget) then
             state.lastAttack = now
             local many = (state.aoeCount or 1) > 1 and (" +" .. (state.aoeCount - 1) .. " close") or ""
+            -- the hit counter is only shown when the game remote that confirms
+            -- hits is there, so a missing hook cannot look like 0 damage
+            local seen = state.hitRemoteHooked
+                and (" (" .. state.hitsConfirmed .. " hits)") or ""
             if swingTarget == target then
-                state.status = "Hitting " .. target.Name .. many
-                    .. " (" .. state.hitsConfirmed .. " hits)"
+                state.status = "Hitting " .. target.Name .. many .. seen
             else
                 state.status = "Attacking " .. swingTarget.Name .. many
             end
@@ -3596,6 +3684,14 @@ task.spawn(function()
             state.wasStopped = false
             local ok, err = pcall(step)
             if not ok then dbg("Loop error: " .. tostring(err)) end
+            -- A pause of the farm (a turn-in, a fruit, a shop) must not leave
+            -- the last pack frozen: if the farm has not carried it for a few
+            -- seconds, the mobs are let go and the enlarged hitbox is put back.
+            if next(state.bringHeld) ~= nil
+                and tick() - (state.bringAt or 0) > 3 then
+                releaseBringMobs()
+                restoreHitbox()
+            end
         else
             state.farming = false
             state.status = "Stopped"
@@ -3603,7 +3699,8 @@ task.spawn(function()
             -- let the held mobs go the moment the bot is stopped, once
             if not state.wasStopped then
                 state.wasStopped = true
-                if next(state.bringHeld) ~= nil then releaseBringMobs() end
+                if next(state.bringHeld) ~= nil or next(state.bringIgnored) ~= nil then releaseBringMobs() end
+                restoreHitbox()
             end
         end
         task.wait(0.05)
