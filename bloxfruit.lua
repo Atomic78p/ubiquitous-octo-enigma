@@ -61,7 +61,6 @@ CONFIG = {
     BossFarm        = false,
     BossQuestPriority = true,
     BossRange       = 3000,
-    BossLevelWindow = 25,
     WarpClose       = true,
     WarpDistance    = 60,
     HoverHeight     = 7,
@@ -568,20 +567,13 @@ end
 local function pickQuest(list, level, only)
     local best, fallback, bossQ, bestLevel, fallbackLevel, bossLevel
     -- A boss quest that just could not be finished is left alone for a while,
-    -- or the bot would chase the same boss for ever. With the boss farm off
-    -- boss quests are not picked at all: the normal mob quest is used instead.
-    local bossAllowed = CONFIG.BossFarm and CONFIG.BossQuestPriority ~= false
+    -- or the bot would chase the same boss for ever.
+    local bossAllowed = CONFIG.BossQuestPriority ~= false
         and (not state.bossQuestCd or tick() > state.bossQuestCd)
-    local bossWindow = CONFIG.BossLevelWindow or 25
     for _, q in ipairs(list) do
         if type(q.level) == "number" and q.level <= level and (not only or only[q.name]) then
-            if bossNameIs(q.mob or "") then
-                -- A boss quest is only taken when the boss itself is close to
-                -- the player's level, not just when the quest is unlocked.
-                local mobLevel = bossLevelOf and bossLevelOf(q.mob)
-                local bossOk = bossAllowed and (mobLevel == nil
-                    or math.abs(mobLevel - level) <= bossWindow)
-                if bossOk and (bossLevel == nil or q.level > bossLevel) then
+            if bossAllowed and bossNameIs(q.mob or "") then
+                if bossLevel == nil or q.level > bossLevel then
                     bossQ, bossLevel = q, q.level
                 end
             elseif (q.count or 0) > 1 then
@@ -1368,76 +1360,30 @@ bossNameIs = function(name)
     return false
 end
 
-local function pickBoss(root, range, mobName)
+local function pickBoss(root, range)
     if not root then return nil end
     local level = getMyLevel()
-    local window = CONFIG.BossLevelWindow or 25
-    local wanted
-    if mobName then
-        wanted = mobKey(tostring(mobName)):lower():gsub("^the ", "")
-    end
-    local best, bestD = nil, math.huge
-
+    local best, bestD, fallback, fallbackD = nil, nil, nil, nil
     for _, mob in ipairs(collectEnemies(tick())) do
         local key = bossKeyOf(mob)
-        local matchesName = true
-
-        if key and wanted then
-            matchesName = key:lower():gsub("^the ", "") == wanted
-        end
-
-        if key and matchesName then
+        if key then
             local anchor = anchorOf(mob)
             if anchor then
                 local d = (anchor.Position - root.Position).Magnitude
                 if d <= range then
+                    -- A boss whose level is unknown, or far above the level of
+                    -- the player, is only taken when nothing better is around.
                     local bossLevel = BOSS_LEVELS[key]
-
-                    -- Bosses are only taken when their level is close to the
-                    -- player, so a level 700 player is not thrown at a level
-                    -- 600 boss. The quest boss itself is always allowed if its
-                    -- level table is missing.
-                    local levelOk = bossLevel == nil
-                        or math.abs(bossLevel - level) <= window
-
-                    if levelOk and d < bestD then
+                    if bossLevel == nil or bossLevel > level + 25 then
+                        if fallbackD == nil or d < fallbackD then fallback, fallbackD = mob, d end
+                    elseif bestD == nil or d < bestD then
                         best, bestD = mob, d
                     end
                 end
             end
         end
     end
-
-    return best
-end
-
--- The level of a boss quest mob, global because the quest picker is defined
--- earlier in the chunk than the boss tables.
-bossLevelOf = function(name)
-    if not name then return nil end
-    local key = mobKey(name):lower()
-    if BOSS_LEVELS[key] then return BOSS_LEVELS[key] end
-    if key:sub(1, 4) == "the " then
-        return BOSS_LEVELS[key:sub(5)]
-    end
-    return BOSS_LEVELS["the " .. key]
-end
-
--- While the quest boss is dead the bot farms normal mobs around the spawn
--- instead of standing still. Bosses are never returned here.
-pickNormal = function(root)
-    if not root then return nil end
-    local best, bestD = nil, math.huge
-    for _, mob in ipairs(collectEnemies(tick())) do
-        if not bossKeyOf(mob) then
-            local anchor = anchorOf(mob)
-            if anchor then
-                local d = (anchor.Position - root.Position).Magnitude
-                if d < bestD then best, bestD = mob, d end
-            end
-        end
-    end
-    return best
+    return best or fallback
 end
 
 local function getTarget(mobName)
@@ -2139,9 +2085,8 @@ end
 
 local function hitPartOf(mob)
     if not mob then return nil end
-    -- live spy uses limb parts (RightHand, LeftLowerArm)
+    -- logs show the game often uses limb parts (RightHand, LeftUpperLeg, etc.)
     return mob:FindFirstChild("RightHand")
-        or mob:FindFirstChild("LeftLowerArm")
         or mob:FindFirstChild("LeftHand")
         or mob:FindFirstChild("RightUpperArm")
         or mob:FindFirstChild("Head")
@@ -2149,6 +2094,10 @@ local function hitPartOf(mob)
         or anchorOf(mob)
 end
 
+-- Every mob close to the player goes into one swing. Like the hub, each mob
+-- goes in as a pair of its rig and the part that was hit, and the target is
+-- the first one: the game takes that part on its own and the whole list with
+-- it, so a single swing lands on all of them.
 local function aoePairs(root, target)
     local range = CONFIG.AoeRange or 80
     local out, seen = {}, {}
@@ -2168,6 +2117,8 @@ local function aoePairs(root, target)
     return out
 end
 
+-- The folder that holds the remotes of the game is looked up once: it does not
+-- change while a server runs, and the way to it was walked on every swing.
 local function netFolder()
     if state.netCache and state.netCache.Parent then return state.netCache end
     local modules = ReplicatedStorage:FindFirstChild("Modules")
@@ -2175,6 +2126,8 @@ local function netFolder()
     return state.netCache
 end
 
+-- The hub fires the hit remote through the Net wrapper of the game; the raw
+-- remote is the fallback when that wrapper is not there.
 local function hitRemote()
     if state.hitRemoteCache and state.hitRemoteCache.Parent then
         return state.hitRemoteCache
@@ -2199,6 +2152,8 @@ local function attackRemote()
     return state.attackRemoteCache
 end
 
+-- Game hit path (2025+): PlayerScripts exposes _G.SendHitsToServer(closestPart, hits)
+-- RegisterAttack takes cooldown only. LeftClickRemote on the tool is also used.
 local function getSendHits()
     if state.sendHitsFn then return state.sendHitsFn end
     pcall(function()
@@ -2222,9 +2177,6 @@ local function getSendHits()
     return state.sendHitsFn
 end
 
--- Auto attack from spy-verified path (bloxfruit-13-5)
--- RegisterAttack(animLen, combo)
--- RegisterHit(part, list, nil, hexId)
 local function remoteAttack(target, tool)
     local root = getRoot()
     local pairs_ = aoePairs(root, target)
@@ -2236,6 +2188,9 @@ local function remoteAttack(target, tool)
     if not closest then return false end
     local fired = false
 
+    -- exact shape from live remote spy:
+    -- RegisterAttack(0.4, combo)
+    -- RegisterHit(LeftLowerArm, {}, [4]="0929ad3b")
     local animLen = attackAnimLength(tool)
     if type(animLen) ~= "number" or animLen <= 0 then animLen = 0.4 end
 
@@ -2247,27 +2202,33 @@ local function remoteAttack(target, tool)
         end
     end)
 
+    -- build hit id like the game (8 hex chars)
     state.attackId = (state.attackId or math.floor(tick() * 1000) % 0xFFFFFF) + 1
     local id = string.format("%08x", state.attackId % 0xFFFFFFFF)
 
+    -- AOE list: use real pairs when Aoe is on, else empty {} like the spy sample
     local hitList = pairs_
     if not CONFIG.Aoe or #pairs_ <= 1 then
+        -- spy showed {} when only registering the primary part
         hitList = {}
     end
 
     local hit = hitRemote()
     pcall(function()
         if hit then
+            -- args: [1]=part, [2]=list, [3]=nil, [4]=id
             hit:FireServer(closest, hitList, nil, id)
             fired = true
         end
     end)
 
+    -- also fire the internal sender if the executor exposes it
     local send = getSendHits()
     if send then
         pcall(function() send(closest, pairs_) end)
     end
 
+    -- LeftClickRemote backup
     pcall(function()
         local left = tool and tool:FindFirstChild("LeftClickRemote")
         if left and root then
@@ -2282,9 +2243,6 @@ end
 local function doAttack(tool, target)
     if not tool then return false end
     local char = LocalPlayer.Character
-    -- The stun of this game is a client value that can stay up while the mobs
-    -- are around: refusing to swing on it is what made the farm hit nothing.
-    -- It is zeroed here instead, the way the hubs do it.
     local stun = char and char:FindFirstChild("Stun")
     if stun then
         pcall(function()
@@ -2296,21 +2254,29 @@ local function doAttack(tool, target)
         end)
     end
     if CONFIG.FastAttack then fastAttack() end
-    -- The combat-state helper of the game is not a gate here: the cooldown of
-    -- the script and the stun above already decide. A helper that reports a
-    -- stale "cannot attack" is what left the bot swinging at nothing.
+
     local remote = false
     if CONFIG.RemoteAttack then
         remote = remoteAttack(target, tool)
     else
         state.aoeCount = 1
     end
-    -- a fruit in hand is eaten by its activation, never used as a swing
     if isFruit(tool) then return remote end
-    -- The real swing goes out as well: it is the fallback of the packet. A
-    -- remote the server drops still counts as fired here, and the old early
-    -- return left the bot standing over a mob that never lost health. In
-    -- reach the swing costs nothing; out of reach it simply misses.
+
+    -- also try the game CombatController attack path
+    pcall(function()
+        local ps = ReplicatedStorage:FindFirstChild("Controllers")
+            or (LocalPlayer:FindFirstChild("PlayerScripts") and LocalPlayer.PlayerScripts)
+        local mod = ps and (ps:FindFirstChild("CombatController") or ps:FindFirstChild("CombatFramework"))
+        if mod then
+            local ok, ctrl = pcall(require, mod)
+            if ok and ctrl and ctrl.Attack then
+                ctrl:Attack(tool)
+                remote = true
+            end
+        end
+    end)
+
     local ok = pcall(function() tool:Activate() end)
     return ok or remote
 end
@@ -3598,36 +3564,12 @@ local function step()
 
     local quest = CONFIG.AutoQuest and questFor(getMyLevel()) or nil
     local mob = quest and quest.mob or nil
-    local bossWindow = CONFIG.BossLevelWindow or 25
-    local function bossAllowedFor(name)
-        if not CONFIG.BossFarm or not bossNameIs(name) then return false end
-        local level = bossLevelOf and bossLevelOf(name)
-        return level == nil or math.abs(level - getMyLevel()) <= bossWindow
-    end
-    if info and info.target then
-        -- The live quest overrides the guide, unless it is a boss the boss
-        -- farm is not allowed to take.
-        if not bossNameIs(info.target) or bossAllowedFor(info.target) then
-            mob = info.target
-        end
-    end
+    if info and info.target then mob = info.target end
 
-    local target
-    if mob and bossNameIs(mob) then
-        if bossAllowedFor(mob) then
-            -- Prefer the exact quest boss; no other boss is taken instead.
-            target = pickBoss(root, CONFIG.BossRange or 3000, mob)
-            -- The boss is dead or out of range: farm normal mobs around the
-            -- spawn and pick the boss up again when it respawns.
-            if not target then target = pickNormal(root) end
-        else
-            -- Boss farm off, or the boss is too far from the player's level.
-            -- Do not let the normal quest picker walk into it anyway.
-            mob = nil
-            target = pickNormal(root)
-        end
-    else
-        target = getTarget(mob)
+    local target = getTarget(mob)
+    if CONFIG.BossFarm then
+        local boss = pickBoss(root, CONFIG.BossRange or 3000)
+        if boss then target = boss end
     end
     if state.saberTarget then
         -- a running quest knows which mob it needs
@@ -4706,7 +4648,7 @@ makeHeader("BOSS FARM")
 makeToggle("Farm Bosses", CONFIG.BossFarm, function(v) CONFIG.BossFarm = v end)
 makeSlider("Boss Range", 500, 8000, CONFIG.BossRange,
     function(v) return v.." studs" end, function(v) CONFIG.BossRange = v end)
-makeHint("Bosses are only chased when the current quest actually wants a boss")
+makeHint("Takes the nearest boss of the player's level over the quest mob")
 
 makeHeader("MELEE SHOP (buy)")
 makeToggle("Auto Buy Styles (in order)", CONFIG.AutoBuyStyles,
