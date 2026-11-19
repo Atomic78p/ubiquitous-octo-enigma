@@ -2185,57 +2185,52 @@ local function remoteAttack(target, tool)
     state.attackCombo = ((state.attackCombo or 0) % 4) + 1
     local combo = state.attackCombo
     local closest = pairs_[1][2]
-    if not closest then return false end
     local fired = false
 
-    -- exact shape from live remote spy:
-    -- RegisterAttack(0.4, combo)
-    -- RegisterHit(LeftLowerArm, {}, [4]="0929ad3b")
-    local animLen = attackAnimLength(tool)
-    if type(animLen) ~= "number" or animLen <= 0 then animLen = 0.4 end
-
-    local regAttack = attackRemote()
-    pcall(function()
-        if regAttack then
-            regAttack:FireServer(animLen, combo)
-            fired = true
-        end
-    end)
-
-    -- build hit id like the game (8 hex chars)
-    state.attackId = (state.attackId or math.floor(tick() * 1000) % 0xFFFFFF) + 1
-    local id = string.format("%08x", state.attackId % 0xFFFFFFFF)
-
-    -- AOE list: use real pairs when Aoe is on, else empty {} like the spy sample
-    local hitList = pairs_
-    if not CONFIG.Aoe or #pairs_ <= 1 then
-        -- spy showed {} when only registering the primary part
-        hitList = {}
-    end
-
-    local hit = hitRemote()
-    pcall(function()
-        if hit then
-            -- args: [1]=part, [2]=list, [3]=nil, [4]=id
-            hit:FireServer(closest, hitList, nil, id)
-            fired = true
-        end
-    end)
-
-    -- also fire the internal sender if the executor exposes it
-    local send = getSendHits()
-    if send then
-        pcall(function() send(closest, pairs_) end)
-    end
-
-    -- LeftClickRemote backup
+    -- 1) tool LeftClickRemote (current melee path)
     pcall(function()
         local left = tool and tool:FindFirstChild("LeftClickRemote")
-        if left and root then
+        if left and closest and root then
             left:FireServer((closest.Position - root.Position).Unit, combo)
             fired = true
         end
     end)
+
+    -- 2) RegisterAttack(cooldown) — modern single-arg form
+    local regAttack = attackRemote()
+    local cd = 0.05
+    pcall(function()
+        if tool and tool:FindFirstChild("Cooldown") then
+            cd = math.min(tonumber(tool.Cooldown.Value) or 0.05, 0.05)
+        end
+    end)
+    if combo >= 4 then cd = cd + 0.05 end
+    pcall(function()
+        if regAttack then
+            regAttack:FireServer(cd)
+            fired = true
+        end
+    end)
+
+    -- 3) internal SendHitsToServer(closestPart, {{mob,part},...})
+    local send = getSendHits()
+    if send and closest then
+        local ok = pcall(function()
+            send(closest, pairs_)
+        end)
+        if ok then fired = true end
+    end
+
+    -- 4) fallback RegisterHit shapes (older servers)
+    local hit = hitRemote()
+    if hit and closest then
+        pcall(function() hit:FireServer(closest, pairs_) end)
+        pcall(function()
+            state.attackId = (state.attackId or 0) + 1
+            hit:FireServer(closest, pairs_, nil, string.format("%08x", state.attackId))
+        end)
+        fired = true
+    end
 
     return fired
 end
