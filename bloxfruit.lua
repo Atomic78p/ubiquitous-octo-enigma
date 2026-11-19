@@ -65,7 +65,7 @@ CONFIG = {
     WarpClose       = true,
     WarpDistance    = 60,
     HoverHeight     = 7,
-    Dodge           = true,
+    Dodge           = false,
     DodgeRadius     = 14,
     DodgeSpeed      = 90,
     FruitScanRadius = 5000,
@@ -2193,74 +2193,117 @@ local function attackRemote()
     return state.attackRemoteCache
 end
 
--- Exact shape from remote spy:
--- RegisterAttack(0.4, 2)
--- RegisterHit(LeftLowerArm, {}, [4]="0929ad3b")
+local function getSendHits()
+    if state.sendHitsFn then return state.sendHitsFn end
+    pcall(function()
+        if getsenv then
+            local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+            if ps then
+                for _, ls in ipairs(ps:GetChildren()) do
+                    if ls:IsA("LocalScript") then
+                        local env = getsenv(ls)
+                        if env then
+                            local fn = (env._G and env._G.SendHitsToServer) or env.SendHitsToServer
+                            if type(fn) == "function" then
+                                state.sendHitsFn = fn
+                                return
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if getrenv then
+            local env = getrenv()
+            local fn = env and env._G and env._G.SendHitsToServer
+            if type(fn) == "function" then state.sendHitsFn = fn end
+        end
+    end)
+    return state.sendHitsFn
+end
+
+-- Multi-path attack. Server often ignores raw RegisterHit without the
+-- game's own SendHitsToServer / LeftClickRemote path.
 local function remoteAttack(target, tool)
-    local regAttack = attackRemote()
-    if not regAttack then return false end
-    local hit = hitRemote()
-    if not hit then return false end
     local root = getRoot()
     local pairs_ = aoePairs(root, target)
     if #pairs_ == 0 then return false end
-
     local primary = pairs_[1][2]
+    local mob = pairs_[1][1]
     if not primary then return false end
 
+    state.aoeCount = #pairs_
     state.attackCombo = ((state.attackCombo or 1) % 4) + 1
+    local combo = state.attackCombo
     local animLen = attackAnimLength(tool)
     if type(animLen) ~= "number" or animLen <= 0 then animLen = 0.4 end
-    pcall(function() regAttack:FireServer(animLen, state.attackCombo) end)
-    state.aoeCount = #pairs_
+    local fired = false
 
-    -- single target: {} like spy; multi: full {{mob,part},...}
-    local hitList = {}
-    if CONFIG.Aoe and #pairs_ > 1 then
-        hitList = pairs_
+    -- 1) game-internal sender (most reliable when executor has getsenv)
+    local send = getSendHits()
+    if send then
+        local ok = pcall(function() send(primary, pairs_) end)
+        if ok then fired = true end
     end
 
-    state.attackId = (state.attackId or math.floor(tick() * 1000) % 0xFFFFFF) + 1
-    local id = string.format("%08x", state.attackId % 0xFFFFFFFF)
+    -- 2) RegisterAttack — spy shape (animLen, combo)
+    local regAttack = attackRemote()
+    if regAttack then
+        pcall(function() regAttack:FireServer(animLen, combo) end)
+        pcall(function() regAttack:FireServer(animLen) end)
+        fired = true
+    else
+        dbg("RegisterAttack remote missing")
+    end
 
-    local ok = pcall(function()
-        hit:FireServer(primary, hitList, nil, id)
+    -- 3) RegisterHit — try both list shapes from spy samples
+    local hit = hitRemote()
+    if hit then
+        state.attackId = (state.attackId or math.floor(tick() * 1000) % 0xFFFFFF) + 1
+        local id = string.format("%08x", state.attackId % 0xFFFFFFFF)
+        pcall(function() hit:FireServer(primary, {}, nil, id) end)
+        pcall(function() hit:FireServer(primary, pairs_, nil, id) end)
+        pcall(function() hit:FireServer(primary, pairs_) end)
+        fired = true
+    else
+        dbg("RegisterHit remote missing")
+    end
+
+    -- 4) tool LeftClickRemote
+    pcall(function()
+        local left = tool and tool:FindFirstChild("LeftClickRemote")
+        if left and root then
+            left:FireServer((primary.Position - root.Position).Unit, combo)
+            fired = true
+        end
     end)
-    return ok
+
+    if not send and not state.warnedNoSendHits then
+        state.warnedNoSendHits = true
+        dbg("SendHitsToServer not found (needs getsenv) — raw remotes may not damage")
+    end
+    return fired
 end
 
 local function doAttack(tool, target)
     if not tool then return false end
     local char = LocalPlayer.Character
-    -- The stun of this game is a client value that can stay up while the mobs
-    -- are around: refusing to swing on it is what made the farm hit nothing.
-    -- It is zeroed here instead, the way the hubs do it.
     local stun = char and char:FindFirstChild("Stun")
     if stun then
         pcall(function()
-            if stun:IsA("BoolValue") then
-                stun.Value = false
-            else
-                stun.Value = 0
-            end
+            if stun:IsA("BoolValue") then stun.Value = false else stun.Value = 0 end
         end)
     end
     if CONFIG.FastAttack then fastAttack() end
-    -- The combat-state helper of the game is not a gate here: the cooldown of
-    -- the script and the stun above already decide. A helper that reports a
-    -- stale "cannot attack" is what left the bot swinging at nothing.
+
     local remote = false
     if CONFIG.RemoteAttack then
         remote = remoteAttack(target, tool)
     else
         state.aoeCount = 1
     end
-    -- a fruit in hand is eaten by its activation, never used as a swing
     if isFruit(tool) then return remote end
-    -- The real swing goes out as well: it is the fallback of the packet. A
-    -- remote the server drops still counts as fired here, and the old early
-    -- return left the bot standing over a mob that never lost health. In
-    -- reach the swing costs nothing; out of reach it simply misses.
+
     local ok = pcall(function() tool:Activate() end)
     return ok or remote
 end
