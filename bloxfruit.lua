@@ -1,5 +1,78 @@
 -- // Blox Fruits Auto-Farm — Fixed Build
 print("[Farm] build start")
+-- One live copy of the bot is allowed. A second execution first tears the old
+-- copy down; the generation check makes every old task leave instead of
+-- running a second farm beside the new one.
+-- Apex executes injected chunks in an isolated script VM. Keep the registry in
+-- the executor's shared environment as well as in this chunk, so a later
+-- execution can stop the previous copy and live diagnostics can inspect the
+-- same runtime that the farm is actually using.
+FarmRuntime = (getgenv and getgenv().FarmRuntime) or _G.FarmRuntime or {}
+if getgenv then getgenv().FarmRuntime = FarmRuntime end
+if _G then _G.FarmRuntime = FarmRuntime end
+local runtime = {
+    generation = (FarmRuntime.generation or 0) + 1,
+    running = true,
+    hookConnections = {},
+    characterConnections = {},
+    inputConnections = {},
+    tasks = {},
+    steppedConn = nil,
+    gui = nil,
+    disposed = false,
+    cleanupFns = {},
+    characterEpoch = 0,
+    state = nil,
+    config = nil,
+}
+runtime.isCurrent = function()
+    return runtime.running and FarmRuntime.current == runtime
+end
+if FarmRuntime.current and FarmRuntime.current.running
+    and type(FarmRuntime.stop) == "function" then
+    pcall(FarmRuntime.stop)
+end
+FarmRuntime.generation = runtime.generation
+FarmRuntime.current = runtime
+-- One idempotent teardown owns the whole run. The gameplay cleanup functions
+-- register themselves below, when they exist; the early part still cancels
+-- tasks and disconnects listeners if a second execution arrives while this
+-- chunk is still being built.
+FarmRuntime.stop = function()
+    if runtime.disposed then return end
+    runtime.disposed = true
+    runtime.running = false
+    runtime.characterEpoch = (runtime.characterEpoch or 0) + 1
+    if runtime.state then runtime.state.enabled = false end
+    for _, cleanup in ipairs(runtime.cleanupFns or {}) do
+        pcall(cleanup)
+    end
+    if runtime.hitThread then
+        runtime.hitRequest = {stop = true}
+        pcall(coroutine.resume, runtime.hitThread)
+        runtime.hitThread = nil
+        runtime.hitRequest = nil
+        runtime.hitResult = nil
+    end
+    for _, thread in ipairs(runtime.tasks or {}) do pcall(task.cancel, thread) end
+    for _, connection in ipairs(runtime.hookConnections or {}) do
+        pcall(function() connection:Disconnect() end)
+    end
+    for _, connection in ipairs(runtime.characterConnections or {}) do
+        pcall(function() connection:Disconnect() end)
+    end
+    for _, connection in ipairs(runtime.inputConnections or {}) do
+        pcall(function() connection:Disconnect() end)
+    end
+    if runtime.steppedConn then pcall(function() runtime.steppedConn:Disconnect() end) end
+    if runtime.gui then pcall(function() runtime.gui:Destroy() end) end
+    runtime.hookConnections = {}
+    runtime.characterConnections = {}
+    runtime.inputConnections = {}
+    runtime.tasks = {}
+    runtime.steppedConn = nil
+    runtime.gui = nil
+end
 -- The services are put in the global table on purpose: the script has a hard
 -- limit of 200 locals in one chunk, and it is already close to it.
 Players           = game:GetService("Players")
@@ -10,9 +83,50 @@ UserInputService  = game:GetService("UserInputService")
 TweenService      = game:GetService("TweenService")
 LocalPlayer       = Players.LocalPlayer
 
+-- Streaming and simulation are client-wide settings. Capture the values that
+-- were in place before this run changes them and put them back when the farm
+-- is stopped. A second execution first stops the old copy, so the old run
+-- restores its settings before the new run captures them.
+runtime.captureClientGlobals = function()
+    local ok, value = pcall(function() return Workspace.StreamingEnabled end)
+    if ok then runtime.originalStreamingEnabled = value end
+    ok, value = pcall(function() return Workspace.StreamingMinRadius end)
+    if ok then runtime.originalStreamingMinRadius = value end
+    ok, value = pcall(function() return Workspace.StreamingTargetRadius end)
+    if ok then runtime.originalStreamingTargetRadius = value end
+    ok, value = pcall(function() return LocalPlayer.SimulationRadius end)
+    if ok then runtime.originalSimulationRadius = value end
+    ok, value = pcall(function() return LocalPlayer.MaxSimulationRadius end)
+    if ok then runtime.originalMaxSimulationRadius = value end
+end
+runtime.restoreClientGlobals = function()
+    if runtime.originalStreamingEnabled ~= nil then
+        pcall(function() Workspace.StreamingEnabled = runtime.originalStreamingEnabled end)
+    end
+    if runtime.originalStreamingMinRadius ~= nil then
+        pcall(function() Workspace.StreamingMinRadius = runtime.originalStreamingMinRadius end)
+    end
+    if runtime.originalStreamingTargetRadius ~= nil then
+        pcall(function() Workspace.StreamingTargetRadius = runtime.originalStreamingTargetRadius end)
+    end
+    if runtime.originalSimulationRadius ~= nil then
+        if sethiddenproperty then
+            pcall(function() sethiddenproperty(LocalPlayer, "SimulationRadius", runtime.originalSimulationRadius) end)
+        end
+        pcall(function() LocalPlayer.SimulationRadius = runtime.originalSimulationRadius end)
+    end
+    if runtime.originalMaxSimulationRadius ~= nil then
+        if sethiddenproperty then
+            pcall(function() sethiddenproperty(LocalPlayer, "MaxSimulationRadius", runtime.originalMaxSimulationRadius) end)
+        end
+        pcall(function() LocalPlayer.MaxSimulationRadius = runtime.originalMaxSimulationRadius end)
+    end
+end
+runtime.captureClientGlobals()
 pcall(function() Workspace.StreamingEnabled = false end)
 pcall(function() Workspace.StreamingMinRadius = 1e8 end)
 pcall(function() Workspace.StreamingTargetRadius = 1e8 end)
+table.insert(runtime.cleanupFns, function() runtime.restoreClientGlobals() end)
 
 -- ================= CONFIG =================
 -- CONFIG and state live in the global table: the chunk is at the limit of
@@ -26,7 +140,8 @@ CONFIG = {
     QuestTurnIn     = true,
     AntiAfk         = true,
     AntiAfkInterval = 120,
-    AttackCooldown  = 0.06,
+    -- Extra delay only. The normal cadence comes from the real animation.
+    AttackCooldown  = 0,
     FastAttack      = true,
     RemoteAttack    = true,
     HitboxMagnitude = 120,
@@ -36,11 +151,22 @@ CONFIG = {
     FruitRange      = 70,
     AutoBuyStyles   = false,
     AutoSaber       = false,
+    AutoSaberTimeout = 90,
     MeleeHover      = 4,
     BringMob        = true,
     BringMobRange   = 60,
     BringMobCount   = 5,
-    BringMobSearch  = 300,
+    -- The proven Bring Mobs source searches the same-name pack up to 3000
+    -- studs away. Ownership and the BringMobMax cap keep that bounded.
+    BringMobSearch  = 3000,
+    -- A locally owned extra is snapped into its ring slot once. The body
+    -- mover then follows the player; the snap is only the fast first step.
+    BringMobSnap    = true,
+    BringMobSnapDistance = 4,
+    -- Carry the target under the player when this client owns it. A
+    -- server-owned target keeps the source's reliable layout instead: the
+    -- extras are packed around it and the player walks to the target.
+    BringMobCarryTarget = true,
     -- "Lock" is the mover of this script and it is what works. "Game" tries
     -- the body mover of the game instead, but that one is made for the local
     -- character, so a mob is left where it stands (kept for testing only).
@@ -57,7 +183,7 @@ CONFIG = {
     AutoBuso        = true,
     Aoe             = true,
     AoeRange        = 130,
-    BringMobMax     = 5,
+    BringMobMax     = 10,
     BossFarm        = false,
     BossQuestPriority = true,
     BossRange       = 3000,
@@ -138,27 +264,72 @@ state = {
     questPos      = nil,
     statAt        = 0,
     shopping      = false,
+    shopInFlight  = false,
+    shopToken     = 0,
+    shopUnknown   = {},
     flying        = false,
     whirlpooling  = false,
     questing      = false,
     bringHeld     = setmetatable({}, {__mode = "k"}),
     bringSaved    = setmetatable({}, {__mode = "k"}),
+    bringSnapped  = setmetatable({}, {__mode = "k"}),
+    bringCarryingTarget = setmetatable({}, {__mode = "k"}),
     bringSlot     = setmetatable({}, {__mode = "k"}),
     bringSlotCount = 0,
     bringMoved    = setmetatable({}, {__mode = "k"}),
     bringIgnored  = setmetatable({}, {__mode = "k"}),
     bringHealth   = setmetatable({}, {__mode = "k"}),
+    bringOwned    = setmetatable({}, {__mode = "k"}),
     bringPoint    = nil,
     bringTarget   = nil,
     bringCentre   = nil,
+    bringMover    = setmetatable({}, {__mode = "k"}),
     bringMoverId  = setmetatable({}, {__mode = "k"}),
     bringMoverSeq = 0,
     questVerified = false,
     questGaveUp   = false,
     hitsConfirmed = 0,
     hitRemoteHooked = false,
+    hitUseFallback = false,
     statsHooked   = false,
     attackSpeed   = 1,
+    attackCombo   = 0,
+    attackComboAt = 0,
+    attackComboCount = 1,
+    attackNextCombo = 1,
+    attackNextAt  = 0,
+    attackWeapon  = nil,
+    attackAnimLength = 0.5,
+    attackDispatched = false,
+    attackHitDispatched = false,
+    attackConfirmed = false,
+    attackFallback = false,
+    attackComboSent = false,
+    aoeCount      = 0,
+    aoeRequested  = 0,
+    aoeConfirmed  = 0,
+    gunInput      = nil,
+    saberActive   = false,
+    saberLockAt   = 0,
+    saberProgressAt = 0,
+    saberKillHealth = nil,
+    saberKillDamaged = false,
+    saberKillTarget = nil,
+    saberProgress = nil,
+    saberStateAt = 0,
+    saberFingerprint = "",
+    saberSickDone = false,
+    saberSonDone = false,
+    saberAttemptKey = nil,
+    saberAttemptAt = 0,
+    saberAttempts = {},
+    saberCupRequestAt = 0,
+    saberCupGranted = false,
+    saberFillRequestAt = 0,
+    saberRelicRequestAt = 0,
+    saberRelicGranted = false,
+    saberPlaceRequestAt = 0,
+    saberPlaceAccepted = false,
     turnInFailed  = false,
     turnInFailedAt = 0,
     seekSince     = nil,
@@ -169,19 +340,95 @@ state = {
     fruitTools    = nil,
 }
 
+runtime.config = CONFIG
+runtime.state = state
+
+-- Transient state is reset as one unit. A disabled bot, a character change, a
+-- Saber timeout and a fresh enable must never inherit an old attack combo,
+-- prompt throttle, burst window or half-finished puzzle action.
+runtime.resetSaberState = function()
+    local s = runtime.state
+    s.saberActive = false
+    s.saberTarget = nil
+    s.saberAt = nil
+    s.saberLockAt = 0
+    s.saberProgressAt = 0
+    s.saberKillHealth = nil
+    s.saberKillDamaged = false
+    s.saberKillTarget = nil
+    s.saberProgress = nil
+    s.saberStateAt = 0
+    s.saberFingerprint = ""
+    s.saberSickDone = false
+    s.saberSonDone = false
+    s.saberAttemptKey = nil
+    s.saberAttemptAt = 0
+    s.saberAttempts = {}
+    s.saberCupRequestAt = 0
+    s.saberCupGranted = false
+    s.saberFillRequestAt = 0
+    s.saberRelicRequestAt = 0
+    s.saberRelicGranted = false
+    s.saberPlaceRequestAt = 0
+    s.saberPlaceAccepted = false
+end
+
+runtime.stopGunInput = function()
+    local tracked = runtime.state.gunInput
+    if not tracked then return end
+    runtime.state.gunInput = nil
+    pcall(function() tracked.input.UserInputState = Enum.UserInputState.End end)
+    pcall(function() tracked.changed:Fire() end)
+    pcall(function() tracked.changed:Destroy() end)
+end
+
+runtime.resetCombatState = function()
+    local s = runtime.state
+    if runtime.stopGunInput then runtime.stopGunInput() end
+    if runtime.hitThread then
+        runtime.hitRequest = {stop = true}
+        pcall(coroutine.resume, runtime.hitThread)
+    end
+    runtime.hitSessionId, runtime.hitThread, runtime.hitThreadRemote = nil, nil, nil
+    runtime.hitRequest, runtime.hitResult = nil, nil
+    runtime.hitHandshakeOk, runtime.hitHandshakeError = false, nil
+    s.lastAttack, s.attackNextAt = 0, 0
+    s.attackCombo, s.attackComboAt, s.attackComboCount = 0, 0, 1
+    s.attackNextCombo, s.attackWeapon = 1, nil
+    s.attackAnimLength = 0.5
+    s.attackDispatched, s.attackHitDispatched = false, false
+    s.attackConfirmed, s.attackFallback, s.attackComboSent = false, false, false
+    s.aoeCount, s.aoeRequested, s.aoeConfirmed = 0, 0, 0
+    s.hitsConfirmed = 0
+    s.lastHitAt, s.lastHitMob = nil, nil
+    s.combatUtil, s.combatUtilMod = nil, nil
+    s.netModule, s.netModuleInstance = nil, nil
+    s.hitRemoteCache, s.attackRemoteCache = nil, nil
+    s.hitUseFallback = false
+end
+
+runtime.resetTransient = function()
+    runtime.resetSaberState()
+    runtime.resetCombatState()
+    local s = runtime.state
+    s.lastPrompt, s.promptAt = nil, 0
+    s.autoBurst, s.autoBurstCd = 0, 0
+    s.questing = false
+end
+
 local grabbedFruits = setmetatable({}, {__mode = "k"})
 
 local function dbg(msg)
-    if msg == state.debugMsg then
-        state.debugCount = state.debugCount + 1
-        state.debugLine = msg .. " (x" .. state.debugCount .. ")"
+    if msg == runtime.state.debugMsg then
+        runtime.state.debugCount = runtime.state.debugCount + 1
+        runtime.state.debugLine = msg .. " (x" .. runtime.state.debugCount .. ")"
     else
-        state.debugMsg = msg
-        state.debugCount = 1
-        state.debugLine = msg
+        runtime.state.debugMsg = msg
+        runtime.state.debugCount = 1
+        runtime.state.debugLine = msg
     end
-    if CONFIG.Debug and msg ~= state.lastPrinted then
-        state.lastPrinted = msg
+    if runtime.config.Debug and msg ~= runtime.state.lastPrinted then
+        runtime.state.lastPrinted = msg
         print("[Farm] " .. msg)
     end
 end
@@ -277,7 +524,7 @@ end
 
 local function weaponRank(tool)
     local n = tool.Name:lower()
-    local group = WEAPON_GROUPS[CONFIG.WeaponMode] or WEAPON_GROUPS.Melee
+    local group = WEAPON_GROUPS[runtime.config.WeaponMode] or WEAPON_GROUPS.Melee
     for i, w in ipairs(group) do
         if n:find(w, 1, true) then return i end
     end
@@ -285,7 +532,7 @@ local function weaponRank(tool)
 end
 
 local function matchesMode(tool)
-    local mode = CONFIG.WeaponMode
+    local mode = runtime.config.WeaponMode
     if mode == "Fruit" then
         return toolKind(tool) == "fruit" or isFruit(tool)
     end
@@ -314,10 +561,10 @@ local function fallbackRank(tool)
 end
 
 local function attackRange(tool)
-    if not tool then return CONFIG.MeleeRange end
-    if isGun(tool) then return CONFIG.GunRange end
-    if isFruit(tool) then return CONFIG.FruitRange or CONFIG.GunRange end
-    return CONFIG.MeleeRange
+    if not tool then return runtime.config.MeleeRange end
+    if isGun(tool) then return runtime.config.GunRange end
+    if isFruit(tool) then return runtime.config.FruitRange or runtime.config.GunRange end
+    return runtime.config.MeleeRange
 end
 
 local function equipWeapon()
@@ -327,8 +574,21 @@ local function equipWeapon()
     local hum = getHumanoid()
     if not hum then return nil end
 
+    -- The game starts its basic combo at one again whenever another weapon is
+    -- equipped. The script keeps the same counter so RegisterAttack carries
+    -- the index the server expects.
+    local function remember(tool)
+        if tool and runtime.state.attackWeapon ~= tool then
+            runtime.state.attackWeapon = tool
+            runtime.state.attackCombo = 0
+            runtime.state.attackComboAt = 0
+            runtime.state.attackNextAt = 0
+        end
+        return tool
+    end
+
     local function equip(item)
-        if tick() < state.equipRetryAt then return nil end
+        if tick() < runtime.state.equipRetryAt then return nil end
         pcall(function() hum:EquipTool(item) end)
         
         if item.Parent ~= char then
@@ -350,7 +610,7 @@ local function equipWeapon()
         end
         
         if item.Parent ~= char then
-            state.equipRetryAt = tick() + 2
+            runtime.state.equipRetryAt = tick() + 2
             dbg("Could not equip " .. item.Name)
             return nil
         end
@@ -358,7 +618,7 @@ local function equipWeapon()
     end
 
     local equipped = char:FindFirstChildOfClass("Tool")
-    if equipped and matchesMode(equipped) then return equipped end
+    if equipped and matchesMode(equipped) then return remember(equipped) end
 
     local carriers = {char}
     if backpack then table.insert(carriers, backpack) end
@@ -368,7 +628,7 @@ local function equipWeapon()
         for _, item in ipairs(container:GetChildren()) do
             if item:IsA("Tool") then
                 order = order + 1
-                if CONFIG.WeaponMode == "Fruit" then
+                if runtime.config.WeaponMode == "Fruit" then
                     if isFruit(item) then
                         table.insert(weapons, {tool = item, rank = 1, order = order})
                     end
@@ -390,12 +650,12 @@ local function equipWeapon()
     end)
 
     for _, entry in ipairs(weapons) do
-        if entry.tool == equipped then return equipped end
+        if entry.tool == equipped then return remember(equipped) end
         local weapon = equip(entry.tool)
-        if weapon then return weapon end
+        if weapon then return remember(weapon) end
     end
 
-    if equipped and not isFruit(equipped) then return equipped end
+    if equipped and not isFruit(equipped) then return remember(equipped) end
 
     table.sort(fallbacks, function(a, b)
         local ra, rb = fallbackRank(a), fallbackRank(b)
@@ -405,33 +665,33 @@ local function equipWeapon()
     local best = fallbacks[1]
     if best then
         local tool = equip(best)
-        if tool then return tool end
+        if tool then return remember(tool) end
     end
 
-    return equipped
+    return remember(equipped)
 end
 
 -- A mob that was made big for the swing is put back the moment the bot turns
 -- to another mob: the size and the collide of the part are only the client's,
 -- but a mob left blown up on screen is a bug the player can see.
 local function restoreHitbox()
-    local part = state.hitboxPart
+    local part = runtime.state.hitboxPart
     if not part then return end
-    state.hitboxPart = nil
-    pcall(function() part.Size = state.hitboxOrigSize end)
-    pcall(function() part.CanCollide = state.hitboxOrigCollide end)
+    runtime.state.hitboxPart = nil
+    pcall(function() part.Size = runtime.state.hitboxOrigSize end)
+    pcall(function() part.CanCollide = runtime.state.hitboxOrigCollide end)
 end
 
 local function enlargeHitbox(target)
     local anchor = anchorOf(target)
     if not anchor or not anchor.Size then return end
-    if state.hitboxPart and state.hitboxPart ~= anchor then restoreHitbox() end
-    local size = CONFIG.HitboxSize or 16
+    if runtime.state.hitboxPart and runtime.state.hitboxPart ~= anchor then restoreHitbox() end
+    local size = runtime.config.HitboxSize or 16
     if anchor.Size.X >= size then return end
-    state.hitboxAt = tick()
-    state.hitboxOrigSize = anchor.Size
-    state.hitboxOrigCollide = anchor.CanCollide
-    state.hitboxPart = anchor
+    runtime.state.hitboxAt = tick()
+    runtime.state.hitboxOrigSize = anchor.Size
+    runtime.state.hitboxOrigCollide = anchor.CanCollide
+    runtime.state.hitboxPart = anchor
     pcall(function() anchor.Size = Vector3.new(size, size, size) end)
     pcall(function() anchor.CanCollide = false end)
 end
@@ -565,14 +825,17 @@ local function loadGameQuests()
 end
 
 -- ================= QUEST =================
-local function pickQuest(list, level, only)
+local function pickQuest(list, level, only, bossAllowedOverride)
     local best, fallback, bossQ, bestLevel, fallbackLevel, bossLevel
     -- A boss quest that just could not be finished is left alone for a while,
     -- or the bot would chase the same boss for ever. With the boss farm off
     -- boss quests are not picked at all: the normal mob quest is used instead.
-    local bossAllowed = CONFIG.BossFarm and CONFIG.BossQuestPriority ~= false
-        and (not state.bossQuestCd or tick() > state.bossQuestCd)
-    local bossWindow = CONFIG.BossLevelWindow or 25
+    local bossAllowed = bossAllowedOverride
+    if bossAllowed == nil then
+        bossAllowed = runtime.config.BossFarm and runtime.config.BossQuestPriority ~= false
+            and (not runtime.state.bossQuestCd or tick() > runtime.state.bossQuestCd)
+    end
+    local bossWindow = runtime.config.BossLevelWindow or 25
     for _, q in ipairs(list) do
         if type(q.level) == "number" and q.level <= level and (not only or only[q.name]) then
             if bossNameIs(q.mob or "") then
@@ -599,17 +862,27 @@ local function pickQuest(list, level, only)
 end
 
 local function gameQuestFor(level)
-    if gameQuestCacheAt == level then return gameQuestCache end
+    -- The chosen quest depends on more than the level: turning boss farming on,
+    -- changing its priority or waiting out the boss cooldown must invalidate
+    -- the old answer as well.
+    local now = tick()
+    local bossReady = runtime.config.BossFarm
+        and runtime.config.BossQuestPriority ~= false
+        and (not runtime.state.bossQuestCd or now > runtime.state.bossQuestCd)
+    local cacheKey = tostring(level) .. ":" .. (bossReady and "1" or "0")
+        .. ":" .. tostring(runtime.config.BossQuestPriority)
+        .. ":" .. tostring(runtime.config.BossLevelWindow)
+    if gameQuestCacheAt == cacheKey then return gameQuestCache end
     local best = nil
     if gameGuideQuests and #gameGuideQuests > 0 then
-        best = pickQuest(gameGuideQuests, level, nil)
+        best = pickQuest(gameGuideQuests, level, nil, bossReady)
         if not best and gameLevelQuests and #gameLevelQuests > 0 then
-            best = pickQuest(gameLevelQuests, level, gameGuideNames)
+            best = pickQuest(gameLevelQuests, level, gameGuideNames, bossReady)
         end
     elseif gameLevelQuests and #gameLevelQuests > 0 then
-        best = pickQuest(gameLevelQuests, level, nil)
+        best = pickQuest(gameLevelQuests, level, nil, bossReady)
     end
-    gameQuestCache, gameQuestCacheAt = best, level
+    gameQuestCache, gameQuestCacheAt = best, cacheKey
     return best
 end
 
@@ -619,7 +892,7 @@ local function questFor(level)
         return {name = best.name, index = best.index, mob = best.mob,
                 pos = best.pos, npc = best.npc}
     end
-    for _, q in ipairs(CONFIG.QuestList) do
+    for _, q in ipairs(runtime.config.QuestList) do
         if level >= q[1] and level <= q[2] then
             return {name = q[3], index = q[4], mob = q[5]}
         end
@@ -671,7 +944,7 @@ local function refreshKnownMobs()
             table.insert(list, name)
         end
     end
-    for _, q in ipairs(CONFIG.QuestList) do add(q[5]) end
+    for _, q in ipairs(runtime.config.QuestList) do add(q[5]) end
     for _, m in ipairs(OTHER_MOBS) do add(m) end
     for _, q in ipairs(gameQuests or {}) do add(q.mob) end
     table.sort(list, function(a, b)
@@ -758,8 +1031,10 @@ local function mobAtEnd(text)
     return nil
 end
 
-task.spawn(function()
+table.insert(runtime.tasks, task.spawn(function()
+    if not runtime.running or FarmRuntime.current ~= runtime then return end
     local data = loadGameQuests()
+    if not runtime.running or FarmRuntime.current ~= runtime then return end
     if data then
         gameQuests = data.quests
         gameGuideQuests = data.guide
@@ -767,13 +1042,13 @@ task.spawn(function()
         gameGuideNames = data.guideNames
         gameQuestIndexes = data.indexes
         gameQuestCache, gameQuestCacheAt = nil, nil
-        state.questTried = {}
-        state.questTryKey = nil
-        state.questIndexTry = nil
+        runtime.state.questTried = {}
+        runtime.state.questTryKey = nil
+        runtime.state.questIndexTry = nil
         refreshKnownMobs()
         dbg("Game quest data: " .. #gameQuests .. " quests")
     end
-end)
+end))
 
 local CONNECTORS = {["and"] = true, ["then"] = true, ["plus"] = true}
 
@@ -818,26 +1093,33 @@ local function hookQuestRemote()
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local q = remotes and remotes:FindFirstChild("QuestUpdate")
     if not q then return nil end
+    if questRemoteHooked and runtime.questHookRemote == q then return q end
+    if runtime.questHookConnection then
+        pcall(function() runtime.questHookConnection:Disconnect() end)
+        runtime.questHookConnection = nil
+        questRemoteHooked = false
+    end
     questRemote = q
-    if questRemoteHooked or not q.OnClientEvent then return q end
-    questRemoteHooked = true
-    pcall(function()
-        q.OnClientEvent:Connect(function(data, update)
+    if not q.OnClientEvent then return q end
+    local connection
+    local ok = pcall(function()
+        connection = q.OnClientEvent:Connect(function(data, update)
+            if not runtime.running or FarmRuntime.current ~= runtime then return end
             if data == nil then
                 questRemoteState = nil
-                state.questDone = false
-                state.questDoneMob = nil
-                state.currentQuest = nil
-                state.questSentAt = 0
-                local hadQuest = state.questVerified
-                state.questAsked = nil
-                state.questVerified = false
-                state.questGaveUp = false
-                state.questTryKey = nil
-                state.questNpc = nil
+                runtime.state.questDone = false
+                runtime.state.questDoneMob = nil
+                runtime.state.currentQuest = nil
+                runtime.state.questSentAt = 0
+                local hadQuest = runtime.state.questVerified
+                runtime.state.questAsked = nil
+                runtime.state.questVerified = false
+                runtime.state.questGaveUp = false
+                runtime.state.questTryKey = nil
+                runtime.state.questNpc = nil
                 if hadQuest then
-                    state.questTried = {}
-                    state.questIndexTry = nil
+                    runtime.state.questTried = {}
+                    runtime.state.questIndexTry = nil
                 end
                 dbg("Quest cleared by the game")
                 return
@@ -850,17 +1132,23 @@ local function hookQuestRemote()
             if type(update) == "table" and update.Context == "Complete" then
                 dbg("Quest progress complete: " .. tostring(update.Name))
             end
-            state.questVerified = true
-            state.questGaveUp = false
-            if state.questAsked and data.InternalQuestName ~= state.questAsked then
+            runtime.state.questVerified = true
+            runtime.state.questGaveUp = false
+            if runtime.state.questAsked and data.InternalQuestName ~= runtime.state.questAsked then
                 dbg("The game gave us " .. tostring(data.InternalQuestName)
-                    .. " instead of " .. tostring(state.questAsked))
+                    .. " instead of " .. tostring(runtime.state.questAsked))
             else
-                state.questTried = {}
-                state.questIndexTry = nil
+                runtime.state.questTried = {}
+                runtime.state.questIndexTry = nil
             end
         end)
     end)
+    if ok and connection then
+        questRemoteHooked = true
+        runtime.questHookRemote = q
+        runtime.questHookConnection = connection
+        table.insert(runtime.hookConnections or {}, connection)
+    end
     return q
 end
 
@@ -901,46 +1189,70 @@ local function remoteQuestInfo()
 end
 
 local function hookHitRemote()
-    if state.hitRemoteHooked then return end
     local modules = ReplicatedStorage:FindFirstChild("Modules")
     local net = modules and modules:FindFirstChild("Net")
     local hit = net and net:FindFirstChild("RE/ReceivedHit")
     if not hit or not hit.OnClientEvent then return end
-    state.hitRemoteHooked = true
-    pcall(function()
-        hit.OnClientEvent:Connect(function(player, mob, kind, weapon, part)
-            state.hitsConfirmed = state.hitsConfirmed + 1
-            state.lastHitAt = tick()
-            if mob then state.lastHitMob = mob.Name end
+    if runtime.state.hitRemoteHooked and runtime.hitHookRemote == hit then return end
+    if runtime.hitHookConnection then
+        pcall(function() runtime.hitHookConnection:Disconnect() end)
+        runtime.hitHookConnection = nil
+        runtime.state.hitRemoteHooked = false
+    end
+    local connection
+    local ok = pcall(function()
+        connection = hit.OnClientEvent:Connect(function(player, mob, kind, weapon, part)
+            if not runtime.running or FarmRuntime.current ~= runtime then return end
+            runtime.state.hitsConfirmed = runtime.state.hitsConfirmed + 1
+            runtime.state.lastHitAt = tick()
+            if mob then runtime.state.lastHitMob = mob.Name end
         end)
     end)
+    if ok and connection then
+        runtime.state.hitRemoteHooked = true
+        runtime.hitHookRemote = hit
+        runtime.hitHookConnection = connection
+        table.insert(runtime.hookConnections or {}, connection)
+    end
 end
 
 local function hookStatsRemote()
-    if state.statsHooked then return end
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local stats = remotes and remotes:FindFirstChild("Stats")
     if not stats or not stats.OnClientEvent then return end
-    state.statsHooked = true
-    pcall(function()
-        stats.OnClientEvent:Connect(function(player, key, value)
+    if runtime.state.statsHooked and runtime.statsHookRemote == stats then return end
+    if runtime.statsHookConnection then
+        pcall(function() runtime.statsHookConnection:Disconnect() end)
+        runtime.statsHookConnection = nil
+        runtime.state.statsHooked = false
+    end
+    local connection
+    local ok = pcall(function()
+        connection = stats.OnClientEvent:Connect(function(player, key, value)
+            if not runtime.running or FarmRuntime.current ~= runtime then return end
             if key == "AttackSpeedMultiplier" and type(value) == "number" and value > 0 then
-                state.attackSpeed = value
+                runtime.state.attackSpeed = value
             end
         end)
     end)
+    if ok and connection then
+        runtime.state.statsHooked = true
+        runtime.statsHookRemote = stats
+        runtime.statsHookConnection = connection
+        table.insert(runtime.hookConnections or {}, connection)
+    end
 end
 
 local function questProgressText()
     local s = questRemoteState
-    if not s or not s.Info then return tostring(state.currentQuest) end
+    if not s or not s.Info then return tostring(runtime.state.currentQuest) end
     local task = s.Info.Task or {}
     local progress = s.Progress or {}
     local parts = {}
     for mob, need in pairs(task) do
         table.insert(parts, mob .. " " .. tostring(progress[mob] or 0) .. "/" .. tostring(need))
     end
-    if #parts == 0 then return tostring(s.InternalQuestName or state.currentQuest) end
+    if #parts == 0 then return tostring(s.InternalQuestName or runtime.state.currentQuest) end
     table.sort(parts)
     return table.concat(parts, ", ")
 end
@@ -1038,14 +1350,16 @@ end
 
 local function tryAcceptQuest(info)
     local now = tick()
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
 
     if info and info.confirmed then
-        state.questSeenUntil = now + 1
+        runtime.state.questSeenUntil = now + 1
         return
     end
-    if now < (state.questSeenUntil or 0) then return end
-    if now - state.lastQuestTry < 2 then return end
-    if state.questDone then return end
+    if now < (runtime.state.questSeenUntil or 0) then return end
+    if now - runtime.state.lastQuestTry < 2 then return end
+    if runtime.state.questDone then return end
 
     local q = questFor(getMyLevel())
     if not q then
@@ -1054,63 +1368,69 @@ local function tryAcceptQuest(info)
     end
 
     local key = questKey(q) .. "@" .. tostring(getMyLevel())
-    if state.questTryKey ~= key then
-        state.questTryKey = key
-        state.questTried = {}
-        state.questIndexTry = nil
-        state.questGaveUp = false
+    if runtime.state.questTryKey ~= key then
+        runtime.state.questTryKey = key
+        runtime.state.questTried = {}
+        runtime.state.questIndexTry = nil
+        runtime.state.questGaveUp = false
     end
 
-    if state.questAsked and not state.questVerified then
-        if now - state.questAskedAt < 6 then return end
-        local nextIndex = nextQuestIndex(q, getMyLevel(), state.questTried)
+    if runtime.state.questAsked and not runtime.state.questVerified then
+        if now - runtime.state.questAskedAt < 6 then return end
+        local nextIndex = nextQuestIndex(q, getMyLevel(), runtime.state.questTried)
         if nextIndex then
-            dbg("The game did not take " .. state.questAsked .. " #" .. tostring(state.questIndexTry))
-            state.questIndexTry = nextIndex
-            state.currentQuest = nil
-            state.questAskedAt = now
+            dbg("The game did not take " .. runtime.state.questAsked .. " #" .. tostring(runtime.state.questIndexTry))
+            runtime.state.questIndexTry = nextIndex
+            runtime.state.currentQuest = nil
+            runtime.state.questAskedAt = now
         else
             dbg("The game took no quest of this level, asking a giver")
-            state.questGaveUp = true
-            state.currentQuest = nil
+            runtime.state.questGaveUp = true
+            runtime.state.currentQuest = nil
             return
         end
     end
-    if state.questGaveUp then return end
+    if runtime.state.questGaveUp then return end
 
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if not commF then dbg("CommF_ remote missing"); return end
 
-    local index = state.questIndexTry or q.index
+    local index = runtime.state.questIndexTry or q.index
 
-    pcall(function() commF:InvokeServer("SetLastSpawnPoint", "Town") end)
+    local spawnOk = pcall(function() commF:InvokeServer("SetLastSpawnPoint", "Town") end)
+    if not spawnOk or not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return end
 
     if questRemoteState then
-        pcall(function() commF:InvokeServer("AbandonQuest") end)
+        local abandonOk = pcall(function() commF:InvokeServer("AbandonQuest") end)
+        if not abandonOk or not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return end
     end
     local ok, err = pcall(function() commF:InvokeServer("StartQuest", q.name, index) end)
-    state.currentQuest = q.name .. "#" .. tostring(index)
-    state.questSentAt = tick()
-    state.lastQuestTry = now
-    state.questAsked = q.name
-    if bossNameIs(q.mob or "") then
-        state.bossQuestName = q.mob
-        state.bossQuestUntil = tick() + 180
-    else
-        state.bossQuestName, state.bossQuestUntil = nil, nil
-    end
-    state.questNpc = q.npc
-    state.questPos = q.pos
-    state.questAskedAt = tick()
-    state.questVerified = false
-    state.questIndexTry = index
-    state.questTried[index] = true
-    if ok then
-        dbg("Quest sent: " .. q.name .. " #" .. index)
-    else
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return end
+    if not ok then
         dbg("Quest FAIL: " .. tostring(err))
+        return
     end
+    runtime.state.currentQuest = q.name .. "#" .. tostring(index)
+    runtime.state.questSentAt = tick()
+    runtime.state.lastQuestTry = now
+    runtime.state.questAsked = q.name
+    if bossNameIs(q.mob or "") then
+        runtime.state.bossQuestName = q.mob
+        runtime.state.bossQuestUntil = tick() + 180
+    else
+        runtime.state.bossQuestName, runtime.state.bossQuestUntil = nil, nil
+    end
+    runtime.state.questNpc = q.npc
+    runtime.state.questPos = q.pos
+    runtime.state.questAskedAt = tick()
+    runtime.state.questVerified = false
+    runtime.state.questIndexTry = index
+    runtime.state.questTried[index] = true
+    dbg("Quest sent: " .. q.name .. " #" .. index)
 end
 
 local giverCache, giverCacheAt = {}, -999
@@ -1210,16 +1530,22 @@ local function interactWith(obj, prompt)
     prompt = prompt or promptOf(obj)
     if not prompt then return false end
     local now = tick()
-    if state.lastPrompt == prompt and now - state.promptAt < 3 then return true end
-    state.lastPrompt, state.promptAt = prompt, now
+    if runtime.state.lastPrompt == prompt and now - runtime.state.promptAt < 3 then return false end
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    runtime.state.lastPrompt, runtime.state.promptAt = prompt, now
     if fireproximityprompt then
         pcall(function() fireproximityprompt(prompt) end)
     else
         pcall(function()
             prompt:InputHoldBegin()
-            if task.delay then
-                task.delay(prompt.HoldDuration or 1, function() prompt:InputHoldEnd() end)
-            end
+            table.insert(runtime.tasks, task.spawn(function()
+                task.wait(prompt.HoldDuration or 1)
+                if runtime.isCurrent() and runtime.characterEpoch == epoch
+                    and LocalPlayer.Character == char then
+                    pcall(function() prompt:InputHoldEnd() end)
+                end
+            end))
         end)
     end
     return true
@@ -1285,8 +1611,7 @@ local function collectEnemies(now)
             local hum = e:FindFirstChildOfClass("Humanoid")
             local stuck = stuckTargets[e]
             if hum and hum.Health > 0 and (not stuck or stuck < now)
-                and not e:FindFirstChild("Ignored")
-                and not e:FindFirstChild("FarmIgnored") then
+                and not e:FindFirstChild("Ignored") then
                 table.insert(list, e)
             end
         end
@@ -1296,8 +1621,7 @@ local function collectEnemies(now)
                 local hum = child:FindFirstChildOfClass("Humanoid")
                 local stuck = stuckTargets[child]
                 if hum and hum.Health > 0 and (not stuck or stuck < now)
-                    and not child:FindFirstChild("Ignored")
-                    and not child:FindFirstChild("FarmIgnored") then
+                    and not child:FindFirstChild("Ignored") then
                     table.insert(list, child)
                 end
             end
@@ -1371,7 +1695,7 @@ end
 local function pickBoss(root, range, mobName)
     if not root then return nil end
     local level = getMyLevel()
-    local window = CONFIG.BossLevelWindow or 25
+    local window = runtime.config.BossLevelWindow or 25
     local wanted
     if mobName then
         wanted = mobKey(tostring(mobName)):lower():gsub("^the ", "")
@@ -1463,86 +1787,60 @@ local function ownedByOther(part)
     local chars = Workspace:FindFirstChild("Characters")
     if not chars then return false end
     local now = tick()
-    local cache = state.otherPlayerCache
+    local cache = runtime.state.otherPlayerCache
     if not cache or now - cache.at > 0.1 then
         local list = {}
         for _, c in ipairs(chars:GetChildren()) do
-            if c ~= LocalPlayer.Character then
+            if c.Name ~= LocalPlayer.Name then
                 local hrp = c:FindFirstChild("HumanoidRootPart")
                 if hrp then table.insert(list, hrp) end
             end
         end
         cache = {at = now, list = list}
-        state.otherPlayerCache = cache
+        runtime.state.otherPlayerCache = cache
     end
     for _, hrp in ipairs(cache.list) do
-        if (hrp.Position - part.Position).Magnitude <= 300 then return true end
+        -- Only a player who is really on top of the mob is fighting it. The
+        -- old 300 studs covered the whole camp, so on a populated server every
+        -- mob counted as someone else's and Bring Mob let go of everything.
+        if (hrp.Position - part.Position).Magnitude <= 12 then return true end
     end
     return false
 end
 
--- The pack stands on one point. Like the hub, that point is the spawn point
--- of that mob in the world; the place the mob was first seen is the fallback.
-local function mobSpawnPoint(target, fallback)
-    local origin = Workspace:FindFirstChild("_WorldOrigin")
-    local spawns = origin and origin:FindFirstChild("EnemySpawns")
-    if not spawns then return fallback end
-    local key = mobKey(target.Name)
-    local best, bestD = nil, nil
-    for _, part in ipairs(spawns:GetChildren()) do
-        if part:IsA("BasePart") then
-            local display = nil
-            pcall(function() display = part:GetAttribute("DisplayName") end)
-            local clean = tostring(display or part.Name)
-            clean = clean:gsub("%s*%(Lv%.?%s*%d+%)", "")
-            if mobKey(clean) == key then
-                local d = (part.Position - fallback).Magnitude
-                if bestD == nil or d < bestD then
-                    best, bestD = part.Position, d
-                end
-            end
-        end
-    end
-    return best or fallback
+-- The working Bring Mobs source only teleports an extra when this client
+-- owns its physics. A server-owned rig would snap straight back, while a
+-- locally owned one can be put into the ring immediately and then carried by
+-- the body mover. Never guess ownership: no ownership means no snap.
+runtime.bringLocallyOwned = function(part)
+    if type(isnetworkowner) ~= "function" then return false end
+    local ok, owned = pcall(isnetworkowner, part)
+    return ok and owned == true
 end
 
--- The middle of a camp, straight from the game: the spawn points of that kind
--- that stand around the player. Mobs are born there, so dragging them onto
--- their own camp is a short move - a mob that is far from its spawn is the one
--- that gets stuck, and that is what this avoids. The camp with no spawn point
--- next to the player is the player.
-local function spawnCentre(target, near)
-    local origin = Workspace:FindFirstChild("_WorldOrigin")
-    local spawns = origin and origin:FindFirstChild("EnemySpawns")
-    if not spawns then return nil end
-    local key = mobKey(target.Name)
-    -- The list of spawn points does not change while a camp is farmed, and the
-    -- whole folder is walked for every pull otherwise (twenty times a second).
-    local cache = state.spawnCentreCache
-    if cache and cache.key == key and tick() - cache.at < 0.5 then
-        if not cache.value then return nil end
-        if (cache.value - near).Magnitude <= (CONFIG.BringMobSearch or 200) then
-            return cache.value
-        end
+runtime.bringSnap = function(mob, part, goal)
+    if not runtime.config.BringMobSnap or runtime.state.bringSnapped[mob] then
+        return false
     end
-    local sum, n = nil, 0
-    for _, part in ipairs(spawns:GetChildren()) do
-        if part:IsA("BasePart") and not part:GetAttribute("Disabled") then
-            local display = nil
-            pcall(function() display = part:GetAttribute("DisplayName") end)
-            local clean = tostring(display or part.Name)
-            clean = clean:gsub("%s*%(Lv%.?%s*%d+%)", "")
-            if mobKey(clean) == key
-                and (part.Position - near).Magnitude <= (CONFIG.BringMobSearch or 200) then
-                sum = sum and (sum + part.Position) or part.Position
-                n = n + 1
-            end
-        end
+    if not runtime.bringLocallyOwned(part) then return false end
+
+    local gap = (part.Position - goal).Magnitude
+    if gap < (runtime.config.BringMobSnapDistance or 4) then
+        -- It is already close enough. Do not keep testing ownership for this
+        -- hold; the mover is responsible from here on.
+        runtime.state.bringSnapped[mob] = true
+        return false
     end
-    local value = nil
-    if n > 0 and sum then value = sum / n end
-    state.spawnCentreCache = {key = key, at = tick(), value = value}
-    return value
+
+    local ok = pcall(function()
+        -- Keep the facing of the rig, but put its root at the ring slot. The
+        -- source uses the same one-step position move for the pack.
+        part.CFrame = CFrame.new(goal) * part.CFrame.Rotation
+        part.AssemblyLinearVelocity = Vector3.zero
+        part.AssemblyAngularVelocity = Vector3.zero
+    end)
+    if ok then runtime.state.bringSnapped[mob] = true end
+    return ok
 end
 
 -- The game itself knows how to push a body: the server sends a message and the
@@ -1566,25 +1864,23 @@ gameBodyMove = function(char, velocity, duration, id, action)
     return ok
 end
 
--- A mob is let go: the drag goes away and the physics the pack changed is put
+-- A mob is let go: the drag goes away and every value this run changed is put
 -- back exactly as the game had it, so the mob can stand and walk on its own
--- again. It is a global because the chunk is at the limit of 200 locals.
-letGoMob = function(mob, part)
+-- again. Only the mover recorded for this mob is destroyed; a pre-existing
+-- instance named "Lock" belongs to somebody else and is never touched.
+runtime.letGoMob = function(mob, part)
     part = part or anchorOf(mob)
-    if state.bringMoverId[mob] then
-        pcall(function() gameBodyMove(mob, Vector3.zero, 0, state.bringMoverId[mob], "Destroy") end)
-        state.bringMoverId[mob] = nil
+    if runtime.state.bringMoverId[mob] then
+        pcall(function() gameBodyMove(mob, Vector3.zero, 0, runtime.state.bringMoverId[mob], "Destroy") end)
+        runtime.state.bringMoverId[mob] = nil
     end
-    if part and part.Parent then
-        pcall(function()
-            local lock = part:FindFirstChild("Lock")
-            if lock then lock:Destroy() end
-            local gyro = part:FindFirstChild("BringGyro")
-            if gyro then gyro:Destroy() end
-            part:SetAttribute("BeingBrought", false)
-        end)
+    local mover = runtime.state.bringMover[mob]
+    if mover then
+        pcall(function() mover:Destroy() end)
+        runtime.state.bringMover[mob] = nil
     end
-    local saved = state.bringSaved[mob]
+
+    local saved = runtime.state.bringSaved[mob]
     if saved then
         for d, orig in pairs(saved.parts) do
             if d.Parent then
@@ -1592,137 +1888,130 @@ letGoMob = function(mob, part)
                     d.CanCollide = orig.collide
                     d.CanTouch = orig.touch
                     d.Massless = orig.massless
-                    d.AssemblyLinearVelocity = Vector3.zero
-                    d.AssemblyAngularVelocity = Vector3.zero
                 end)
             end
         end
-        local hum = mob:FindFirstChildOfClass("Humanoid")
-        if hum then
+        if part and part.Parent then
             pcall(function()
-                hum.PlatformStand = false
-                hum.AutoRotate = true
-                if saved.walk then hum.WalkSpeed = saved.walk end
-                if saved.jump then hum.JumpPower = saved.jump end
-                if saved.breakJoints ~= nil then hum.BreakJointsOnDeath = saved.breakJoints end
+                part.AssemblyLinearVelocity = saved.linear or Vector3.zero
+                part.AssemblyAngularVelocity = saved.angular or Vector3.zero
+                if saved.hadBeingBrought then
+                    part:SetAttribute("BeingBrought", saved.beingBrought)
+                else
+                    part:SetAttribute("BeingBrought", nil)
+                end
             end)
         end
-        state.bringSaved[mob] = nil
+        local hum = mob and mob:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function()
+                if saved.platformStand ~= nil then hum.PlatformStand = saved.platformStand end
+                if saved.autoRotate ~= nil then hum.AutoRotate = saved.autoRotate end
+                if saved.walk ~= nil then hum.WalkSpeed = saved.walk end
+                if saved.jump ~= nil then hum.JumpPower = saved.jump end
+                -- Restore the state that was captured before the hold. A
+                -- blanket Running change used to overwrite a mob that was
+                -- already jumping or lying down before it was picked up.
+                if hum.Health > 0 and saved.state then
+                    hum:ChangeState(saved.state)
+                end
+            end)
+        end
+        runtime.state.bringSaved[mob] = nil
     end
-    state.bringHeld[mob] = nil
-    state.bringMoved[mob] = nil
-    state.bringHealth[mob] = nil
+    runtime.state.bringHeld[mob] = nil
+    runtime.state.bringMoved[mob] = nil
+    runtime.state.bringHealth[mob] = nil
+    runtime.state.bringSnapped[mob] = nil
+    runtime.state.bringOwned[mob] = nil
+    runtime.state.bringCarryingTarget[mob] = nil
     -- the slot is only given back; the counter never walks back, or a new mob
     -- would take a step a mob that is still held already stands on
-    state.bringSlot[mob] = nil
+    runtime.state.bringSlot[mob] = nil
 end
+letGoMob = runtime.letGoMob
 
--- Bring Mob, the way the good hubs do it: the pack is gathered on one point
--- and every mob is held there by a body velocity named Lock (unlimited force,
--- so a hit cannot knock it off), not by a teleport. The point is the spawn
--- point of that mob in the world when it is already close, the player
--- otherwise, and each mob keeps its own step of the row so the pack never
--- shuffles.
+-- Bring Mob uses the reliable layout of the working source with one useful
+-- extension. A locally owned target is carried under the player. A
+-- server-owned target cannot be moved by a client BodyVelocity, so the extras
+-- are packed around that target and the player walks to it, exactly like the
+-- source. In both cases the target stays alive and the extras form a ring.
 local function bringMob(target, root)
-    if not CONFIG.BringMob or not target or not target.Parent or not root then return end
+    if not runtime.config.BringMob or not target or not target.Parent or not root then return end
     local anchor = anchorOf(target)
     if not anchor then return end
-    if ownedByOther(anchor) then
-        -- the mob is in the fight of another player: let go of it instead of
-        -- leaving it locked where it stands
-        if state.bringHeld[target] then letGoMob(target, anchor) end
+    local targetHum = target:FindFirstChildOfClass("Humanoid")
+    if not targetHum or targetHum.Health <= 0 then
+        if runtime.state.bringHeld[target] then runtime.letGoMob(target, anchor) end
         return
     end
 
     local now = tick()
-
-    -- the mark of a mob that was given up is taken off again
-    for mob, at in pairs(state.bringIgnored) do
-        if now - at > 30 then
-            local marker = mob:FindFirstChild("FarmIgnored")
-            if marker then pcall(function() marker:Destroy() end) end
-            state.bringIgnored[mob] = nil
-        end
-    end
-
-    -- a held mob that is not being hurt is let go and left alone for a while
-    for mob, at in pairs(state.bringMoved) do
-        if now - at > 2.2 then
-            state.bringMoved[mob] = nil
-            local hum = mob:FindFirstChildOfClass("Humanoid")
-            local hp = hum and hum.Health
-            if mob ~= target and hp and state.bringHealth[mob] == hp
-                and not mob:FindFirstChild("FarmIgnored") then
-                local part = anchorOf(mob)
-                if part then
-                    letGoMob(mob, part)
-                    state.bringSlot[mob] = nil
-                    -- The mob is left where it stands: the game walks it back
-                    -- to its camp on its own. Snapping it home was the visible
-                    -- "dragged and thrown back" jitter of the pack.
-                end
-                state.bringIgnored[mob] = now
-                pcall(function()
-                    local marker = Instance.new("IntValue")
-                    marker.Name = "FarmIgnored"
-                    marker.Parent = mob
-                end)
-            end
-            state.bringHealth[mob] = hp
-        end
-    end
-
-    if now < (state.bringAt or 0) then return end
-    state.bringAt = now + 0.05
-
-    if target:FindFirstChild("Ignored") then
-        local part = anchorOf(target)
-        if part then
-            local lock = part:FindFirstChild("Lock")
-            if lock then pcall(function() lock:Destroy() end) end
-            pcall(function() part:SetAttribute("BeingBrought", false) end)
-        end
-        state.bringHeld[target] = nil
+    local bringRange = tonumber(runtime.config.BringMobRange) or 60
+    if bringRange <= 0 or (anchor.Position - root.Position).Magnitude > bringRange then
         return
     end
 
-    -- The middle of the pack is the camp of that kind, taken from the game -
-    -- but only when the camp is already a short move away. A spawn centre can
-    -- stand up to the whole search range off, and a pack pulled there is the
-    -- "mobs dragged away" the farm used to show. Further than BringMobRange
-    -- the pack is gathered where the player stands instead.
-    state.bringTarget = target
-    local maxPull = CONFIG.BringMobRange or 60
-    local point = spawnCentre(target, root.Position)
-    if not point or (point - root.Position).Magnitude > maxPull then
-        point = root.Position
+    -- A held mob that died, vanished or lost network ownership goes free at
+    -- once. Ownership is checked per mob: the target and every extra can have
+    -- different owners, and a server-owned extra must never be frozen by a
+    -- client-side BodyVelocity.
+    for mob, part in pairs(runtime.state.bringHeld) do
+        local hum = mob and mob:FindFirstChildOfClass("Humanoid")
+        if not mob.Parent or not part.Parent or not hum or hum.Health <= 0
+            or not runtime.bringLocallyOwned(part) then
+            runtime.letGoMob(mob, part)
+        end
     end
-    -- The middle only moves when the player has really travelled or the camp
-    -- changed: refreshing it on every little hover step would drag the pack
-    -- back and forth under the player for the whole fight.
-    local centre = state.bringCentre
-    if not centre or (point - centre).Magnitude > maxPull then
-        state.bringCentre = point
-        centre = point
+
+    if now < (runtime.state.bringAt or 0) then return end
+    runtime.state.bringAt = now + 0.05
+
+    if target:FindFirstChild("Ignored") then
+        for mob, part in pairs(runtime.state.bringHeld) do
+            runtime.letGoMob(mob, part)
+        end
+        runtime.state.bringTarget, runtime.state.bringCentre = nil, nil
+        return
     end
-    point = centre
-    state.bringPoint = point
+
+    -- The source proves that a pack around the target is the reliable part.
+    -- When this client owns the target, we can do the nicer thing and carry
+    -- it under the player. Otherwise the target is the centre of the ring and
+    -- the main loop walks the player to it.
+    local carryTarget = runtime.config.BringMobCarryTarget
+        and runtime.bringLocallyOwned(anchor)
+    if runtime.state.bringTarget ~= target then
+        runtime.state.bringCentre = nil
+    end
+
+    -- The centre follows its owner with a small dead zone. Refreshing it on
+    -- every hover step would drag the pack back and forth, while a point that
+    -- lags too far behind is what made the mobs trail after the bot.
+    local desired = carryTarget and root.Position or anchor.Position
+    local centre = runtime.state.bringCentre
+    if not centre or (desired - centre).Magnitude > 3 then
+        runtime.state.bringCentre = desired
+        centre = desired
+    end
+    local point = centre
+    runtime.state.bringPoint, runtime.state.bringTarget = point, target
 
     local list = {target}
-    local count = CONFIG.BringMobCount or 0
+    local count = runtime.config.BringMobCount or 0
     if count <= 0 then count = math.huge end
-    count = math.min(count, CONFIG.BringMobMax or 8)
+    count = math.min(count, runtime.config.BringMobMax or 8)
     local key = mobKey(target.Name)
     if count > 1 then
         local near = {}
         for _, mob in ipairs(collectEnemies(now)) do
-            if mob ~= target and not mob:FindFirstChild("Ignored")
-                and not mob:FindFirstChild("FarmIgnored")
-                and mobKey(mob.Name) == key then
+            if mob ~= target and not mob:FindFirstChild("Ignored") then
                 local part = anchorOf(mob)
                 local hum = mob:FindFirstChildOfClass("Humanoid")
                 if part and hum and hum.Health > 0 and not ownedByOther(part)
-                    and (part.Position - anchor.Position).Magnitude <= (CONFIG.BringMobSearch or 200) then
+                    and runtime.bringLocallyOwned(part)
+                    and mobKey(mob.Name) == key
+                    and (part.Position - anchor.Position).Magnitude <= (runtime.config.BringMobSearch or 200) then
                     table.insert(near, {mob = mob, dist = (part.Position - anchor.Position).Magnitude})
                 end
             end
@@ -1735,149 +2024,178 @@ local function bringMob(target, root)
     end
 
     local stillHeld = {}
-    for _, mob in ipairs(list) do
+    for index, mob in ipairs(list) do
         local part = anchorOf(mob)
-        -- The mob of the fight is not held: the player stands over its head
-        -- and hits it there, and it is left walking the way the game made it.
-        -- Carrying it is what turned a missed swing into a frozen statue.
-        -- Only the extra mobs of the pack are frozen and dragged.
-        if part and mob ~= target then
-            stillHeld[mob] = true
-            -- every mob keeps its own step of the row, so the pack does not
-            -- shuffle around when the order of the list changes
-            local slot = state.bringSlot[mob]
-            if not slot then
-                state.bringSlotCount = (state.bringSlotCount or 0) + 1
-                slot = state.bringSlotCount
-                state.bringSlot[mob] = slot
+        if part then
+            local isTarget = mob == target
+            -- A server-owned target is the centre of the ring but is never
+            -- held or changed. Only locally owned extras are packed around
+            -- it, and the player walks to the target itself.
+            local shouldHold = (not isTarget) or carryTarget
+            if not shouldHold then
+                if runtime.state.bringHeld[mob] or runtime.state.bringSaved[mob] then
+                    runtime.letGoMob(mob, part)
+                end
+            else
+                stillHeld[mob] = true
+                -- every mob keeps its own slot, so the pack does not shuffle
+                -- around when the order of the list changes
+                local slot = runtime.state.bringSlot[mob]
+                if not slot then
+                    runtime.state.bringSlotCount = (runtime.state.bringSlotCount or 0) + 1
+                    slot = runtime.state.bringSlotCount
+                    runtime.state.bringSlot[mob] = slot
+                end
+            -- The target stands in the middle; the extras are spread on a ring
+            -- with the golden angle, so any count from one to twelve stands
+            -- evenly around the target instead of in one row on one side.
+            local goalX, goalZ = point.X, point.Z
+            if index > 1 then
+                local angle = (slot - 1) * 2.399963229728653
+                goalX = point.X + math.cos(angle) * 2.8
+                goalZ = point.Z + math.sin(angle) * 2.8
             end
-            -- A fixed step of a tight block on the camp, so the pack stands on
-            -- top of itself and one swing reaches all of them. Only the ground
-            -- under the mob is steered: the mob keeps its own height, so
-            -- nothing is ever lifted or dropped and the view does not bob.
-            local i = (slot - 1) % 12
-            local col = i % 3
-            local row = math.floor(i / 3)
-            local goal = Vector3.new(point.X + (col - 1) * 1.8, part.Position.Y,
-                point.Z + row * 1.8)
+            -- The whole pack stands on the ground of the target, not on the
+            -- height each mob happened to have when it was grabbed: a mob
+            -- pulled over a slope otherwise floats or sinks into it.
+            local goal = Vector3.new(goalX,
+                anchor.Position.Y + (part.Size.Y - anchor.Size.Y) * 0.5, goalZ)
             local hum = mob:FindFirstChildOfClass("Humanoid")
 
-            -- every part of the mob goes ghost and is stopped. One part that
-            -- still collides with the ground is enough to hold the whole mob
-            -- back, so the hub does this to all of them, and it does it once.
-            -- The values the game had are written down on the way in, so the
-            -- mob can be put back exactly, not just made solid again.
-            if not state.bringHeld[mob] then
+            -- The pack keeps the real assembly mass and the real touch
+            -- behaviour. Only collision and the walking state are changed,
+            -- and every original value is written down before the first
+            -- change so release can restore the rig exactly.
+            if not runtime.state.bringSaved[mob] then
                 local saved = { parts = {} }
                 for _, d in ipairs(mob:GetDescendants()) do
                     if d:IsA("BasePart") then
-                        saved.parts[d] = { collide = d.CanCollide, touch = d.CanTouch, massless = d.Massless }
-                        pcall(function()
-                            d.CanCollide = false
-                            d.CanTouch = false
-                            d.Massless = true
-                            d.AssemblyLinearVelocity = Vector3.zero
-                            d.AssemblyAngularVelocity = Vector3.zero
-                        end)
+                        saved.parts[d] = {
+                            collide = d.CanCollide,
+                            touch = d.CanTouch,
+                            massless = d.Massless,
+                        }
                     end
                 end
+                saved.linear = part.AssemblyLinearVelocity
+                saved.angular = part.AssemblyAngularVelocity
+                saved.hadBeingBrought = part:GetAttribute("BeingBrought") ~= nil
+                saved.beingBrought = part:GetAttribute("BeingBrought")
                 if hum then
                     saved.walk = hum.WalkSpeed
                     saved.jump = hum.JumpPower
-                    saved.breakJoints = hum.BreakJointsOnDeath
+                    saved.platformStand = hum.PlatformStand
+                    saved.autoRotate = hum.AutoRotate
+                    saved.state = nil
+                    pcall(function() saved.state = hum:GetState() end)
                 end
-                state.bringSaved[mob] = saved
+                runtime.state.bringSaved[mob] = saved
+                for d in pairs(saved.parts) do
+                    if d.Parent then
+                        pcall(function() d.CanCollide = false end)
+                    end
+                end
+                pcall(function()
+                    part.AssemblyLinearVelocity = Vector3.zero
+                    part.AssemblyAngularVelocity = Vector3.zero
+                    part:SetAttribute("BeingBrought", true)
+                end)
             end
 
             if hum then
                 pcall(function()
-                    hum.AutoRotate = false
-                    hum.BreakJointsOnDeath = false
                     hum.PlatformStand = true
+                    hum.AutoRotate = false
                     hum.WalkSpeed = 0
                     hum.JumpPower = 0
                     hum:ChangeState(Enum.HumanoidStateType.Physics)
                 end)
+                -- This is the fast first step from the working source. It is
+                -- only used when this client owns the rig; otherwise the body
+                -- velocity below does the carrying.
+                runtime.bringSnap(mob, part, goal)
             end
 
             -- Move with the mover of the game when it can be had: fire its own
             -- handler with a speed towards the step and a short duration, so
-            -- the game carries the mob. Only when that is not there is the
-            -- private Lock used, as before.
+            -- the game carries the mob. Otherwise use a private mover with a
+            -- unique name. The script never searches for or destroys a
+            -- generic "Lock" instance that it did not create itself.
             local gameMoved = false
-            if CONFIG.BringMover == "Game" then
-                local id = state.bringMoverId[mob]
+            if runtime.config.BringMover == "Game" then
+                local private = runtime.state.bringMover[mob]
+                if private then
+                    pcall(function() private:Destroy() end)
+                    runtime.state.bringMover[mob] = nil
+                end
+                local id = runtime.state.bringMoverId[mob]
                 if not id then
-                    state.bringMoverSeq = (state.bringMoverSeq or 0) + 1
-                    id = state.bringMoverSeq
-                    state.bringMoverId[mob] = id
+                    runtime.state.bringMoverSeq = (runtime.state.bringMoverSeq or 0) + 1
+                    id = runtime.state.bringMoverSeq
+                    runtime.state.bringMoverId[mob] = id
                 end
                 local vel = Vector3.zero
-                if mob ~= target then
-                    local toGo = goal - part.Position
-                    if toGo.Magnitude > 0.2 then
-                        vel = toGo.Unit * math.min(toGo.Magnitude * 6, 900)
-                    end
+                local toGo = goal - part.Position
+                local gap = toGo.Magnitude
+                if gap > 0.6 then
+                    vel = toGo.Unit * math.min(gap * 4, 120)
                 end
                 gameMoved = gameBodyMove(mob, vel, 0.2, id, "Create")
             end
 
             if not gameMoved then
-                local lock = part:FindFirstChild("Lock")
-                if not lock then
-                    lock = Instance.new("BodyVelocity")
-                    lock.Name = "Lock"
-                    lock.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                    lock.P = 12500
-                    lock.Velocity = Vector3.zero
-                    lock.Parent = part
-                    pcall(function() part:SetAttribute("BeingBrought", true) end)
+                local mover = runtime.state.bringMover[mob]
+                if not mover or not mover.Parent then
+                    runtime.state.bringMoverSeq = (runtime.state.bringMoverSeq or 0) + 1
+                    mover = Instance.new("BodyVelocity")
+                    mover.Name = "FarmBringMover_" .. tostring(runtime.generation)
+                        .. "_" .. tostring(runtime.state.bringMoverSeq)
+                    -- The working source uses 1e9. A finite force is enough
+                    -- for every enemy rig and avoids an unbounded force on
+                    -- an assembly that is changing ownership.
+                    mover.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+                    mover.P = 12500
+                    mover.Velocity = Vector3.zero
+                    pcall(function() mover:SetAttribute("FarmOwned", true) end)
+                    mover.Parent = part
+                    runtime.state.bringMover[mob] = mover
                 end
-                -- The hold drags the mob over with the same body velocity the
-                -- hubs use (the one that really moves a server mob), and the
-                -- speed follows the distance with no floor under it: a floor
-                -- makes a mob step past its step and slide back and forth.
-                -- The enemy of the fight is not moved, the player stands on it.
-                local toGo = (mob ~= target) and (goal - part.Position) or nil
-                if toGo and toGo.Magnitude > 0.2 then
-                    -- calm on purpose: a mob that is yanked dives past the
-                    -- player and the two of them skate away together
-                    lock.Velocity = toGo.Unit * math.min(toGo.Magnitude * 4, 400)
+                -- The hold drags the mob over with the same body velocity
+                -- the hubs use. The owned target is carried too, so the bot
+                -- fights where it stands instead of walking after a mob
+                -- that was never brought.
+                local toGo = goal - part.Position
+                local gap = toGo.Magnitude
+                if gap > 0.6 then
+                    -- A speed that closes a fixed fraction of the gap per
+                    -- update (the hold is refreshed twenty times a second).
+                    -- The old distance times eight with a six-stud floor
+                    -- overshot every step, and the mob visibly bounced.
+                    mover.Velocity = toGo.Unit * math.min(gap * 4, 120)
                 else
-                    lock.Velocity = Vector3.zero
+                    mover.Velocity = Vector3.zero
                 end
             else
                 -- the game carries it, no private mover may stay on the rig
-                local lock = part:FindFirstChild("Lock")
-                if lock then pcall(function() lock:Destroy() end) end
+                local private = runtime.state.bringMover[mob]
+                if private then
+                    pcall(function() private:Destroy() end)
+                    runtime.state.bringMover[mob] = nil
+                end
             end
 
-            local gyro = part:FindFirstChild("BringGyro")
-            if not gyro then
-                gyro = Instance.new("BodyGyro")
-                gyro.Name = "BringGyro"
-                gyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-                gyro.P = 50000
-                gyro.D = 500
-                gyro.Parent = part
+            runtime.state.bringOwned[mob] = true
+            runtime.state.bringHeld[mob] = part
             end
-            gyro.CFrame = CFrame.new(part.Position, part.Position + root.CFrame.LookVector)
-
-            pcall(function()
-                part.AssemblyLinearVelocity = Vector3.zero
-                part.AssemblyAngularVelocity = Vector3.zero
-            end)
-
-            state.bringHeld[mob] = part
-            state.bringMoved[mob] = now
-            state.bringHealth[mob] = hum and hum.Health
         end
     end
 
+    runtime.state.bringCarryingTarget[target] = carryTarget == true
+
     -- the mobs of the last pack that are not in this one any more go free
-    for mob, part in pairs(state.bringHeld) do
+    for mob, part in pairs(runtime.state.bringHeld) do
         if not stillHeld[mob] then
-            letGoMob(mob, part)
+            runtime.letGoMob(mob, part)
         end
     end
 end
@@ -1901,9 +2219,9 @@ local activeTween, tweenGoal
 
 -- The one tween of the script. Every trip of the character goes through here,
 -- so the walk to a mob, the flight to an island and the way into the whirlpool
--- all move at exactly CONFIG.MoveSpeed. There is no cap: a longer way simply
+-- all move at exactly runtime.config.MoveSpeed. There is no cap: a longer way simply
 -- takes longer, it is never rushed (a rushed flight is what the game undoes).
-function tweenTo(cf)
+runtime.tweenTo = function(cf)
     local root = getRoot()
     if not root then return end
     local dist = (root.Position - cf.Position).Magnitude
@@ -1914,15 +2232,15 @@ function tweenTo(cf)
         if moved < math.max(12, left * 0.4) then return end
     end
     if activeTween then activeTween:Cancel() end
-    setFlying()
+    runtime.setFlying()
     tweenGoal = cf
     activeTween = TweenService:Create(root,
-        TweenInfo.new(math.max(dist / CONFIG.MoveSpeed, 0.12), Enum.EasingStyle.Linear),
+        TweenInfo.new(math.max(dist / runtime.config.MoveSpeed, 0.12), Enum.EasingStyle.Linear),
         {CFrame = cf})
     activeTween:Play()
 end
 
-function setFlying()
+runtime.setFlying = function()
     -- While a tween moves the character, its own body (gravity, walking,
     -- getting up) fights the CFrame and the flight looks jerky. The body is
     -- put in the physics state and left alone until the move is over.
@@ -1933,7 +2251,7 @@ function setFlying()
     pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
 end
 
-function setWalking()
+runtime.setWalking = function()
     local hum = getHumanoid()
     if not hum then return end
     pcall(function() hum.PlatformStand = false end)
@@ -1941,50 +2259,59 @@ function setWalking()
     pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
 end
 
-function stopTween()
+runtime.stopTween = function()
     if activeTween then activeTween:Cancel(); activeTween = nil end
     tweenGoal = nil
-    setWalking()
+    runtime.setWalking()
 end
 
-function moveTo(cf, noWarp)
+runtime.moveTo = function(cf, noWarp)
     local root = getRoot()
     if not root then return end
-    local mode = CONFIG.MovementMode
+    local mode = runtime.config.MovementMode
     local hop = (root.Position - cf.Position).Magnitude
 
     -- A short hop inside the same island is accepted by the game, so it is
     -- taken at once instead of being walked. The shop turns that off: the
     -- teacher of a style has to see the player walk up to it.
-    if CONFIG.WarpClose and not noWarp and hop <= (CONFIG.WarpDistance or 60) then
+    if runtime.config.WarpClose and not noWarp and hop <= (runtime.config.WarpDistance or 60) then
         -- The hover asks for the very spot the player already stands on twenty
         -- times a second. Snapping there is what made the view stutter, so a
         -- step under a stud is left alone and a real hop is taken at once.
         if hop > 1 then
-            stopTween()
+            runtime.stopTween()
             root.CFrame = cf
         end
         return
     end
 
     if mode == "Teleport" then
-        stopTween()
+        runtime.stopTween()
         root.CFrame = cf
     elseif mode == "Tween" then
         local dist = (root.Position - cf.Position).Magnitude
         if dist < 9 and not noWarp then
-            stopTween()
-            setWalking()
+            runtime.stopTween()
+            runtime.setWalking()
             root.CFrame = cf
             return
         end
-        tweenTo(cf)
+        runtime.tweenTo(cf)
     else
-        setWalking()
+        runtime.setWalking()
         local hum = getHumanoid()
         if hum then hum:MoveTo(cf.Position) end
     end
 end
+
+-- Keep the old global names as compatibility aliases, but every internal
+-- call uses the function captured by this runtime. An old execution can
+-- therefore never move or restore the character of a newer execution.
+tweenTo = runtime.tweenTo
+setFlying = runtime.setFlying
+setWalking = runtime.setWalking
+stopTween = runtime.stopTween
+moveTo = runtime.moveTo
 
 -- ================= NOCLIP =================
 local noclipChar, noclipParts, noclipConn = nil, {}, nil
@@ -2010,9 +2337,10 @@ local function applyNoclip()
                 end
             end
             noclipConn = char.DescendantAdded:Connect(function(obj)
+                if not runtime.running or FarmRuntime.current ~= runtime then return end
                 if obj:IsA("BasePart") then
                     table.insert(noclipParts, {part = obj, original = obj.CanCollide})
-                    if state.farming then obj.CanCollide = false end
+                    if runtime.state.farming then obj.CanCollide = false end
                 end
             end)
         end
@@ -2023,17 +2351,18 @@ local function applyNoclip()
     end
 end
 
-RunService.Stepped:Connect(function()
+runtime.steppedConn = RunService.Stepped:Connect(function()
+    if not runtime.running or FarmRuntime.current ~= runtime then return end
     pcall(function()
         local root = getRoot()
-        if not state.enabled or not root then
+        if not runtime.state.enabled or not root then
             if #noclipParts > 0 then restoreNoclip() end
             return
         end
         -- A flight or a quest walk needs no clipping as much as the farm does.
         -- The fruit sniper alone is not a reason to walk through walls.
-        if not (state.flying or state.questing or state.shopping
-            or (state.farming and CONFIG.AutoFarm)) then
+        if not (runtime.state.flying or runtime.state.saberActive or runtime.state.shopping
+            or (runtime.state.farming and runtime.config.AutoFarm)) then
             if #noclipParts > 0 then restoreNoclip() end
             return
         end
@@ -2044,7 +2373,7 @@ RunService.Stepped:Connect(function()
         -- alone as well.
         local tweenPlaying = activeTween
             and activeTween.PlaybackState == Enum.PlaybackState.Playing
-        if not tweenPlaying and CONFIG.MovementMode ~= "Walk" then
+        if not tweenPlaying and runtime.config.MovementMode ~= "Walk" then
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
         end
@@ -2064,34 +2393,36 @@ local combatController
 
 local function getCombatController()
     if combatController then return combatController end
-    local ps = LocalPlayer and LocalPlayer.PlayerScripts
-    if not ps then return nil end
-    local mod = ps:FindFirstChild("CombatFramework")
+    -- The live client uses this module directly. The old PlayerScripts
+    -- "CombatFramework" object does not exist in this build, so looking for it
+    -- made every gun attack fall back to a plain tool activation.
+    local controllers = ReplicatedStorage:FindFirstChild("Controllers")
+    local mod = controllers and controllers:FindFirstChild("CombatController")
     if not mod then return nil end
-    local ok, cf = pcall(require, mod)
-    if not ok or not cf then return nil end
-    local ctrl = nil
-    pcall(function() ctrl = cf:GetActiveController() end)
-    if not ctrl then pcall(function() ctrl = cf.activeController end) end
+    local ok, ctrl = pcall(require, mod)
+    if not ok or type(ctrl) ~= "table" or type(ctrl.Attack) ~= "function" then
+        return nil
+    end
     combatController = ctrl
     return combatController
 end
 
 local function fastAttack()
-    local ctrl = getCombatController()
-    if not ctrl then return false end
-    local ok = pcall(function()
-        ctrl.attacking = false
-        ctrl.blocking = false
-        ctrl.timeToNextAttack = tick() - 1
-        ctrl.timeToNextBlock = 0
-        ctrl.increment = 3
-        ctrl.hitboxMagnitude = CONFIG.HitboxMagnitude or 120
-    end)
+    -- The old implementation wrote fields the live CombatController does not
+    -- have, so it only pretended to bypass a cooldown. The remote path really
+    -- bypasses it; here we only clear the client stun that can block a swing.
     local char = LocalPlayer.Character
     local stun = char and char:FindFirstChild("Stun")
-    if stun then pcall(function() stun.Value = 0 end) end
-    return ok
+    if stun then
+        pcall(function()
+            if stun:IsA("BoolValue") then
+                stun.Value = false
+            else
+                stun.Value = 0
+            end
+        end)
+    end
+    return true
 end
 
 local function combatUtilModule()
@@ -2100,42 +2431,59 @@ local function combatUtilModule()
     if not util then return nil end
     -- the module does not change while a server is played: require it once.
     -- The cache lives in state, the chunk is at the limit of 200 locals.
-    if state.combatUtil and state.combatUtilMod == util then return state.combatUtil end
+    if runtime.state.combatUtil and runtime.state.combatUtilMod == util then return runtime.state.combatUtil end
     local ok, combatUtil = pcall(require, util)
     if not ok or not combatUtil then return nil end
-    state.combatUtil, state.combatUtilMod = combatUtil, util
+    runtime.state.combatUtil, runtime.state.combatUtilMod = combatUtil, util
     return combatUtil
 end
 
 local function attackAnimLength(tool)
     local combatUtil = combatUtilModule()
     if not combatUtil or not tool then return 0.5, 1 end
+
+    -- The live controller forgets a basic combo after 0.75 seconds without a
+    -- new swing. The script uses the same rule instead of keeping a stale
+    -- combo index for ever.
+    local now = tick()
+    if runtime.state.attackComboAt and now - runtime.state.attackComboAt >= 0.75 then
+        runtime.state.attackCombo = 0
+        runtime.state.attackComboAt = 0
+    end
+
     local length, combo = 0.5, 1
     pcall(function()
         local weaponName = combatUtil:GetWeaponName(tool)
         local weaponData = combatUtil:GetWeaponData(weaponName)
+        if weaponData and weaponData.WeaponType == "Gun" then
+            -- Guns do not use RegisterAttack or a basic moveset. Their own
+            -- cooldown is the timing used by CombatUtil.ShootTypes.
+            length = tonumber(weaponData.Cooldown)
+                or tonumber(weaponData.ShootInterval) or 0.5
+            combo = 0
+            runtime.state.attackComboCount = 1
+            return
+        end
+
         local basic = weaponData and weaponData.Moveset and weaponData.Moveset.Basic
         local comboCount = (basic and #basic) or 1
         if comboCount < 1 then comboCount = 1 end
+        runtime.state.attackComboCount = comboCount
 
-        -- The live combat controller sends the current basic-move index with
-        -- RegisterAttack. It cycles through the number of moves in the weapon
-        -- data, rather than always sending a fixed value.
-        combo = ((state.attackCombo or 0) % comboCount) + 1
-        state.attackCombo = combo
+        -- RegisterAttack carries the next basic-move index. It is advanced
+        -- only after an attack is really dispatched.
+        combo = ((runtime.state.attackCombo or 0) % comboCount) + 1
 
         -- CombatUtil caches loaded animation tracks by Humanoid, not by the
-        -- weapon name. The old lookup always missed and sent the fallback
-        -- length for every swing.
+        -- weapon name. If a particular combo track has not been loaded, basic1
+        -- is the matching fallback, but the combo index sent to the server
+        -- must still be the real one.
         local hum = getHumanoid()
         local cache = combatUtil:GetMovesetAnimCache(hum)
         local pure = combatUtil:GetPureWeaponName(weaponName)
         local prefix = pure .. "-basic"
         local track = cache and cache[prefix .. combo]
-        if not track and combo ~= 1 then
-            combo = 1
-            track = cache and cache[prefix .. combo]
-        end
+        if not track then track = cache and cache[prefix .. "1"] end
         if not track then
             for key, value in pairs(cache or {}) do
                 if startsWith(key, prefix) then
@@ -2152,19 +2500,6 @@ local function attackAnimLength(tool)
     return length, combo
 end
 
-local function canAttack(tool)
-    local combatUtil = combatUtilModule()
-    if not combatUtil or not tool then return true end
-    local allowed = true
-    pcall(function()
-        local weaponName = combatUtil:GetWeaponName(tool)
-        local data = combatUtil:GetWeaponData(weaponName)
-        local weaponType = (data and data.WeaponType) or "Melee"
-        allowed = combatUtil:CanAttack(LocalPlayer.Character, weaponType)
-    end)
-    return allowed ~= false
-end
-
 local function hitPartOf(mob)
     if not mob then return nil end
     -- the game registers a hit against any body part of the rig; the head is
@@ -2179,7 +2514,7 @@ end
 -- the first one: the game takes that part on its own and the whole list with
 -- it, so a single swing lands on all of them.
 local function aoePairs(root, target)
-    local range = CONFIG.AoeRange or 80
+    local range = runtime.config.AoeRange or 80
     local out, seen = {}, {}
     local function add(mob)
         if not mob or seen[mob] then return end
@@ -2191,7 +2526,7 @@ local function aoePairs(root, target)
         table.insert(out, {mob, part})
     end
     add(target)
-    if CONFIG.Aoe then
+    if runtime.config.Aoe then
         for _, mob in ipairs(collectEnemies(tick())) do add(mob) end
     end
     return out
@@ -2202,54 +2537,54 @@ end
 -- child skips the virtual-remote encoding and the server silently drops every
 -- hit. Requiring Net returns the wrapper that performs that encoding.
 local function netFolder()
-    if state.netModule then return state.netModule end
+    if runtime.state.netModule then return runtime.state.netModule end
     local modules = ReplicatedStorage:FindFirstChild("Modules")
     local module = modules and modules:FindFirstChild("Net")
     if not module then return nil end
-    state.netModuleInstance = module
+    runtime.state.netModuleInstance = module
     local ok, net = pcall(require, module)
     if ok and type(net) == "table" then
-        state.netModule = net
+        runtime.state.netModule = net
         return net
     end
     return nil
 end
 
 local function hitRemote()
-    if state.hitRemoteCache then return state.hitRemoteCache end
+    if runtime.state.hitRemoteCache then return runtime.state.hitRemoteCache end
     local net = netFolder()
     if net then
         local ok, remote = pcall(function() return net:RemoteEvent("RegisterHit", true) end)
         if ok and remote then
-            state.hitRemoteCache = remote
+            runtime.state.hitRemoteCache = remote
             return remote
         end
     end
 
     -- A raw RegisterHit is only safe when the game has not marked it virtual.
-    local module = state.netModuleInstance
+    local module = runtime.state.netModuleInstance
     local raw = module and module:FindFirstChild("RE/RegisterHit")
     if raw and not raw:GetAttribute("Virtual") then
-        state.hitRemoteCache = raw
+        runtime.state.hitRemoteCache = raw
         return raw
     end
     return nil
 end
 
 local function attackRemote()
-    if state.attackRemoteCache then return state.attackRemoteCache end
+    if runtime.state.attackRemoteCache then return runtime.state.attackRemoteCache end
     local net = netFolder()
     if net then
         local ok, remote = pcall(function() return net:RemoteEvent("RegisterAttack") end)
         if ok and remote then
-            state.attackRemoteCache = remote
+            runtime.state.attackRemoteCache = remote
             return remote
         end
     end
-    local module = state.netModuleInstance
+    local module = runtime.state.netModuleInstance
     local raw = module and module:FindFirstChild("RE/RegisterAttack")
     if raw and not raw:GetAttribute("Virtual") then
-        state.attackRemoteCache = raw
+        runtime.state.attackRemoteCache = raw
         return raw
     end
     return nil
@@ -2263,56 +2598,134 @@ end
 local function hitSessionId()
     local hit = hitRemote()
     if not hit then return nil end
-    if state.hitSessionId and state.hitThread and state.hitThreadRemote == hit then
-        return state.hitSessionId
+    if runtime.hitSessionId and runtime.hitThread and runtime.hitThreadRemote == hit
+        and coroutine.status(runtime.hitThread) == "suspended" then
+        return runtime.hitSessionId
     end
 
-    state.hitSessionId = nil
-    state.hitThread = nil
-    state.hitThreadRemote = hit
+    runtime.hitSessionId = nil
+    runtime.hitThread = nil
+    runtime.hitThreadRemote = hit
+    runtime.hitRequest = nil
+    runtime.hitResult = nil
+    runtime.hitHandshakeOk = false
     local thread = coroutine.create(function()
+        local epoch = runtime.characterEpoch
         local token = tostring(LocalPlayer.UserId):sub(2, 4)
             .. tostring(coroutine.running()):sub(11, 15)
-        state.hitSessionId = token
 
-        -- Handshake: the server learns the token before the first hit.
+        -- Handshake: the server learns the token before the first hit. Its
+        -- result is kept for the caller instead of being lost inside this
+        -- coroutine.
         local ok, err = pcall(function() hit:FireServer(token) end)
+        runtime.hitHandshakeOk = ok
+        runtime.hitHandshakeError = err
+        runtime.hitSessionId = token
         if not ok then
             dbg("Hit handshake failed: " .. tostring(err))
         end
 
         while true do
-            local part, list = coroutine.yield()
-            if part then
-                local sent
-                sent, err = pcall(function()
-                    hit:FireServer(part, list, nil, token)
+            coroutine.yield()
+            if not runtime.isCurrent() or runtime.characterEpoch ~= epoch then return end
+            local request = runtime.hitRequest
+            runtime.hitRequest = nil
+            if request then
+                if request.stop then
+                    runtime.hitResult = {ok = true}
+                    return
+                end
+                local sent, sendError = pcall(function()
+                    hit:FireServer(request.part, request.list, nil, token)
                 end)
+                runtime.hitResult = {ok = sent, error = sendError}
                 if not sent then
-                    dbg("Hit remote failed: " .. tostring(err))
+                    dbg("Hit remote failed: " .. tostring(sendError))
                 end
             end
         end
     end)
 
-    state.hitThread = thread
-    local ok, err = coroutine.resume(thread)
-    if not ok then
-        state.hitThread = nil
-        state.hitThreadRemote = nil
+    runtime.hitThread = thread
+    local resumed, err = coroutine.resume(thread)
+    if not resumed then
+        runtime.hitThread = nil
+        runtime.hitThreadRemote = nil
+        runtime.hitSessionId = nil
         dbg("Hit session failed: " .. tostring(err))
         return nil
     end
-    return state.hitSessionId
+    if not runtime.hitHandshakeOk then
+        runtime.hitThread = nil
+        runtime.hitThreadRemote = nil
+        runtime.hitSessionId = nil
+        return nil
+    end
+    return runtime.hitSessionId
 end
 
-local function remoteAttack(target, tool)
+local function remoteAttack(target, tool, animLength, combo, attackPairs)
+    runtime.state.attackDispatched = false
+    runtime.state.attackHitDispatched = false
+    runtime.state.attackComboSent = false
+
+    -- A gun is not a melee hit. RegisterAttack/RegisterHit would send the
+    -- wrong protocol. The live CombatController routes guns through
+    -- CombatUtil.ShootTypes, which sends ShootGunEvent with the argument
+    -- shape of each gun (single shot, shotgun or projectile).
+    if isGun(tool) then
+        local ctrl = getCombatController()
+        local camera = Workspace.CurrentCamera
+        local anchor = anchorOf(target)
+        if not ctrl or not camera or not anchor then return false end
+        local view = camera:WorldToViewportPoint(anchor.Position)
+        if not view then return false end
+        local inset = game:GetService("GuiService"):GetGuiInset()
+        local before = tonumber(tool:GetAttribute("LocalTotalShots")) or 0
+        local beforeLeft = tonumber(tool:GetAttribute("LocalShotsLeft"))
+
+        -- CombatController.Attack expects the InputObject that came from the
+        -- game. A small compatible object is enough here: the normal guns read
+        -- its type and position, while Gatling guns also ask for a property
+        -- signal. A BindableEvent supplies that signal and is explicitly ended
+        -- when the bot is stopped, so the controller never keeps a dead input.
+        if runtime.stopGunInput then runtime.stopGunInput() end
+        local changed = Instance.new("BindableEvent")
+        local input = {
+            UserInputType = Enum.UserInputType.Touch,
+            UserInputState = Enum.UserInputState.Begin,
+            Position = Vector3.new(view.X - inset.X, view.Y - inset.Y, 0),
+        }
+        function input:GetPropertyChangedSignal()
+            return changed.Event
+        end
+
+        local ok, err = pcall(function() ctrl:Attack(tool, input) end)
+        local after = tonumber(tool:GetAttribute("LocalTotalShots")) or 0
+        local afterLeft = tonumber(tool:GetAttribute("LocalShotsLeft"))
+        local dispatched = ok and (after > before
+            or (beforeLeft ~= nil and afterLeft ~= nil and afterLeft < beforeLeft))
+        runtime.state.attackDispatched = dispatched
+        runtime.state.attackHitDispatched = false
+        runtime.state.aoeCount = dispatched and 1 or 0
+        runtime.state.lastRemoteAttackAt = tick()
+        if ok and tool:GetAttribute("IsAutoShooting") then
+            runtime.state.gunInput = {tool = tool, input = input, changed = changed}
+        else
+            pcall(function() changed:Destroy() end)
+        end
+        if not ok then
+            dbg("The gun controller failed: " .. tostring(err))
+        end
+        return dispatched
+    end
+
     local regAttack = attackRemote()
     if not regAttack then return false end
     local hit = hitRemote()
     if not hit then return false end
     local root = getRoot()
-    local pairs_ = aoePairs(root, target)
+    local pairs_ = attackPairs or aoePairs(root, target)
     if #pairs_ == 0 then return false end
 
     local primary = pairs_[1][2]
@@ -2321,11 +2734,15 @@ local function remoteAttack(target, tool)
     -- RegisterAttack takes the real animation length and the current basic
     -- combo index. The old fixed second argument did not match the live
     -- combat controller.
-    local animLength, combo = attackAnimLength(tool)
     local attackOk = pcall(function()
         regAttack:FireServer(animLength, combo)
     end)
-    state.aoeCount = #pairs_
+    if attackOk then
+        runtime.state.attackCombo = combo
+        runtime.state.attackComboAt = tick()
+        runtime.state.attackComboSent = true
+    end
+    runtime.state.aoeCount = #pairs_
 
     -- The first part is sent separately. The second argument contains the
     -- remaining {rig, hitPart} pairs, exactly like CombatUtil does.
@@ -2333,64 +2750,216 @@ local function remoteAttack(target, tool)
     for i = 2, #pairs_ do others[#others + 1] = pairs_[i] end
 
     local hitOk = false
-    -- CombatUtil installs this function on ReplicatedStorage.Global. It owns
-    -- the encrypted remote wrapper, the session handshake and the combat
-    -- thread, so using it is both the safest and the most compatible path.
-    local globalOk, global = pcall(require, ReplicatedStorage:FindFirstChild("Global"))
-    if globalOk and type(global) == "table"
-        and type(global.SendHitsToServer) == "function" then
-        hitOk = pcall(global.SendHitsToServer, primary, others)
-    end
+    if attackOk then
+        -- CombatUtil normally installs SendHitsToServer on the game-wide global
+        -- table. Apex runs this chunk with RobloxScript identity, where requiring
+        -- ReplicatedStorage.Global is forbidden, so look the already-installed
+        -- function up in the two visible global tables instead of trying to
+        -- require that module again.
+        local helper
+        if type(_G) == "table" and type(_G.SendHitsToServer) == "function" then
+            helper = _G.SendHitsToServer
+        elseif type(getgenv) == "function" then
+            local shared = getgenv()
+            if type(shared) == "table" and type(shared.SendHitsToServer) == "function" then
+                helper = shared.SendHitsToServer
+            end
+        end
+        if helper then
+            local sent, err = pcall(helper, primary, others)
+            hitOk = sent
+            if not sent then
+                dbg("The game hit helper failed: " .. tostring(err))
+            end
+        end
 
-    -- Fallback for builds where the global helper is not installed yet.
-    if not hitOk then
-        local token = hitSessionId()
-        if token and state.hitThread then
-            local resumed = coroutine.resume(state.hitThread, primary, others)
-            hitOk = resumed
+        -- Fallback for builds where the global helper is not installed yet. The
+        -- dedicated coroutine writes its real send result back to state, so a
+        -- failed handshake or FireServer is not mistaken for a successful hit.
+        if not hitOk then
+            runtime.state.hitUseFallback = true
+            local token = hitSessionId()
+            if token and runtime.hitThread then
+                runtime.hitRequest = {part = primary, list = others}
+                runtime.hitResult = nil
+                local resumed, err = coroutine.resume(runtime.hitThread)
+                if not resumed then
+                    hitOk = false
+                    dbg("Hit session stopped: " .. tostring(err))
+                else
+                    local result = runtime.hitResult
+                    hitOk = result and result.ok == true
+                end
+            end
         end
     end
 
-    state.lastRemoteAttackAt = tick()
-    return attackOk and hitOk
+    runtime.state.lastRemoteAttackAt = tick()
+    -- FireServer only tells us that the packet was dispatched. It does not
+    -- tell us that the server accepted the hit; doAttack waits for the mob's
+    -- health to change before it suppresses the normal tool activation.
+    runtime.state.attackHitDispatched = hitOk
+    runtime.state.aoeRequested = #pairs_
+    runtime.state.aoeConfirmed = 0
+    runtime.state.attackDispatched = attackOk and hitOk
+    return runtime.state.attackDispatched
 end
 
 local function doAttack(tool, target)
     if not tool then return false end
     local char = LocalPlayer.Character
-    -- The stun of this game is a client value that can stay up while the mobs
-    -- are around: refusing to swing on it is what made the farm hit nothing.
-    -- It is zeroed here instead, the way the hubs do it.
-    local stun = char and char:FindFirstChild("Stun")
-    if stun then
+    local epoch = runtime.characterEpoch
+    if not char then return false end
+    if runtime.config.FastAttack then fastAttack() end
+    -- A fruit is a skill item, not a basic melee swing.
+    if isFruit(tool) then return false end
+
+    local animLength, combo = attackAnimLength(tool)
+    runtime.state.attackAnimLength = animLength
+
+    local now = tick()
+    local gun = isGun(tool)
+    local gunAlreadyFiring = gun and tool:GetAttribute("IsAutoShooting")
+    if gunAlreadyFiring then
+        -- A Gatling gun owns its firing loop. Starting the controller a second
+        -- time would run two loops over the same magazine.
+        runtime.state.attackNextAt = now + 0.05
+        return false
+    end
+
+    -- Keep the health of the primary target and of every AOE target. A
+    -- successful remote dispatch is not a server acknowledgement; only a real
+    -- health decrease proves that a mob was hit.
+    local watched = {}
+    local attackPairs = nil
+    if not gun then
+        local root = getRoot()
+        attackPairs = aoePairs(root, target)
+        for _, entry in ipairs(attackPairs) do
+            local mob = entry[1]
+            local hum = mob and mob:FindFirstChildOfClass("Humanoid")
+            if hum then watched[mob] = hum.Health end
+        end
+        runtime.state.aoeRequested = #attackPairs
+    else
+        local targetHum = target and target:FindFirstChildOfClass("Humanoid")
+        if targetHum then watched[target] = targetHum.Health end
+        runtime.state.aoeRequested = 1
+    end
+
+    local function confirmedDamage(deadline)
+        local count, primaryConfirmed = 0, false
+        while tick() < deadline do
+            count, primaryConfirmed = 0, false
+            for mob, health in pairs(watched) do
+                local hum = mob and mob:FindFirstChildOfClass("Humanoid")
+                -- A vanished model is not a health confirmation. The Humanoid
+                -- has to still be there with a smaller Health value.
+                if hum and hum.Health < health then
+                    count = count + 1
+                    if mob == target then primaryConfirmed = true end
+                end
+            end
+            if primaryConfirmed then return true, count end
+            task.wait(0.02)
+            if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                or LocalPlayer.Character ~= char then return false, count end
+        end
+        return false, count
+    end
+
+    local dispatched = false
+    if runtime.config.RemoteAttack then
+        dispatched = remoteAttack(target, tool, animLength, combo, attackPairs)
+    else
+        runtime.state.aoeCount = 1
+    end
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
+
+    local speed = tonumber(runtime.state.attackSpeed) or 1
+    local charSpeed = char and tonumber(char:GetAttribute("AttackSpeedMultiplier")) or 1
+    if charSpeed > speed then speed = charSpeed end
+    if speed < 0.1 then speed = 0.1 end
+
+    local delay
+    if gun then
+        -- A normal gun uses ShootInterval until the magazine is empty and then
+        -- Cooldown to reload. Gatling guns use their own automatic cadence.
+        local interval = animLength
         pcall(function()
-            if stun:IsA("BoolValue") then
-                stun.Value = false
-            else
-                stun.Value = 0
+            local combatUtil = combatUtilModule()
+            local weaponName = combatUtil and combatUtil:GetWeaponName(tool)
+            local data = weaponName and combatUtil:GetWeaponData(weaponName)
+            if data then
+                local shotsLeft = tonumber(tool:GetAttribute("LocalShotsLeft")) or 0
+                local remaining = math.max(0, shotsLeft - 1)
+                if data.ShootStyle ~= "Gatling" and remaining > 0 then
+                    interval = tonumber(data.ShootInterval) or tonumber(data.Cooldown) or interval
+                else
+                    interval = tonumber(data.Cooldown) or tonumber(data.ShootInterval) or interval
+                end
             end
         end)
-    end
-    if CONFIG.FastAttack then fastAttack() end
-    -- The combat-state helper of the game is not a gate here: the cooldown of
-    -- the script and the stun above already decide. A helper that reports a
-    -- stale "cannot attack" is what left the bot swinging at nothing.
-    local remote = false
-    if CONFIG.RemoteAttack then
-        remote = remoteAttack(target, tool)
-        -- When the remote path is ready it is the complete attack. Activating
-        -- the tool as well would register a second attack and a second combo
-        -- step, which can make the server discard one of the two packets.
-        if remote then return true end
+        delay = interval / speed + (runtime.config.AttackCooldown or 0)
     else
-        state.aoeCount = 1
+        -- The live controller can cancel a basic attack at 80% of its
+        -- animation. runtime.config.AttackCooldown is only an optional extra delay.
+        delay = animLength * 0.8 / speed + (runtime.config.AttackCooldown or 0)
     end
-    -- a fruit in hand is eaten by its activation, never used as a swing
-    if isFruit(tool) then return remote end
-    -- The normal tool activation remains the fallback for a missing or
-    -- rejected remote path.
-    local ok = pcall(function() tool:Activate() end)
-    return ok or remote
+    if delay < 0.05 then delay = 0.05 end
+
+    if dispatched then
+        runtime.state.attackNextAt = now + delay
+        runtime.state.lastAttack = now
+        local deadline = now + (gun and 0.45 or math.max(0.35, animLength * 0.8 + 0.15))
+        local confirmed, confirmedCount = confirmedDamage(deadline)
+        runtime.state.attackConfirmed = confirmed
+        runtime.state.attackFallback = false
+        runtime.state.aoeConfirmed = confirmedCount
+        runtime.state.aoeCount = confirmedCount
+        if confirmed then return true end
+
+        -- A gun has already gone through the game's controller. Activating
+        -- the tool again would send a second shot, so the controller is left
+        -- to own the next attempt.
+        if gun and runtime.config.RemoteAttack then return true end
+
+        -- The melee hit packet was already dispatched. Activating the tool as
+        -- a fallback would send the same hit a second time through the game
+        -- controller. Wait for the next cadence instead.
+        if runtime.state.attackHitDispatched then return true end
+    elseif gun and runtime.config.RemoteAttack then
+        -- The controller refused this attempt (usually a reload or cooldown).
+        -- It must not be bypassed with a raw tool activation.
+        runtime.state.attackNextAt = now + math.max(delay, 0.1)
+        return false
+    end
+
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
+    local activated = pcall(function() tool:Activate() end)
+    if not activated then return false end
+    runtime.state.attackNextAt = now + delay
+    runtime.state.lastAttack = now
+    runtime.state.attackFallback = true
+    local count = runtime.state.attackComboCount or 1
+    if not runtime.state.attackComboSent then
+        runtime.state.attackCombo = combo
+    elseif count > 0 then
+        -- The remote already used one combo index; the controller's fallback
+        -- activation is the next one.
+        runtime.state.attackCombo = (combo % count) + 1
+    end
+    runtime.state.attackComboAt = now
+
+    -- The fallback is the game's normal activation, so its result is checked
+    -- in exactly the same way as the remote path.
+    local confirmed, confirmedCount = confirmedDamage(now + math.max(0.15, math.min(delay, 0.5)))
+    runtime.state.attackConfirmed = confirmed
+    runtime.state.aoeConfirmed = confirmedCount
+    runtime.state.aoeCount = confirmedCount
+    return true
 end
 
 local function mobInReach(root, reach)
@@ -2409,7 +2978,7 @@ end
 
 local function autoAttackSwing(current)
     local now = tick()
-    if now - state.lastAttack < CONFIG.AttackCooldown then return false end
+    if runtime.state.attackNextAt and now < runtime.state.attackNextAt then return false end
     local tool = equipWeapon()
     if not tool or isFruit(tool) then return false end
     local root = getRoot()
@@ -2418,8 +2987,8 @@ local function autoAttackSwing(current)
     local best = mobInReach(root, reach)
     if not best then return false end
     if doAttack(tool, best) then
-        state.lastAttack = now
-        if best ~= current then state.status = "Attacking " .. best.Name end
+        runtime.state.lastAttack = now
+        if best ~= current then runtime.state.status = "Attacking " .. best.Name end
         return true
     end
     return false
@@ -2457,7 +3026,7 @@ local function recentlyFailed(obj, now)
 end
 
 local function scanFruits(root, now)
-    local best, bestD = nil, CONFIG.FruitScanRadius
+    local best, bestD = nil, runtime.config.FruitScanRadius
     local char = LocalPlayer.Character
     local backpack = LocalPlayer:FindFirstChild("Backpack")
 
@@ -2548,6 +3117,9 @@ end
 local function useFruitMenu(fruitName, actions)
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     if not pg then return false end
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not runtime.isCurrent() or not char then return false end
     local function press(d)
         -- MouseButton1Click is a signal, not a BindableEvent: it has no
         -- :Fire(). The executor helper is the way to click a game button.
@@ -2574,6 +3146,8 @@ local function useFruitMenu(fruitName, actions)
             end
         end
         task.wait(0.2)
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return false end
     end
     for _, action in ipairs(actions) do
         for _, d in ipairs(pg:GetDescendants()) do
@@ -2609,18 +3183,24 @@ end
 local function eatFruit(tool)
     local char = LocalPlayer.Character
     local hum = getHumanoid()
+    local epoch = runtime.characterEpoch
     if not tool or not char or not hum then return false end
     local name = tool.Name
     if tool.Parent ~= char then
         pcall(function() hum:EquipTool(tool) end)
         task.wait(0.1)
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return false end
     end
     if tool.Parent ~= char then
         dbg("Could not equip " .. tool.Name)
         return false
     end
     pcall(function() tool:Activate() end)
-    if useFruitMenu(name, {"eat"}) then
+    local used = useFruitMenu(name, {"eat"})
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
+    if used then
         dbg("Ate " .. name .. " from the menu")
         return true
     end
@@ -2630,6 +3210,9 @@ end
 
 local function storeFruit(tool)
     if not tool then return false end
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not char then return false end
     -- The game stores a fruit itself when the remote gets the tool: the server
     -- moves it into the bank at once. This is the path the hubs use; the GUI
     -- of the storage npc is only the fallback for builds without the remote.
@@ -2640,8 +3223,12 @@ local function storeFruit(tool)
         -- so the name is only tried when the call with the tool did not go
         -- through: asking twice can make the game eat or drop the fruit
         local ok = pcall(function() commF:InvokeServer("StoreFruit", tool) end)
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return false end
         if not ok then
             ok = pcall(function() commF:InvokeServer("StoreFruit", tool.Name) end)
+            if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                or LocalPlayer.Character ~= char then return false end
         end
         if not ok then
             dbg("The store remote refused " .. tool.Name)
@@ -2656,11 +3243,16 @@ local function storeFruit(tool)
                 return true
             end
             task.wait(0.1)
+            if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                or LocalPlayer.Character ~= char then return false end
         end
         dbg("The store remote did not take " .. tool.Name)
         return false
     end
-    if useFruitMenu(tool.Name, {"store", "deposit", "stash"}) then
+    local used = useFruitMenu(tool.Name, {"store", "deposit", "stash"})
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
+    if used then
         dbg("Asked the game to store " .. tool.Name)
         return true
     end
@@ -2670,7 +3262,7 @@ end
 local function fruitWasTaken(fruit)
     local p = fruit.Parent
     if p == nil then
-        return toolCount() > state.fruitToolCount
+        return toolCount() > runtime.state.fruitToolCount
     end
     local backpack = LocalPlayer:FindFirstChild("Backpack")
     if backpack and fruit:IsDescendantOf(backpack) then return true end
@@ -2680,14 +3272,14 @@ local function fruitWasTaken(fruit)
 end
 
 local function confirmFruitPickup(fruit)
-    state.fruitsFound = state.fruitsFound + 1
+    runtime.state.fruitsFound = runtime.state.fruitsFound + 1
     local name = fruit.Name
-    local tool = newTool(state.fruitTools) or findFruitTool(name)
-    state.fruit = nil
-    state.fruitTries = 0
-    state.fruitTools = nil
+    local tool = newTool(runtime.state.fruitTools) or findFruitTool(name)
+    runtime.state.fruit = nil
+    runtime.state.fruitTries = 0
+    runtime.state.fruitTools = nil
     dbg("Picked up " .. name)
-    if CONFIG.EatFruit and tool then
+    if runtime.config.EatFruit and tool then
         eatFruit(tool)
         equipWeapon()
     end
@@ -2697,57 +3289,57 @@ end
 local function handleFruit(root)
     local now = tick()
 
-    if now - state.lastFruitScan >= 1.5 and not state.fruit then
-        state.lastFruitScan = now
+    if now - runtime.state.lastFruitScan >= 1.5 and not runtime.state.fruit then
+        runtime.state.lastFruitScan = now
         local best = scanFruits(root, now)
         if best then
-            state.fruit, state.fruitStart, state.fruitTries = best, now, 0
-            state.fruitLastTry = 0
-            state.fruitToolCount = toolCount()
-            state.fruitTools = ownedTools()
+            runtime.state.fruit, runtime.state.fruitStart, runtime.state.fruitTries = best, now, 0
+            runtime.state.fruitLastTry = 0
+            runtime.state.fruitToolCount = toolCount()
+            runtime.state.fruitTools = ownedTools()
             dbg("Fruit spotted: " .. best.Name)
         end
     end
 
-    local fruit = state.fruit
+    local fruit = runtime.state.fruit
     if not fruit then return false end
 
     local handle = fruit.Parent and toolPart(fruit)
     if not handle then
         if fruitWasTaken(fruit) then confirmFruitPickup(fruit) end
-        state.fruit = nil
-        state.fruitTools = nil
+        runtime.state.fruit = nil
+        runtime.state.fruitTools = nil
         return false
     end
 
-    state.status = "Fruit: " .. fruit.Name
-    moveTo(handle.CFrame)
+    runtime.state.status = "Fruit: " .. fruit.Name
+    runtime.moveTo(handle.CFrame)
 
     if (root.Position - handle.Position).Magnitude < 8 then
-        if now - state.fruitLastTry >= CONFIG.FruitTouchInterval then
-            state.fruitLastTry = now
+        if now - runtime.state.fruitLastTry >= runtime.config.FruitTouchInterval then
+            runtime.state.fruitLastTry = now
             pcall(function()
                 if firetouchinterest then
                     firetouchinterest(root, handle, 0)
                     firetouchinterest(root, handle, 1)
                 end
             end)
-            state.fruitTries = state.fruitTries + 1
+            runtime.state.fruitTries = runtime.state.fruitTries + 1
             if fruitWasTaken(fruit) then
                 confirmFruitPickup(fruit)
-            elseif state.fruitTries >= CONFIG.FruitPickupTries then
+            elseif runtime.state.fruitTries >= runtime.config.FruitPickupTries then
                 grabbedFruits[fruit] = now
-                state.fruit = nil
-                state.fruitTries = 0
-                state.fruitTools = nil
+                runtime.state.fruit = nil
+                runtime.state.fruitTries = 0
+                runtime.state.fruitTools = nil
                 dbg("Could not pick up " .. fruit.Name)
             end
         end
-    elseif now - state.fruitStart > 20 then
+    elseif now - runtime.state.fruitStart > 20 then
         grabbedFruits[fruit] = now
-        state.fruit = nil
-        state.fruitTries = 0
-        state.fruitTools = nil
+        runtime.state.fruit = nil
+        runtime.state.fruitTries = 0
+        runtime.state.fruitTools = nil
         dbg("Gave up on " .. fruit.Name)
     end
     return true
@@ -2835,10 +3427,13 @@ local function statPoints()
 end
 
 local function tryUpgradeStats()
-    if not CONFIG.AutoStats then return end
+    if not runtime.config.AutoStats then return end
     local now = tick()
-    if now - (state.statAt or 0) < (CONFIG.AutoStatWait or 3) then return end
-    local wanted = STAT_TARGETS[CONFIG.AutoStatTarget] or CONFIG.AutoStatTarget
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not char then return end
+    if now - (runtime.state.statAt or 0) < (runtime.config.AutoStatWait or 3) then return end
+    local wanted = STAT_TARGETS[runtime.config.AutoStatTarget] or runtime.config.AutoStatTarget
     local targets = {}
     if wanted == "All" then
         for _, stat in ipairs(STAT_LIST) do targets[stat] = true end
@@ -2856,8 +3451,10 @@ local function tryUpgradeStats()
                 dbg(stat .. " is at the maximum")
             elseif level then
                 local ok = pcall(function() commF:InvokeServer("AddPoint", stat, 9999) end)
+                if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                    or LocalPlayer.Character ~= char then return end
                 if ok then
-                    state.statAt = now
+                    runtime.state.statAt = now
                     dbg("Stat up: " .. stat)
                     return
                 end
@@ -2866,6 +3463,7 @@ local function tryUpgradeStats()
     end
 end
 
+runtime.takeWhirlpool = nil
 takeWhirlpool = nil
 
 -- Is this destination a place under the sea, and is the player still up here?
@@ -2874,7 +3472,7 @@ local function islandPositions()
     -- The map of the game and its island parts do not change while a server
     -- runs, so they are read once a second instead of on every tick of a walk.
     local now = tick()
-    local cache = state.islandCache
+    local cache = runtime.state.islandCache
     if not cache or now - cache.at >= 1 then
         local list, known = {}, {}
         local ok, map = pcall(function() return Workspace:GetAttribute("MAP") end)
@@ -2897,7 +3495,7 @@ local function islandPositions()
             end
         end
         cache = {list = list, at = now}
-        state.islandCache = cache
+        runtime.state.islandCache = cache
     end
     local list = {}
     for _, entry in ipairs(cache.list) do table.insert(list, entry) end
@@ -2932,7 +3530,7 @@ end
 
 -- Where the warp door of the sea is: the whirlpool island of the game, with
 -- the whirlpool part of the world as the fallback.
-function whirlpoolPos()
+function runtime.whirlpoolPos()
     for _, island in ipairs(islandPositions()) do
         if island.name:lower():find("whirlpool", 1, true) then return island.pos end
     end
@@ -2944,21 +3542,24 @@ function whirlpoolPos()
     end
     return nil
 end
+whirlpoolPos = runtime.whirlpoolPos
 
-function travelTo(cf, noWarp)
+function runtime.travelTo(cf, noWarp)
     -- A farm under the sea goes through the whirlpool of the sea first: fly
     -- there with the tween of the script, let the game drop the player under
     -- the sea, and only then walk the rest of the way. Nothing on this route
     -- is ever warped: a teleport here is what made the character jump around.
-    if not noWarp and not state.whirlpooling and takeWhirlpool and needsWhirlpool(cf.Position) then
-        state.whirlpooling = true
-        takeWhirlpool()
-        state.whirlpooling = false
+    if not noWarp and not runtime.state.whirlpooling and runtime.takeWhirlpool
+        and needsWhirlpool(cf.Position) then
+        runtime.state.whirlpooling = true
+        runtime.takeWhirlpool()
+        runtime.state.whirlpooling = false
         noWarp = true
     end
-    moveTo(cf, noWarp)
+    runtime.moveTo(cf, noWarp)
     return false
 end
+travelTo = runtime.travelTo
 
 
 -- ================= WORLD (SEA) TRAVEL =================
@@ -2969,6 +3570,9 @@ local WORLD_TRAVEL = {"TravelMain", "TravelDressrosa", "TravelZou"}
 local function travelToWorld(world)
     local what = WORLD_TRAVEL[world]
     if not what then return false end
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not char then return false end
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     local commF = remotes and remotes:FindFirstChild("CommF_")
     if not commF then
@@ -2976,6 +3580,8 @@ local function travelToWorld(world)
         return false
     end
     local ok = pcall(function() commF:InvokeServer(what) end)
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
     if ok then
         dbg("Travelling to world " .. tostring(world))
         return true
@@ -2993,17 +3599,20 @@ end
 -- straight tween across the sea, like the player would glide over.
 local function flyTo(position)
     local root = getRoot()
-    if not root or not position then return false end
-    if state.flying then
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not root or not position or not char then return false end
+    if runtime.state.flying then
         dbg("Already flying to an island")
         return false
     end
-    state.flying = true
-    stopTween()
+    runtime.state.flying = true
+    runtime.stopTween()
     local here = root.Position
     local distance = (here - position).Magnitude
     dbg("Flying to the island (" .. tostring(math.floor(distance)) .. " studs)")
-    setFlying()
+    runtime.setFlying()
+    local stale = false
     local ok, err = pcall(function()
         -- A long flight goes up first, then over, then down. A straight line
         -- across the sea dips into the water, and the game drops a character
@@ -3015,20 +3624,30 @@ local function flyTo(position)
             {point = position + Vector3.new(0, 6, 0), slack = 12},
         }
         for _, leg in ipairs(legs) do
-            tweenTo(CFrame.new(leg.point))
-            local deadline = tick() + math.max(distance / CONFIG.MoveSpeed, 0.12) + 8
+            runtime.tweenTo(CFrame.new(leg.point))
+            local deadline = tick() + math.max(distance / runtime.config.MoveSpeed, 0.12) + 8
             while tick() < deadline do
                 local now = getRoot()
                 if not now then break end
                 if (now.Position - leg.point).Magnitude <= leg.slack then break end
                 -- a flight that is going somewhere is not a task that got stuck
-                state.blockAt = tick()
+                runtime.state.blockAt = tick()
                 task.wait(0.2)
+                if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                    or LocalPlayer.Character ~= char then
+                    stale = true
+                    break
+                end
             end
+            if stale then break end
         end
     end)
-    state.flying = false
-    setWalking()
+    runtime.state.flying = false
+    if runtime.isCurrent() and runtime.characterEpoch == epoch
+        and LocalPlayer.Character == char then
+        runtime.setWalking()
+    end
+    if stale then return false end
     if not ok then
         dbg("The flight failed: " .. tostring(err))
         return false
@@ -3042,6 +3661,9 @@ local SUBMERGED_FLY = Vector3.new(-16269.41, 23.98, 1371.66)
 
 local function specialTravel(name)
     local lower = tostring(name):lower()
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not char then return false end
     local modules = ReplicatedStorage:FindFirstChild("Modules")
     local net = modules and modules:FindFirstChild("Net")
     if not net then
@@ -3052,12 +3674,16 @@ local function specialTravel(name)
         -- stand at the submarine first, then let it take us down
         dbg("Flying to the submarine of " .. tostring(name))
         flyTo(SUBMERGED_FLY)
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return false end
         local sub = net:FindFirstChild("RF/SubmarineWorkerSpeak")
         if not sub then
             dbg("The submarine remote of the game was not found")
             return false
         end
         local ok = pcall(function() sub:InvokeServer("TravelToSubmergedIsland") end)
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return false end
         if ok then
             dbg("Asked the submarine to take us to " .. tostring(name))
             return true
@@ -3190,14 +3816,19 @@ local WHIRLPOOL_STYLES = {["Fishman Karate"] = true, ["Water Kung Fu"] = true}
 -- Fly to the whirlpool of the sea and wait until the game drops the player
 -- under it. That is the way to Underwater (the Water Kung-fu teacher lives
 -- there too). Nothing here is warped: it is a normal flight at MoveSpeed.
-function takeWhirlpool()
-    local pos = whirlpoolPos()
+function runtime.takeWhirlpool()
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not char then return false end
+    local pos = runtime.whirlpoolPos()
     if not pos then
         dbg("The whirlpool of the sea was not found")
         return false
     end
     dbg("Flying into the whirlpool of the sea")
     flyTo(pos)
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
     -- the place to compare against is where the flight left the player: the
     -- jump the game does from here is what puts us under the sea
     local root = getRoot()
@@ -3206,19 +3837,25 @@ function takeWhirlpool()
     while tick() < deadline do
         local now = getRoot()
         if not now then break end
+        runtime.state.blockAt = tick()
         if before and (now.Position - before).Magnitude > 500 then
             dbg("The whirlpool took us under the sea")
             -- the mobs and the givers under the sea are streamed in a moment
             -- later: the farm starts when the place is there
             task.wait(0.8)
+            if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                or LocalPlayer.Character ~= char then return false end
             return true
         end
-        travelTo(CFrame.new(pos), true)
+        runtime.travelTo(CFrame.new(pos), true)
         task.wait(0.3)
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return false end
     end
     dbg("The whirlpool did not take us this time")
     return false
 end
+takeWhirlpool = runtime.takeWhirlpool
 
 -- The game only takes the buy when the player stands at the teacher of the
 -- style, so the bot walks to it first and asks there.
@@ -3228,10 +3865,14 @@ local function buyStyle(style)
         dbg("CommF_ remote missing")
         return false
     end
-    if state.shopping then
+    if runtime.state.shopping or runtime.state.shopInFlight then
         dbg("A buy is already running")
         return false
     end
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not char then return false end
+
     -- What the style needs is checked before the walk: a teacher that will
     -- refuse is a wasted trip, and the player has to see why nothing happened.
     if style.level and getMyLevel() < style.level then
@@ -3250,9 +3891,22 @@ local function buyStyle(style)
             .. " Beli, we have " .. math.floor(beli))
         return false
     end
-    state.shopping = true
+
+    -- An unknown reply is not a refusal, but it is also not permission to send
+    -- the same purchase over and over. It gets a short cooldown.
+    local unknownAt = runtime.state.shopUnknown[style.remote]
+    if unknownAt and tick() - unknownAt < 60 then
+        dbg("Auto buy: " .. style.name .. " has an unknown result; waiting before retrying")
+        return nil
+    end
+
+    local requestToken = (runtime.state.shopToken or 0) + 1
+    runtime.state.shopToken = requestToken
+    runtime.state.shopping = true
     if WHIRLPOOL_STYLES[style.name] then
-        takeWhirlpool()
+        runtime.takeWhirlpool()
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return false end
     end
     local npc = findTeacher(style.teacher)
     local near = false
@@ -3260,30 +3914,77 @@ local function buyStyle(style)
         local deadline = tick() + 25
         pcall(function()
             while tick() < deadline do
+                if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                    or LocalPlayer.Character ~= char then return false end
                 local root, anchor = getRoot(), anchorOf(npc)
                 if not root or not anchor then break end
+                runtime.state.blockAt = tick()
                 if (root.Position - anchor.Position).Magnitude <= 8 then
                     near = true
                     break
                 end
-                travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)), true)
+                runtime.travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)), true)
                 task.wait(0.2)
             end
         end)
     end
-    local ok, reply = true, nil
-    for _ = 1, 3 do
-        ok, reply = pcall(function() return commF:InvokeServer(style.remote) end)
-        if not ok or reply == false then
-            dbg("The game did not take the buy of " .. style.name)
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
+    if runtime.state.shopToken ~= requestToken then return false end
+
+    -- The game's own dialogue asks the same remote with true to learn whether
+    -- the style is already owned. Advanced Combat has no such check in the
+    -- live dialogue list, so it is never asked with the extra argument.
+    if style.remote ~= "BuyAdvancedCombat" then
+        local checkOk, owned = pcall(function() return commF:InvokeServer(style.remote, true) end)
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return false end
+        if runtime.state.shopToken ~= requestToken then return false end
+        if checkOk and owned == 1 then
+            runtime.state.shopping = false
+            runtime.state.shopUnknown[style.remote] = nil
+            dbg("Auto buy: " .. style.name .. " is already owned")
+            return true
         end
-        task.wait(0.4)
     end
-    state.shopping = false
-    local bought = ok and reply ~= false
+
+    -- Send the request once. Repeating it can buy the same style more than
+    -- once when the server has no reply yet. The live buy RPCs answer 1 for a
+    -- successful purchase and 2 when the style is already known.
+    runtime.state.shopInFlight = true
+    local ok, reply = pcall(function() return commF:InvokeServer(style.remote) end)
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
+    if runtime.state.shopToken ~= requestToken then return false end
+    runtime.state.shopInFlight = false
+    runtime.state.shopping = false
+
+    local bought
+    if not ok then
+        bought = false
+        runtime.state.shopUnknown[style.remote] = nil
+        dbg("The buy request for " .. style.name .. " failed")
+    elseif reply == 1 or reply == true then
+        bought = true
+        runtime.state.shopUnknown[style.remote] = nil
+    elseif reply == 2 then
+        bought = true
+        runtime.state.shopUnknown[style.remote] = nil
+        dbg(style.name .. " was already owned")
+    elseif reply == nil then
+        bought = nil
+        runtime.state.shopUnknown[style.remote] = tick()
+        dbg("The game did not answer the buy of " .. style.name)
+    else
+        bought = false
+        runtime.state.shopUnknown[style.remote] = nil
+        dbg("The game refused the buy of " .. style.name
+            .. " (reply " .. tostring(reply) .. ")")
+    end
     dbg("Buy " .. style.name .. " from " .. (npc and "the teacher" or "far away")
         .. (npc and (near and " (stood at it)" or " (could not reach it)") or " (no teacher was seen)")
-        .. (bought and " (the game took it)" or " (the game refused it)"))
+        .. (bought == true and " (the game took it)"
+            or (bought == false and " (the game refused it)" or " (result unknown)")))
     return bought
 end
 
@@ -3293,42 +3994,72 @@ local function buyAbility(remote, what)
         dbg("CommF_ remote missing")
         return false
     end
-    if state.shopping then
+    if runtime.state.shopping or runtime.state.shopInFlight then
         dbg("A buy is already running")
         return false
     end
-    state.shopping = true
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    if not char then return false end
+    local requestToken = (runtime.state.shopToken or 0) + 1
+    runtime.state.shopToken = requestToken
+    runtime.state.shopping = true
+    runtime.state.shopInFlight = true
     local ok, reply = pcall(function() return commF:InvokeServer(remote, what) end)
-    state.shopping = false
-    if not ok or reply == false then
-        dbg("The game did not take the buy of " .. tostring(what))
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
+    if runtime.state.shopToken ~= requestToken then return false end
+    runtime.state.shopInFlight = false
+    runtime.state.shopping = false
+    if not ok then
+        dbg("The buy request for " .. tostring(what) .. " failed")
         return false
     end
-    dbg("Asked the game to buy " .. tostring(what))
-    return true
+    if reply == 1 or reply == true then
+        dbg("The game took the buy of " .. tostring(what))
+        return true
+    end
+    if reply == 2 then
+        dbg(tostring(what) .. " was already owned")
+        return true
+    end
+    if reply == nil then
+        dbg("The game did not answer the buy of " .. tostring(what))
+        return nil
+    end
+    dbg("The game refused the buy of " .. tostring(what)
+        .. " (reply " .. tostring(reply) .. ")")
+    return false
 end
 
 -- ================= MAIN LOOP =================
 -- The mobs that were frozen for the farm are let go again with this.
 
 local function releaseBringMobs()
-    for mob, part in pairs(state.bringHeld) do
-        letGoMob(mob, part)
+    for mob, part in pairs(runtime.state.bringHeld) do
+        runtime.letGoMob(mob, part)
     end
-    state.bringHeld = setmetatable({}, {__mode = "k"})
-    state.bringSlot = setmetatable({}, {__mode = "k"})
-    state.bringSlotCount = 0
+    runtime.state.bringHeld = setmetatable({}, {__mode = "k"})
+    runtime.state.bringSlot = setmetatable({}, {__mode = "k"})
+    runtime.state.bringSlotCount = 0
     -- the point of the last pack dies with it, so the next fight is gathered
     -- where the fight actually is
-    state.bringPoint, state.bringTarget, state.bringCentre = nil, nil, nil
-    -- The "given up" mark only makes sense while the pack is being carried.
-    -- Left behind after a stop it would hide those mobs from every later
-    -- target scan, so it is taken off with the pack.
-    for mob in pairs(state.bringIgnored) do
+    runtime.state.bringPoint, runtime.state.bringTarget, runtime.state.bringCentre = nil, nil, nil
+    runtime.state.bringMoved = setmetatable({}, {__mode = "k"})
+    runtime.state.bringHealth = setmetatable({}, {__mode = "k"})
+    runtime.state.bringSaved = setmetatable({}, {__mode = "k"})
+    runtime.state.bringSnapped = setmetatable({}, {__mode = "k"})
+    runtime.state.bringCarryingTarget = setmetatable({}, {__mode = "k"})
+    runtime.state.bringOwned = setmetatable({}, {__mode = "k"})
+    runtime.state.bringMover = setmetatable({}, {__mode = "k"})
+    runtime.state.bringMoverId = setmetatable({}, {__mode = "k"})
+    runtime.state.bringAt = 0
+    -- markers left by older builds are removed; nothing creates them any more
+    for mob in pairs(runtime.state.bringIgnored) do
         local marker = mob:FindFirstChild("FarmIgnored")
         if marker then pcall(function() marker:Destroy() end) end
     end
-    state.bringIgnored = setmetatable({}, {__mode = "k"})
+    runtime.state.bringIgnored = setmetatable({}, {__mode = "k"})
 end
 
 
@@ -3336,28 +4067,98 @@ end
 -- Without this the farm keeps chasing a corpse: the old target, the old
 -- bring point, the old fruit and the old tween all stay behind.
 local function fullReset(reason)
-    stopTween()
+    -- Every operation that can yield captures this epoch. A respawn or a
+    -- character removal invalidates those operations before they can move or
+    -- mutate the new character.
+    runtime.characterEpoch = (runtime.characterEpoch or 0) + 1
+    runtime.stopTween()
     restoreNoclip()
     releaseBringMobs()
     restoreHitbox()
+    runtime.resetTransient(reason or "character reset")
     raiseSimulationRadius()
-    state.farming = false
-    state.fruit, state.fruitTools, state.fruitTries = nil, nil, 0
-    state.lastTarget, state.targetHealth, state.targetAt, state.targetDist = nil, nil, 0, nil
-    state.bringPoint, state.bringTarget, state.bringCentre = nil, nil, nil
-    state.bringMoved = setmetatable({}, {__mode = "k"})
-    state.bringIgnored = setmetatable({}, {__mode = "k"})
-    state.bringHealth = setmetatable({}, {__mode = "k"})
-    state.bringHeld = setmetatable({}, {__mode = "k"})
-    state.bringSaved = setmetatable({}, {__mode = "k"})
-    state.bringSlot = setmetatable({}, {__mode = "k"})
-    state.bringSlotCount = 0
-    state.bringAt = 0
-    state.flying, state.shopping, state.questing, state.whirlpooling = false, false, false, false
-    state.lastSafe, state.lastPos, state.movedAt = nil, nil, 0
+    runtime.state.farming = false
+    runtime.state.fruit, runtime.state.fruitTools, runtime.state.fruitTries = nil, nil, 0
+    runtime.state.lastTarget, runtime.state.targetHealth, runtime.state.targetAt, runtime.state.targetDist = nil, nil, 0, nil
+    runtime.state.bringPoint, runtime.state.bringTarget, runtime.state.bringCentre = nil, nil, nil
+    runtime.state.bringMoved = setmetatable({}, {__mode = "k"})
+    runtime.state.bringIgnored = setmetatable({}, {__mode = "k"})
+    runtime.state.bringHealth = setmetatable({}, {__mode = "k"})
+    runtime.state.bringHeld = setmetatable({}, {__mode = "k"})
+    runtime.state.bringSaved = setmetatable({}, {__mode = "k"})
+    runtime.state.bringSnapped = setmetatable({}, {__mode = "k"})
+    runtime.state.bringCarryingTarget = setmetatable({}, {__mode = "k"})
+    runtime.state.bringOwned = setmetatable({}, {__mode = "k"})
+    runtime.state.bringMover = setmetatable({}, {__mode = "k"})
+    runtime.state.bringSlot = setmetatable({}, {__mode = "k"})
+    runtime.state.bringSlotCount = 0
+    runtime.state.bringAt = 0
+    runtime.state.flying, runtime.state.shopping, runtime.state.questing, runtime.state.whirlpooling = false, false, false, false
+    runtime.state.shopToken = (runtime.state.shopToken or 0) + 1
+    runtime.state.shopInFlight = false
+    runtime.state.shopUnknown = {}
+
+    -- A reset starts the quest bookkeeping from scratch. The server may still
+    -- know the quest, but the next QuestUpdate is what verifies it again.
+    runtime.state.currentQuest = nil
+    runtime.state.questSentAt = 0
+    runtime.state.lastQuestTry = 0
+    runtime.state.questDone = false
+    runtime.state.questDoneMob = nil
+    runtime.state.questAsked = nil
+    runtime.state.questAskedAt = 0
+    runtime.state.questSeenUntil = 0
+    runtime.state.questVerified = false
+    runtime.state.questGaveUp = false
+    runtime.state.questTryKey = nil
+    runtime.state.questTried = {}
+    runtime.state.questIndexTry = nil
+    runtime.state.bossQuestName = nil
+    runtime.state.bossQuestUntil = nil
+    runtime.state.bossQuestCd = 0
+
+    runtime.state.turnInSince, runtime.state.turnInFailed, runtime.state.turnInFailedAt = nil, false, 0
+    runtime.state.seekSince, runtime.state.seekGaveUp, runtime.state.seekGaveUpAt = nil, false, 0
+    runtime.state.panelInfo, runtime.state.questNpc, runtime.state.questPos = nil, nil, nil
+    runtime.state.lastSafe, runtime.state.lastPos, runtime.state.movedAt = nil, nil, 0
     stuckTargets = {}
     enemyCache, enemyCacheAt = {}, 0
+    runtime.state.otherPlayerCache = nil
+    runtime.state.spawnCentreCache = nil
+    gameQuestCache, gameQuestCacheAt = nil, nil
+    giverCache, giverCacheAt = {}, -999
+    for fruit in pairs(grabbedFruits) do grabbedFruits[fruit] = nil end
+
+    -- Character-bound combat objects must not survive a respawn. The remote
+    -- wrappers, the controller and the hit-session coroutine all belong to
+    -- the old character.
+    if runtime.hitThread then
+        runtime.hitRequest = {stop = true}
+        pcall(coroutine.resume, runtime.hitThread)
+    end
+    combatController = nil
+    runtime.state.combatUtil, runtime.state.combatUtilMod = nil, nil
+    runtime.state.netModule, runtime.state.netModuleInstance = nil, nil
+    runtime.state.hitRemoteCache, runtime.state.attackRemoteCache = nil, nil
+    runtime.hitSessionId, runtime.hitThread, runtime.hitThreadRemote = nil, nil, nil
+    runtime.hitRequest, runtime.hitResult = nil, nil
+    runtime.hitHandshakeOk, runtime.hitHandshakeError = false, nil
+    runtime.state.hitUseFallback = false
     dbg("Reset after: " .. tostring(reason))
+end
+
+-- Register the gameplay cleanup with the one teardown installed at the top.
+-- The function values are captured on this runtime, so a later execution can
+-- never make this run stop or restore the newer run's movement by name.
+if not runtime.disposed then
+    runtime.restoreNoclip = restoreNoclip
+    runtime.releaseBringMobs = releaseBringMobs
+    runtime.restoreHitbox = restoreHitbox
+    table.insert(runtime.cleanupFns, function() runtime.stopTween() end)
+    table.insert(runtime.cleanupFns, function() runtime.restoreNoclip() end)
+    table.insert(runtime.cleanupFns, function() runtime.releaseBringMobs() end)
+    table.insert(runtime.cleanupFns, function() runtime.restoreHitbox() end)
+    table.insert(runtime.cleanupFns, function() runtime.resetTransient("teardown") end)
 end
 
 -- The game makes the player sit on the death screen for a few seconds before
@@ -3365,7 +4166,7 @@ end
 -- The screen has its own respawn button: pressing it brings the character back
 -- at once. When that button is not there nothing is done, the game still
 -- respawns on its own, only slower.
-pressRespawn = function()
+runtime.pressRespawn = function()
     local pressed = false
     -- Every way a death screen is answered: its own signal, the connections of
     -- that signal, the two mouse signals, a real click at its place on the
@@ -3446,50 +4247,51 @@ pressRespawn = function()
     if not pressed then dbg("Death screen: no respawn button found yet") end
     return pressed
 end
+pressRespawn = runtime.pressRespawn
 
 local function step()
     local root, hum = getRoot(), getHumanoid()
     local now = tick()
     if not root or not hum or hum.Health <= 0 then
-        if not state.dead then
-            state.dead = true
+        if not runtime.state.dead then
+            runtime.state.dead = true
             fullReset("the character died")
         end
-        state.status = "Respawning..."
+        runtime.state.status = "Respawning..."
         -- the death screen is looked at twice a second, not every tick
         -- the death screen is asked twice a second until it answers
-        if not state.respawnAt or now - state.respawnAt > 0.2 then
-            state.respawnAt = now
+        if not runtime.state.respawnAt or now - runtime.state.respawnAt > 0.2 then
+            runtime.state.respawnAt = now
             pcall(pressRespawn)
         end
         return
     end
-    if state.dead then
-        state.dead = false
+    if runtime.state.dead then
+        runtime.state.dead = false
         dbg("The character is back, farming again")
     end
 
-    if state.shakerAt == nil or now - state.shakerAt > 30 then
-        state.shakerAt = now
+    if runtime.state.shakerAt == nil or now - runtime.state.shakerAt > 30 then
+        runtime.state.shakerAt = now
         stopCameraShaker()
     end
 
     -- A boss that never shows up must not keep the bot away from the mobs:
     -- after the deadline the boss quests are left alone for a while.
-    if state.bossQuestName and state.bossQuestUntil and now > state.bossQuestUntil then
-        state.bossQuestCd = now + 300
-        state.bossQuestName, state.bossQuestUntil = nil, nil
+    if runtime.state.bossQuestName and runtime.state.bossQuestUntil and now > runtime.state.bossQuestUntil then
+        runtime.state.bossQuestCd = now + 300
+        runtime.state.bossQuestName, runtime.state.bossQuestUntil = nil, nil
         dbg("Boss quest timed out, back to the mobs for a while")
     end
 
-    if root.Position.Y < CONFIG.SafeY and now >= state.recoverUntil then
+    if root.Position.Y < runtime.config.SafeY and now >= runtime.state.recoverUntil then
         local y = root.Position.Y
-        stopTween()
+        runtime.stopTween()
         restoreNoclip()
-        state.recoverUntil = now + 2
-        state.status = "Recovering..."
-        if state.lastSafe then
-            root.CFrame = CFrame.new(state.lastSafe)
+        runtime.state.recoverUntil = now + 2
+        runtime.state.status = "Recovering..."
+        if runtime.state.lastSafe then
+            root.CFrame = CFrame.new(runtime.state.lastSafe)
             dbg(string.format("Recovered from out-of-bounds (Y=%.0f)", y))
         else
             dbg(string.format("Out of bounds (Y=%.0f), no safe spot yet", y))
@@ -3497,33 +4299,72 @@ local function step()
         return
     end
 
-    -- A shop buy, a flight or a quest owns the movement while it runs. One of
-    -- them that never comes back (an error in the middle) is let go after a
-    -- while, or the whole farm would stand still for ever.
-    if state.shopping or state.flying or state.questing then
-        if not state.blockAt then state.blockAt = now end
-        if now - state.blockAt > 25 then
-            state.shopping, state.flying, state.questing = false, false, false
-            state.blockAt = nil
-            stopTween()
-            dbg("A long task got stuck, farming again")
-        else
+    -- Auto Saber has its own lock and timeout. During a kill step the farm
+    -- is allowed to run so that the boss can actually be attacked; the other
+    -- puzzle steps own the movement and pause the ordinary farm.
+    if runtime.state.saberActive then
+        local timeout = runtime.config.AutoSaberTimeout or 90
+        local progressAt = runtime.state.saberProgressAt
+        if not progressAt or progressAt <= 0 then progressAt = runtime.state.saberLockAt or now end
+        if now - progressAt > timeout then
+            runtime.config.AutoSaber = false
+            runtime.resetTransient("Saber timeout")
+            runtime.state.farming = false
+            dbg("Saber made no progress and was stopped")
             return
+        elseif not runtime.state.saberTarget then
+            runtime.state.farming = false
+            return
+        else
+            -- During a kill step the ordinary quest target must not replace
+            -- the Saber boss. The farm is allowed to run only after that boss
+            -- is actually present.
+            local saberMob = nil
+            for _, candidate in ipairs(collectEnemies(now)) do
+                if candidate.Name:lower():find(runtime.state.saberTarget:lower(), 1, true) then
+                    saberMob = candidate
+                    break
+                end
+            end
+            if not saberMob then
+                runtime.state.farming = false
+                return
+            end
         end
+    end
+
+    -- A shop buy or a flight owns the movement while it runs. One of them that
+    -- never comes back (an error in the middle) is let go after a while, or
+    -- the whole farm would stand still for ever.
+    if runtime.state.shopping or runtime.state.flying then
+        if not runtime.state.blockAt then runtime.state.blockAt = now end
+        local timedOut = now - runtime.state.blockAt > 25
+        if timedOut and runtime.state.shopping and not runtime.state.shopInFlight then
+            runtime.state.shopping = false
+            runtime.state.blockAt = nil
+            runtime.stopTween()
+            dbg("A long shopping walk got stuck, farming again")
+        elseif timedOut and runtime.state.flying then
+            runtime.state.flying = false
+            runtime.state.blockAt = nil
+            runtime.stopTween()
+            dbg("A long flight got stuck, farming again")
+        end
+        if runtime.state.shopping or runtime.state.flying then return end
     else
-        state.blockAt = nil
+        runtime.state.blockAt = nil
     end
 
-    if not state.lastPos or (root.Position - state.lastPos).Magnitude > 1 then
-        state.lastPos = root.Position
-        state.movedAt = now
+    if not runtime.state.lastPos or (root.Position - runtime.state.lastPos).Magnitude > 1 then
+        runtime.state.lastPos = root.Position
+        runtime.state.movedAt = now
     end
-    if now - state.movedAt > 0.4 and root.Position.Y > CONFIG.SafeY then
-        state.lastSafe = root.Position
+    if now - runtime.state.movedAt > 0.4 and root.Position.Y > runtime.config.SafeY then
+        runtime.state.lastSafe = root.Position
     end
 
-    if CONFIG.FruitSniper then
-        state.farming = true
+    if runtime.config.FruitSniper then
+        runtime.state.farming = true
         if handleFruit(root) then return end
     end
 
@@ -3531,15 +4372,15 @@ local function step()
     -- the walk through every text 20 times a second is a waste. Between two
     -- parses the last answer is kept, so nothing flickers.
     local info = nil
-    if CONFIG.AutoQuest then
-        if not state.panelAt or now - state.panelAt > 0.3 then
-            state.panelAt = now
-            state.panelInfo = questPanelInfo()
+    if runtime.config.AutoQuest then
+        if not runtime.state.panelAt or now - runtime.state.panelAt > 0.3 then
+            runtime.state.panelAt = now
+            runtime.state.panelInfo = questPanelInfo()
         end
-        info = state.panelInfo
+        info = runtime.state.panelInfo
     end
 
-    if CONFIG.AutoQuest then
+    if runtime.config.AutoQuest then
         hookQuestRemote()
         local remoteInfo = remoteQuestInfo()
         if remoteInfo then info = remoteInfo end
@@ -3549,18 +4390,18 @@ local function step()
 
     if info then
         if info.complete then
-            state.questDone = true
-            state.questDoneMob = info.mentioned or info.target
+            runtime.state.questDone = true
+            runtime.state.questDoneMob = info.mentioned or info.target
         elseif info.confirmed then
-            state.questDone = false
-            state.questDoneMob = nil
+            runtime.state.questDone = false
+            runtime.state.questDoneMob = nil
         end
     end
 
-    if CONFIG.AutoStore and now - (state.storeAt or 0) > 5 then
+    if runtime.config.AutoStore and now - (runtime.state.storeAt or 0) > 5 then
         local fruits = carriedFruits()
-        if #fruits >= (CONFIG.StoreFruitMin or 3) then
-            state.storeAt = now
+        if #fruits >= (runtime.config.StoreFruitMin or 3) then
+            runtime.state.storeAt = now
             local before = #fruits
             local stored = 0
             for _, f in ipairs(fruits) do
@@ -3569,15 +4410,15 @@ local function step()
             end
             stored = before - #carriedFruits()
             if stored > 0 then
-                state.status = "Stored " .. stored .. " fruit(s)"
+                runtime.state.status = "Stored " .. stored .. " fruit(s)"
                 dbg("Stored " .. stored .. " fruit(s)")
             else
                 local npc = storageNpc()
                 local prompt = npc and promptOf(npc)
                 local anchor = (prompt and anchorOf(prompt.Parent)) or (npc and anchorOf(npc))
                 if anchor and prompt then
-                    state.status = "Storing fruit"
-                    travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                    runtime.state.status = "Storing fruit"
+                    runtime.travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
                     interactWith(npc, prompt)
                     task.wait(0.5)
                     for _, f in ipairs(fruits) do
@@ -3586,13 +4427,13 @@ local function step()
                     end
                     stored = before - #carriedFruits()
                     if stored > 0 then
-                        state.status = "Stored " .. stored .. " fruit(s)"
+                        runtime.state.status = "Stored " .. stored .. " fruit(s)"
                         dbg("Stored " .. stored .. " fruit(s) at the npc")
                     else
-                        state.status = "Could not store fruit"
+                        runtime.state.status = "Could not store fruit"
                     end
                 else
-                    state.status = "No way to store fruit"
+                    runtime.state.status = "No way to store fruit"
                     dbg("No store button and no storage npc")
                 end
             end
@@ -3600,85 +4441,85 @@ local function step()
         end
     end
 
-    local pendingTurnIn = (info and info.complete) or state.questDone
-    if pendingTurnIn and CONFIG.QuestTurnIn then
-        if state.turnInFailed and now - state.turnInFailedAt > CONFIG.TurnInTimeout then
-            state.turnInFailed, state.turnInSince = false, now
-            state.questDone = false
-            state.questDoneMob = nil
+    local pendingTurnIn = (info and info.complete) or runtime.state.questDone
+    if pendingTurnIn and runtime.config.QuestTurnIn then
+        if runtime.state.turnInFailed and now - runtime.state.turnInFailedAt > runtime.config.TurnInTimeout then
+            runtime.state.turnInFailed, runtime.state.turnInSince = false, now
+            runtime.state.questDone = false
+            runtime.state.questDoneMob = nil
         end
-        if not state.turnInFailed then
-            local giver = pickQuestGiver((info and info.mentioned) or state.questDoneMob, state.questNpc)
+        if not runtime.state.turnInFailed then
+            local giver = pickQuestGiver((info and info.mentioned) or runtime.state.questDoneMob, runtime.state.questNpc)
             local prompt = giver and promptOf(giver)
             local anchor = (prompt and anchorOf(prompt.Parent)) or (giver and anchorOf(giver))
             if anchor and prompt then
-                if state.turnInSince == nil then state.turnInSince = now end
-                if now - state.turnInSince <= CONFIG.TurnInTimeout then
-                    state.status = "Turning in quest"
-                    travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                if runtime.state.turnInSince == nil then runtime.state.turnInSince = now end
+                if now - runtime.state.turnInSince <= runtime.config.TurnInTimeout then
+                    runtime.state.status = "Turning in quest"
+                    runtime.travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
                     interactWith(giver, prompt)
                     return
                 end
                 dbg("Turn-in timed out, farming instead")
-                state.turnInFailed, state.turnInFailedAt = true, now
+                runtime.state.turnInFailed, runtime.state.turnInFailedAt = true, now
             else
                 dbg("No usable quest giver found")
-                state.turnInFailed, state.turnInFailedAt = true, now
-                state.status = "Quest complete, no giver found"
+                runtime.state.turnInFailed, runtime.state.turnInFailedAt = true, now
+                runtime.state.status = "Quest complete, no giver found"
             end
         end
     else
-        state.turnInSince, state.turnInFailed, state.turnInFailedAt = nil, false, 0
+        runtime.state.turnInSince, runtime.state.turnInFailed, runtime.state.turnInFailedAt = nil, false, 0
     end
 
-    if CONFIG.AutoQuest then tryAcceptQuest(info) end
-    if CONFIG.AutoStats then tryUpgradeStats() end
+    if runtime.config.AutoQuest then tryAcceptQuest(info) end
+    if runtime.config.AutoStats then tryUpgradeStats() end
 
-    local needGiver = not questFor(getMyLevel()) or state.questGaveUp
-    if CONFIG.AutoQuest and needGiver and not (info and info.confirmed) then
-        if state.seekSince == nil then state.seekSince = now end
-        if state.seekGaveUp then
-            if now - state.seekGaveUpAt >= CONFIG.QuestSeekTimeout then
-                state.seekGaveUp = false
-                state.seekSince = now
+    local needGiver = not questFor(getMyLevel()) or runtime.state.questGaveUp
+    if runtime.config.AutoQuest and needGiver and not (info and info.confirmed) then
+        if runtime.state.seekSince == nil then runtime.state.seekSince = now end
+        if runtime.state.seekGaveUp then
+            if now - runtime.state.seekGaveUpAt >= runtime.config.QuestSeekTimeout then
+                runtime.state.seekGaveUp = false
+                runtime.state.seekSince = now
             end
-        elseif now - state.seekSince > CONFIG.QuestSeekTimeout then
+        elseif now - runtime.state.seekSince > runtime.config.QuestSeekTimeout then
             dbg("No quest giver answered, farming instead")
-            state.seekGaveUp, state.seekGaveUpAt = true, now
+            runtime.state.seekGaveUp, runtime.state.seekGaveUpAt = true, now
         else
-            local giver = pickQuestGiver(nil, state.questGaveUp and state.questNpc or nil)
+            local giver = pickQuestGiver(nil, runtime.state.questGaveUp and runtime.state.questNpc or nil)
             local prompt = giver and promptOf(giver)
             local anchor = (prompt and anchorOf(prompt.Parent)) or (giver and anchorOf(giver))
             if anchor then
-                state.status = "Looking for a quest"
-                travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+                runtime.state.status = "Looking for a quest"
+                runtime.travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
                 interactWith(giver, prompt)
                 return
             end
         end
     else
-        state.seekSince = nil
-        state.seekGaveUp = false
+        runtime.state.seekSince = nil
+        runtime.state.seekGaveUp = false
     end
 
-    if not CONFIG.AutoFarm then
-        state.farming = false
-        state.status = "Idle"
+    if not runtime.config.AutoFarm then
+        runtime.state.farming = false
+        runtime.state.status = "Idle"
         -- nothing is being farmed: the pack of the last mob is let go and the
         -- hitbox that was made big for the swing is put back
         restoreHitbox()
-        if next(state.bringHeld) ~= nil or next(state.bringIgnored) ~= nil then releaseBringMobs() end
-        state.lastTarget, state.targetHealth, state.targetAt = nil, nil, 0
-        if CONFIG.AutoAttack then autoAttackSwing(nil) end
+        if next(runtime.state.bringHeld) ~= nil or next(runtime.state.bringIgnored) ~= nil then releaseBringMobs() end
+        runtime.state.lastTarget, runtime.state.targetHealth, runtime.state.targetAt = nil, nil, 0
+        if runtime.config.AutoAttack then autoAttackSwing(nil) end
         return
     end
-    state.farming = true
+    runtime.state.farming = true
 
-    local quest = CONFIG.AutoQuest and questFor(getMyLevel()) or nil
+    local quest = runtime.config.AutoQuest and questFor(getMyLevel()) or nil
     local mob = quest and quest.mob or nil
-    local bossWindow = CONFIG.BossLevelWindow or 25
+    local bossWindow = runtime.config.BossLevelWindow or 25
     local function bossAllowedFor(name)
-        if not CONFIG.BossFarm or not bossNameIs(name) then return false end
+        if not runtime.config.BossFarm or not bossNameIs(name) then return false end
         local level = bossLevelOf and bossLevelOf(name)
         return level == nil or math.abs(level - getMyLevel()) <= bossWindow
     end
@@ -3694,7 +4535,7 @@ local function step()
     if mob and bossNameIs(mob) then
         if bossAllowedFor(mob) then
             -- Prefer the exact quest boss; no other boss is taken instead.
-            target = pickBoss(root, CONFIG.BossRange or 3000, mob)
+            target = pickBoss(root, runtime.config.BossRange or 3000, mob)
             -- The boss is dead or out of range: farm normal mobs around the
             -- spawn and pick the boss up again when it respawns.
             if not target then target = pickNormal(root) end
@@ -3707,10 +4548,10 @@ local function step()
     else
         target = getTarget(mob)
     end
-    if state.saberTarget then
+    if runtime.state.saberTarget then
         -- a running quest knows which mob it needs
         for _, m in ipairs(collectEnemies(tick())) do
-            if m.Name:lower():find(state.saberTarget:lower(), 1, true) then
+            if m.Name:lower():find(runtime.state.saberTarget:lower(), 1, true) then
                 target = m
                 break
             end
@@ -3721,15 +4562,15 @@ local function step()
         -- is released and the enlarged hitbox restored, or the mobs would stay
         -- frozen and big while the bot only flies to a spawn
         restoreHitbox()
-        if next(state.bringHeld) ~= nil or next(state.bringIgnored) ~= nil then releaseBringMobs() end
-        state.lastTarget, state.targetHealth, state.targetAt = nil, nil, 0
+        if next(runtime.state.bringHeld) ~= nil or next(runtime.state.bringIgnored) ~= nil then releaseBringMobs() end
+        runtime.state.lastTarget, runtime.state.targetHealth, runtime.state.targetAt = nil, nil, 0
         local sp = findSpawn(mob)
         local anchor = sp and anchorOf(sp)
         if anchor then
-            state.status = "Travelling to " .. (mob or "mobs")
-            travelTo(anchor.CFrame + Vector3.new(0, CONFIG.HoverHeight, 0))
+            runtime.state.status = "Travelling to " .. (mob or "mobs")
+            runtime.travelTo(anchor.CFrame + Vector3.new(0, runtime.config.HoverHeight, 0))
         else
-            state.status = "No targets"
+            runtime.state.status = "No targets"
         end
         return
     end
@@ -3750,38 +4591,46 @@ local function step()
     local reach = attackRange(tool)
     local inRange = dist <= reach + 6
     if th then
-        if target ~= state.lastTarget then
-            state.lastTarget, state.targetHealth, state.targetAt = target, th.Health, now
-            state.hitsConfirmed = 0
-            state.targetDist, state.travelAt = dist, now
-        elseif th.Health < (state.targetHealth or th.Health) then
-            state.targetHealth, state.targetAt = th.Health, now
-            state.targetDist, state.travelAt = dist, now
+        if target ~= runtime.state.lastTarget then
+            runtime.state.lastTarget, runtime.state.targetHealth, runtime.state.targetAt = target, th.Health, now
+            runtime.state.hitsConfirmed = 0
+            runtime.state.targetDist, runtime.state.travelAt = dist, now
+            if runtime.state.saberTarget and target.Name:lower():find(runtime.state.saberTarget:lower(), 1, true) then
+                runtime.state.saberKillHealth = th.Health
+            end
+        elseif th.Health < (runtime.state.targetHealth or th.Health) then
+            runtime.state.targetHealth, runtime.state.targetAt = th.Health, now
+            runtime.state.targetDist, runtime.state.travelAt = dist, now
+            if runtime.state.saberTarget and target.Name:lower():find(runtime.state.saberTarget:lower(), 1, true) then
+                runtime.state.saberKillHealth = th.Health
+                runtime.state.saberKillDamaged = true
+                runtime.state.saberProgressAt = now
+            end
         elseif inRange then
-            if now - state.targetAt > CONFIG.StuckTimeout then
-                stuckTargets[target] = now + CONFIG.StuckIgnore
-                state.lastTarget, state.targetHealth, state.targetAt = nil, nil, 0
+            if now - runtime.state.targetAt > runtime.config.StuckTimeout then
+                stuckTargets[target] = now + runtime.config.StuckIgnore
+                runtime.state.lastTarget, runtime.state.targetHealth, runtime.state.targetAt = nil, nil, 0
                 enemyCache, enemyCacheAt = {}, 0
                 dbg("Ignoring stuck target " .. target.Name)
                 return
             end
-        elseif dist < (state.targetDist or dist) - 0.5 then
-            state.targetDist, state.travelAt = dist, now
-        elseif now - (state.travelAt or now) > CONFIG.StuckTimeout * 3 then
-            stuckTargets[target] = now + CONFIG.StuckIgnore
-            state.lastTarget, state.targetHealth, state.targetAt = nil, nil, 0
+        elseif dist < (runtime.state.targetDist or dist) - 0.5 then
+            runtime.state.targetDist, runtime.state.travelAt = dist, now
+        elseif now - (runtime.state.travelAt or now) > runtime.config.StuckTimeout * 3 then
+            stuckTargets[target] = now + runtime.config.StuckIgnore
+            runtime.state.lastTarget, runtime.state.targetHealth, runtime.state.targetAt = nil, nil, 0
             enemyCache, enemyCacheAt = {}, 0
             dbg("Cannot reach target " .. target.Name)
             return
         end
     end
 
-    local hover = CONFIG.HoverHeight
+    local hover = runtime.config.HoverHeight
     -- The hits go through the remote of the game, so the player can stay high
     -- above the mob where its swings cannot reach. Only the plain swing has to
     -- come down close.
-    if reach <= CONFIG.MeleeRange and not CONFIG.RemoteAttack then
-        hover = math.min(hover, CONFIG.MeleeHover)
+    if reach <= runtime.config.MeleeRange and not runtime.config.RemoteAttack then
+        hover = math.min(hover, runtime.config.MeleeHover)
     end
 
     local dx = root.Position.X - er.Position.X
@@ -3792,35 +4641,42 @@ local function step()
     -- to a mob is what dragged the held mobs across the map behind the player:
     -- they are let go the moment the target is out of reach and picked up
     -- again when the bot has arrived.
-    if CONFIG.BringMob then
-        if flat <= reach + 10 then
+    if runtime.config.BringMob then
+        local bringRange = tonumber(runtime.config.BringMobRange) or 60
+        if bringRange > 0 and flat <= math.min(reach + 10, bringRange) then
             bringMob(target, root)
-        elseif next(state.bringHeld) ~= nil then
+        elseif next(runtime.state.bringHeld) ~= nil then
             releaseBringMobs()
             restoreHitbox()
         end
-    elseif next(state.bringHeld) ~= nil or next(state.bringIgnored) ~= nil then
+    elseif next(runtime.state.bringHeld) ~= nil or next(runtime.state.bringIgnored) ~= nil then
         releaseBringMobs()
         restoreHitbox()
     end
 
     local swingTarget = target
-    if CONFIG.AutoAttack then
+    if runtime.config.AutoAttack then
         local close = mobInReach(root, reach)
         -- A boss is not given up for a normal mob that happens to stand near:
         -- the boss is what the boss farm went there for.
-        local onBoss = CONFIG.BossFarm and bossKeyOf(target)
+        local onBoss = runtime.config.BossFarm and bossKeyOf(target)
+        local onSaber = runtime.state.saberTarget
+            and target.Name:lower():find(runtime.state.saberTarget:lower(), 1, true)
         -- A swipe at a mob that stands in the way is fine, but the window has
         -- to close and then stay closed for a while. If it is armed again on
         -- the next tick the bot farms the mob beside it for ever and never
         -- walks to the mob of the quest at all.
-        if close and close ~= target and flat > reach and not onBoss
-            and (state.autoBurstCd or 0) <= now then
-            state.autoBurst = now + 2
-            state.autoBurstCd = now + 8
+        if close and close ~= target and flat > reach and not onBoss and not onSaber
+            and (runtime.state.autoBurstCd or 0) <= now then
+            runtime.state.autoBurst = now + 2
+            runtime.state.autoBurstCd = now + 8
         end
-        if (state.autoBurst or 0) > now and close then
+        if (runtime.state.autoBurst or 0) > now and close and not onSaber then
             swingTarget = close
+        elseif onSaber then
+            -- A burst that was armed before the Saber boss appeared must not
+            -- replace that boss with a normal mob standing beside it.
+            runtime.state.autoBurst = 0
         end
     end
 
@@ -3839,7 +4695,7 @@ local function step()
     end
     local hoverPos
     if head then
-        local above = CONFIG.RemoteAttack and math.max(hover, CONFIG.HeadHover) or CONFIG.HeadHover
+        local above = runtime.config.RemoteAttack and math.max(hover, runtime.config.HeadHover) or runtime.config.HeadHover
         hoverPos = head.Position + Vector3.new(0, above, 0)
     else
         hoverPos = er.Position + Vector3.new(0, hover, 0)
@@ -3847,23 +4703,35 @@ local function step()
     local top = er.Position.Y + (er.Size and er.Size.Y or 0) / 2
     hoverPos = Vector3.new(hoverPos.X, math.max(hoverPos.Y, top - 1), hoverPos.Z)
 
+    -- While the target itself is being carried to us, walking to where it used
+    -- to be makes the player and the mob cross each other; the distance grows,
+    -- the pack is dropped and the bot chases it again. The player holds its
+    -- ground and only settles the height while the mob comes over.
+    local heldTarget = runtime.state.bringCarryingTarget[target] == true
+    if heldTarget then
+        local above = runtime.config.RemoteAttack and math.max(hover, runtime.config.HeadHover) or runtime.config.HeadHover
+        local base = head and head.Position or er.Position
+        hoverPos = Vector3.new(root.Position.X, base.Y + above, root.Position.Z)
+    end
+
     -- The player does not sit on the head of the mob: it slides around it on a
     -- little ring, so the skills that are thrown where the mob is look at the
     -- player and miss. The ring goes the whole way round, it never runs back
     -- and forth over the same line.
     local tweenMoving = activeTween
         and activeTween.PlaybackState == Enum.PlaybackState.Playing
-    if CONFIG.Dodge and CONFIG.RemoteAttack and not tweenMoving and flat <= reach + 8 then
-        state.dodgeAngle = ((state.dodgeAngle or 0) + (CONFIG.DodgeSpeed or 90) * 0.05) % 360
-        local a = math.rad(state.dodgeAngle)
-        local ring = CONFIG.DodgeRadius or 14
+    if runtime.config.Dodge and runtime.config.RemoteAttack and not tweenMoving
+        and not heldTarget and flat <= reach + 8 then
+        runtime.state.dodgeAngle = ((runtime.state.dodgeAngle or 0) + (runtime.config.DodgeSpeed or 90) * 0.05) % 360
+        local a = math.rad(runtime.state.dodgeAngle)
+        local ring = runtime.config.DodgeRadius or 14
         local around = Vector3.new(hoverPos.X + math.cos(a) * ring, hoverPos.Y,
             hoverPos.Z + math.sin(a) * ring)
         pcall(function()
             root.CFrame = CFrame.new(around) * CFrame.Angles(math.rad(-90), 0, 0)
         end)
     else
-        travelTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0))
+        runtime.travelTo(CFrame.new(hoverPos) * CFrame.Angles(math.rad(-90), 0, 0))
     end
 
     local swingHit = anchorOf(swingTarget) or er
@@ -3873,25 +4741,25 @@ local function step()
     -- The big hitbox is a thing of the swing, not of the trip: a mob left
     -- blown up while the bot flies somewhere else is the giant rig players
     -- see. It is put back the moment there is no swing to make.
-    if CONFIG.BigHitbox and swingFlat <= reach then
+    if runtime.config.BigHitbox and swingFlat <= reach then
         enlargeHitbox(swingTarget)
-    elseif state.hitboxPart then
+    elseif runtime.state.hitboxPart then
         restoreHitbox()
     end
-    if now - state.lastAttack >= CONFIG.AttackCooldown
+    if (not runtime.state.attackNextAt or now >= runtime.state.attackNextAt)
         and swingFlat <= reach then
         if not tool then dbg("No weapon in backpack!"); return end
         if doAttack(tool, swingTarget) then
-            state.lastAttack = now
-            local many = (state.aoeCount or 1) > 1 and (" +" .. (state.aoeCount - 1) .. " close") or ""
-            -- the hit counter is only shown when the game remote that confirms
-            -- hits is there, so a missing hook cannot look like 0 damage
-            local seen = state.hitRemoteHooked
-                and (" (" .. state.hitsConfirmed .. " hits)") or ""
+            runtime.state.lastAttack = now
+            local many = (runtime.state.aoeCount or 1) > 1 and (" +" .. (runtime.state.aoeCount - 1) .. " close") or ""
+            -- ReceivedHit is sent to the damaged player, not to the attacker.
+            -- It therefore cannot count outgoing mob hits. The local health
+            -- check is the only outgoing confirmation shown here.
+            local seen = runtime.state.attackConfirmed and " (confirmed)" or ""
             if swingTarget == target then
-                state.status = "Hitting " .. target.Name .. many .. seen
+                runtime.state.status = "Hitting " .. target.Name .. many .. seen
             else
-                state.status = "Attacking " .. swingTarget.Name .. many
+                runtime.state.status = "Attacking " .. swingTarget.Name .. many
             end
         end
     end
@@ -3899,265 +4767,455 @@ end
 
 raiseSimulationRadius()
 pcall(function()
-    LocalPlayer.CharacterAdded:Connect(function()
+    local added = LocalPlayer.CharacterAdded:Connect(function()
+        if not runtime.running or FarmRuntime.current ~= runtime then return end
         fullReset("a new character came in")
-        state.dead = false
+        runtime.state.dead = false
         dbg("New character, farming again")
     end)
-    LocalPlayer.CharacterRemoving:Connect(function()
+    table.insert(runtime.characterConnections or {}, added)
+    local removing = LocalPlayer.CharacterRemoving:Connect(function()
+        if not runtime.running or FarmRuntime.current ~= runtime then return end
         fullReset("the character was removed")
     end)
+    table.insert(runtime.characterConnections or {}, removing)
 end)
 
-task.spawn(function()
-    while true do
-        if state.enabled then
-            state.wasStopped = false
+table.insert(runtime.tasks, task.spawn(function()
+    while runtime.running and FarmRuntime.current == runtime do
+        if runtime.state.enabled then
+            runtime.state.wasStopped = false
             local ok, err = pcall(step)
+            if not runtime.isCurrent() then return end
             if not ok then dbg("Loop error: " .. tostring(err)) end
             -- A pause of the farm (a turn-in, a fruit, a shop) must not leave
             -- the last pack frozen: if the farm has not carried it for a few
             -- seconds, the mobs are let go and the enlarged hitbox is put back.
-            if next(state.bringHeld) ~= nil
-                and tick() - (state.bringAt or 0) > 3 then
+            if next(runtime.state.bringHeld) ~= nil
+                and tick() - (runtime.state.bringAt or 0) > 3 then
                 releaseBringMobs()
                 restoreHitbox()
             end
         else
-            state.farming = false
-            state.status = "Stopped"
-            stopTween()
+            runtime.state.farming = false
+            runtime.state.status = "Stopped"
+            runtime.stopTween()
             -- let the held mobs go the moment the bot is stopped, once
-            if not state.wasStopped then
-                state.wasStopped = true
-                if next(state.bringHeld) ~= nil or next(state.bringIgnored) ~= nil then releaseBringMobs() end
+            if not runtime.state.wasStopped then
+                runtime.state.wasStopped = true
+                runtime.resetTransient("bot disabled")
+                if next(runtime.state.bringHeld) ~= nil or next(runtime.state.bringIgnored) ~= nil then releaseBringMobs() end
                 restoreHitbox()
             end
         end
         task.wait(0.05)
+        if not runtime.isCurrent() then return end
     end
-end)
+end))
 
 -- ================= AUTO QUESTS (Saber) =================
--- The Saber of the First Sea is a puzzle of five steps (the wiki): five green
--- buttons in the Jungle, a torch in the hidden room, a cup filled in the
--- Frozen cave, two NPCs, the Mob Leader and finally the Saber Expert. The
--- script looks the pieces up in the world by name and walks the list.
-local SABER_STEPS = {
-    {act = "press", name = "Button", island = "Jungle", count = 5,
-        note = "the green buttons of the Jungle"},
-    {act = "pick",  name = "Torch", island = "Jungle",
-        note = "the torch in the hidden Jungle room"},
-    {act = "talk",  name = "Sick Man", island = "Frozen Village",
-        note = "the Sick Man of the Frozen Village"},
-    {act = "talk",  name = "Rich Man", island = "Pirate Village",
-        note = "the Rich Man of the Pirate Village"},
-    {act = "kill",  name = "Mob Leader", island = "Jean-Luc Island",
-        note = "the Mob Leader on Jean-Luc Island"},
-    {act = "talk",  name = "Rich Man", island = "Pirate Village",
-        note = "the Rich Man again, for the relic"},
-    {act = "kill",  name = "Saber Expert", island = "Jungle",
-        note = "the Saber Expert behind the door"},
-}
-
--- the place of an island, from the list the panel already builds
-local function islandPosByName(text)
-    for _, island in ipairs(islandPositions()) do
-        if island.name:lower():find(text:lower(), 1, true)
-            or text:lower():find(island.name:lower(), 1, true) then
-            return island.pos
-        end
+-- The live client already owns the first-sea puzzle. Its local script sends
+-- the same ProQuestProgress calls that the server understands and stores the
+-- confirmed state in a table. The bot now drives that state machine instead
+-- of guessing from object names: a button, a pickup or a talk only counts
+-- after the server has confirmed it.
+local function saberPart(path)
+    local current = Workspace
+    for name in path:gmatch("[^/]+") do
+        current = current and current:FindFirstChild(name)
+        if not current then return nil end
     end
-    return nil
-end
-
--- every object of the world whose name has the wanted text in it
-local function findParts(text, limit)
-    local out = {}
-    local ok, list = pcall(function() return Workspace:GetDescendants() end)
-    if not ok then return out end
-    for _, obj in ipairs(list) do
-        if (obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Tool"))
-            and obj.Name:lower():find(text:lower(), 1, true) then
-            table.insert(out, obj)
-            if limit and #out >= limit then break end
-        end
-    end
-    return out
-end
-
-local function pressPart(part)
-    -- a button of the game answers a click or a touch
-    pcall(function()
-        local cd = part:FindFirstChildWhichIsA("ClickDetector")
-        if cd and fireclickdetector then fireclickdetector(cd) end
-    end)
-    pcall(function()
-        local root = getRoot()
-        if root and firetouchinterest then
-            firetouchinterest(root, part, 0)
-            firetouchinterest(root, part, 1)
-        end
-    end)
+    return current
 end
 
 local function findMob(text)
+    local wanted = text:lower()
     for _, mob in ipairs(collectEnemies(tick())) do
-        if mob.Name:lower():find(text:lower(), 1, true) then return mob end
+        if mob.Name:lower():find(wanted, 1, true) then return mob end
     end
     return nil
 end
 
--- One pass at the current step of the quest.
-local function saberStep(step, root)
-    if not step then return true end
-    -- the pieces of the puzzle are streamed in only when the player is on
-    -- their island, so the island is flown to before anything is searched
-    if step.island then
-        state.saberFlown = state.saberFlown or {}
-        if not state.saberFlown[step.island] then
-            state.saberFlown[step.island] = true
-            local place = islandPosByName(step.island)
-            if place and (root.Position - place).Magnitude > 600 then
-                state.status = "Saber: flying to " .. step.island
-                flyTo(place)
+-- One pass at the current state of the Saber quest. The return value means
+-- that the whole quest is finished; the final reward is still checked by the
+-- caller, because the server can mark the boss dead a moment before the
+-- Saber reaches the backpack.
+local function saberStep(root)
+    if not root then return false end
+    local now = tick()
+    local char = LocalPlayer.Character
+    local epoch = runtime.characterEpoch
+    local commF = shopRemote()
+    if not commF then
+        runtime.state.status = "Saber: CommF_ is missing"
+        return false
+    end
+
+    local ok, progress = pcall(function()
+        return commF:InvokeServer("ProQuestProgress")
+    end)
+    if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+        or LocalPlayer.Character ~= char then return false end
+    if not ok or type(progress) ~= "table" then
+        runtime.state.status = "Saber: could not read the quest state"
+        return false
+    end
+    runtime.state.saberProgress = progress
+    runtime.state.saberStateAt = now
+
+    local plates = progress.Plates or {}
+    local function plateDone(index)
+        return plates[index] == true or plates[tostring(index)] == true
+    end
+    local plateCount = 0
+    for index = 1, 5 do
+        if plateDone(index) then plateCount = plateCount + 1 end
+    end
+
+    -- Any confirmed server-side change is real progress. The fingerprint also
+    -- includes the two dialogue answers, because those are not fields of the
+    -- progress table.
+    local fingerprint = table.concat({
+        tostring(plateCount),
+        progress.UsedTorch and "1" or "0",
+        progress.UsedCup and "1" or "0",
+        runtime.state.saberSickDone and "1" or "0",
+        progress.KilledMob and "1" or "0",
+        (progress.TalkedSon or runtime.state.saberSonDone) and "1" or "0",
+        progress.UsedRelic and "1" or "0",
+        progress.KilledShanks and "1" or "0",
+    }, ":")
+    if fingerprint ~= runtime.state.saberFingerprint then
+        runtime.state.saberFingerprint = fingerprint
+        runtime.state.saberProgressAt = now
+    end
+
+    -- Every mutation uses the same ProQuestProgress action as the official
+    -- QuestPro script. A separate cooldown is kept for each action, so a
+    -- refused FillCup cannot block the later PlaceRelic request.
+    local function callProgress(action, ...)
+        local key = action
+        if select("#", ...) > 0 then
+            key = action .. "#" .. tostring(select(1, ...))
+        end
+        if now - (runtime.state.saberAttempts[key] or 0) < 2 then
+            return nil, nil
+        end
+        runtime.state.saberAttempts[key] = now
+        runtime.state.saberAttemptKey = action
+        runtime.state.saberAttemptAt = now
+        local args = table.pack(...)
+        local called, result = pcall(function()
+            return commF:InvokeServer("ProQuestProgress", action,
+                table.unpack(args, 1, args.n))
+        end)
+        if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+            or LocalPlayer.Character ~= char then return nil, nil end
+        if called then return true, result end
+        return false, result
+    end
+
+    local function touch(a, b)
+        if not a or not b or not firetouchinterest then return end
+        pcall(function()
+            firetouchinterest(a, b, 0)
+            firetouchinterest(a, b, 1)
+        end)
+    end
+
+    local function ownedTool(name)
+        local wanted = name:lower()
+        for tool in pairs(ownedTools()) do
+            if tool.Name:lower():find(wanted, 1, true) then return tool end
+        end
+        return nil
+    end
+
+    local function moveToPart(part, distance)
+        local anchor = anchorOf(part)
+        if not anchor then return false end
+        local gap = (root.Position - anchor.Position).Magnitude
+        if gap > (distance or 9) then
+            runtime.travelTo(CFrame.new(anchor.Position + Vector3.new(0, 2, 0)))
+            return false
+        end
+        return true
+    end
+
+    local function useBoss(name, description)
+        if runtime.state.saberKillTarget ~= name then
+            runtime.state.saberKillTarget = name
+            runtime.state.saberKillHealth = nil
+            runtime.state.saberKillDamaged = false
+        end
+        runtime.state.saberTarget = name
+        runtime.state.saberAt = description
+    end
+
+    local function watchBoss(mob)
+        local hum = mob and mob:FindFirstChildOfClass("Humanoid")
+        if not hum then return end
+        if runtime.state.saberKillHealth == nil then
+            runtime.state.saberKillHealth = hum.Health
+        elseif hum.Health < runtime.state.saberKillHealth then
+            runtime.state.saberKillHealth = hum.Health
+            runtime.state.saberKillDamaged = true
+            runtime.state.saberProgressAt = now
+        end
+    end
+
+    -- Five green buttons. The state table is the only completion test.
+    if plateCount < 5 then
+        for index = 1, 5 do
+            if not plateDone(index) then
+                local button = saberPart("Map/Jungle/QuestPlates/Plate" .. index .. "/Button")
+                runtime.state.saberAt = "the green buttons of the Jungle"
+                if button then
+                    if moveToPart(button, 10) then
+                        touch(root, anchorOf(button) or button)
+                    end
+                else
+                    runtime.state.status = "Saber: button " .. index .. " is not loaded"
+                end
                 return false
             end
         end
     end
-    if step.act == "press" then
-        state.saberPressed = state.saberPressed or {}
-        local best, bestD = nil, nil
-        for _, part in ipairs(findParts(step.name, 16)) do
-            -- only the ones that are not pressed yet are looked at again
-            if not state.saberPressed[part] then
-                local anchor = anchorOf(part)
-                if anchor then
-                    local d = (anchor.Position - root.Position).Magnitude
-                    if bestD == nil or d < bestD then best, bestD = anchor, d end
+
+    -- The torch is a real quest item. UsedTorch is set by the server only
+    -- after the torch was picked up and then burnt in the Desert fire.
+    if not progress.UsedTorch then
+        local torchTool = ownedTool("Torch")
+        local fire = saberPart("Map/Desert/Burn/Fire")
+        runtime.state.saberAt = "the torch in the hidden Jungle room"
+        if torchTool and fire then
+            local handle = toolPart(torchTool)
+            if handle and moveToPart(fire, 9) then
+                touch(handle, fire)
+            end
+        elseif not torchTool then
+            local torch = saberPart("Map/Jungle/Torch")
+            if torch then
+                if moveToPart(torch, 8) then
+                    touch(root, anchorOf(torch) or torch)
                 end
+            else
+                runtime.state.status = "Saber: the torch is not loaded"
             end
+        else
+            runtime.state.status = "Saber: the Desert fire is not loaded"
         end
-        if not best then
-            local done = 0
-            for _ in pairs(state.saberPressed) do done = done + 1 end
-            state.status = "Saber: " .. done .. " of " .. tostring(step.count or 1) .. " " .. step.name
-            return done >= (step.count or 1)
-        end
-        if bestD and bestD > 30 then
-            state.status = "Saber: walking to " .. step.name
-            travelTo(CFrame.new(best.Position))
-            return false
-        end
-        pressPart(best)
-        state.saberPressed[best] = true
-        state.status = "Saber: pressed a " .. step.name
-        return false
-    elseif step.act == "pick" then
-        local best, bestD = nil, nil
-        for _, obj in ipairs(findParts(step.name, 8)) do
-            local anchor = anchorOf(obj)
-            if anchor then
-                local d = (anchor.Position - root.Position).Magnitude
-                if bestD == nil or d < bestD then best, bestD = anchor, d end
-            end
-        end
-        local char = LocalPlayer.Character
-        local backpack = LocalPlayer:FindFirstChild("Backpack")
-        local have = false
-        for _, folder in ipairs({char, backpack}) do
-            if folder then
-                for _, t in ipairs(folder:GetChildren()) do
-                    if t:IsA("Tool") and t.Name:lower():find(step.name:lower(), 1, true) then
-                        have = true
-                    end
-                end
-            end
-        end
-        if have then return true end
-        if not best then
-            state.status = "Saber: no " .. step.name .. " seen"
-            return false
-        end
-        if bestD and bestD > 12 then
-            state.status = "Saber: walking to the " .. step.name
-            travelTo(CFrame.new(best.Position))
-            return false
-        end
-        if firetouchinterest then
-            pcall(function()
-                firetouchinterest(root, best, 0)
-                firetouchinterest(root, best, 1)
-            end)
-        end
-        state.status = "Saber: took the " .. step.name
-        return true
-    elseif step.act == "talk" then
-        local npc = nil
-        for _, obj in ipairs(findParts(step.name, 4)) do
-            if anchorOf(obj) then npc = obj break end
-        end
-        if not npc then
-            state.status = "Saber: " .. step.name .. " not found"
-            return false
-        end
-        local prompt = promptOf(npc)
-        local anchor = (prompt and anchorOf(prompt.Parent)) or anchorOf(npc)
-        if not anchor then return false end
-        if (root.Position - anchor.Position).Magnitude > 8 then
-            state.status = "Saber: walking to " .. step.name
-            travelTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
-            return false
-        end
-        interactWith(npc, prompt)
-        -- One press is not a finished talk: the dialogs of the game want a few
-        -- of them. Calling it done after the first one is what left the door
-        -- of the Saber shut while the script said the quest was over.
-        state.saberTalk = (state.saberTalk or 0) + 1
-        state.status = "Saber: talked to " .. step.name .. " (" .. state.saberTalk .. ")"
-        if state.saberTalk >= 3 then
-            state.saberTalk = 0
-            return true
-        end
-        return false
-    elseif step.act == "kill" then
-        state.saberTarget = step.name
-        local mob = findMob(step.name)
-        if mob then
-            state.saberSeen = state.saberSeen or {}
-            state.saberSeen[step.name] = true
-            state.status = "Saber: fighting " .. step.name
-            return false
-        end
-        state.saberTarget = nil
-        -- A boss stands far away, on his own island: the mob is only there when
-        -- the player is. Fly to his spawn point before looking again.
-        local spawn = findSpawn(step.name)
-        if spawn and (root.Position - spawn.Position).Magnitude > 700 then
-            state.status = "Saber: flying to the " .. step.name
-            flyTo(spawn.Position)
-            return false
-        end
-        -- The mob is only called down when it was seen and then went away. A
-        -- mob that was never seen is behind a door or not streamed in yet, and
-        -- calling that done is how the quest ended with the door still shut.
-        if state.saberSeen and state.saberSeen[step.name] then
-            state.status = "Saber: " .. step.name .. " is down"
-            return true
-        end
-        state.status = "Saber: no " .. step.name .. " yet"
         return false
     end
-    return true
+
+    -- GetCup only gives the empty cup. UsedCup becomes true after FillCup
+    -- was accepted. The two official server actions are sent separately and
+    -- are not treated as progress until the Cup exists and UsedCup is true.
+    if not progress.UsedCup then
+        local cupTool = ownedTool("Cup")
+        local water = saberPart("Map/Ice/ParticleDrop/Water")
+        runtime.state.saberAt = "the cup in the Frozen cave"
+        if cupTool then
+            runtime.state.saberCupGranted = true
+            if water then
+                local handle = toolPart(cupTool)
+                if handle and moveToPart(water, 9) then
+                    local called, result = callProgress("FillCup", cupTool)
+                    runtime.state.saberFillRequestAt = now
+                    if called and result ~= false then
+                        runtime.state.status = "Saber: FillCup was accepted, waiting for the server"
+                    elseif called then
+                        runtime.state.status = "Saber: the server refused FillCup"
+                    else
+                        runtime.state.status = "Saber: FillCup did not reach the server"
+                    end
+                end
+            else
+                runtime.state.status = "Saber: the water is not loaded"
+            end
+        else
+            local desert = saberPart("Map/Desert")
+            local cup = desert and desert:FindFirstChild("Cup", true)
+            if cup then
+                if moveToPart(cup, 8) then
+                    local called, result = callProgress("GetCup")
+                    runtime.state.saberCupRequestAt = now
+                    if called and result ~= false then
+                        runtime.state.status = "Saber: GetCup was accepted, waiting for the cup"
+                    elseif called then
+                        runtime.state.status = "Saber: the server refused GetCup"
+                    else
+                        runtime.state.status = "Saber: GetCup did not reach the server"
+                    end
+                end
+            else
+                runtime.state.status = "Saber: the cup is not loaded"
+            end
+        end
+        return false
+    end
+
+    -- The Sick Man gives the next instruction. The game's own dialogue uses
+    -- zero for the successful answer; an attempt is never counted as a step.
+    if not runtime.state.saberSickDone then
+        local npc = findTeacher("Sick Man")
+        runtime.state.saberAt = "the Sick Man of the Frozen Village"
+        if npc then
+            if moveToPart(npc, 8) then
+                local called, result = callProgress("SickMan")
+                if called and result == 0 then
+                    runtime.state.saberSickDone = true
+                    runtime.state.saberProgressAt = now
+                    runtime.state.status = "Saber: the Sick Man confirmed the cup"
+                else
+                    runtime.state.status = "Saber: the Sick Man did not confirm the cup yet"
+                end
+            end
+        else
+            runtime.state.status = "Saber: the Sick Man was not found"
+        end
+        return false
+    end
+
+    -- The Mob Leader has to be really killed. The server flag is the
+    -- completion test; the health watch below only refreshes the timeout.
+    if not progress.KilledMob then
+        useBoss("Mob Leader", "the Mob Leader on Jean-Luc Island")
+        local mob = findMob("Mob Leader")
+        if mob then
+            watchBoss(mob)
+            runtime.state.status = "Saber: fighting the Mob Leader"
+        else
+            local spawn = findSpawn("Mob Leader")
+            local anchor = spawn and anchorOf(spawn)
+            if anchor and (root.Position - anchor.Position).Magnitude > 700 then
+                runtime.state.status = "Saber: flying to the Mob Leader"
+                flyTo(anchor.Position)
+                if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                    or LocalPlayer.Character ~= char then return false end
+            else
+                runtime.state.status = "Saber: waiting for the Mob Leader"
+            end
+        end
+        return false
+    end
+    runtime.state.saberTarget = nil
+
+    -- The Rich Man's son hands over the relic only after the Mob Leader is
+    -- dead. TalkedSon can already be true from an earlier conversation, so it
+    -- must not skip the second RichSon request: answer one is the server
+    -- response that grants the relic, and the Relic in the inventory is the
+    -- second confirmation.
+    local relic = ownedTool("Relic")
+    if not relic then
+        local npc = findTeacher("Rich Man")
+        runtime.state.saberAt = "the Rich Man of the Pirate Village"
+        if npc then
+            if moveToPart(npc, 8) then
+                local canRetry = not runtime.state.saberSonDone
+                    or now - (runtime.state.saberRelicRequestAt or 0) >= 3
+                if canRetry then
+                    local called, result = callProgress("RichSon")
+                    runtime.state.saberRelicRequestAt = now
+                    if called and result == 1 then
+                        runtime.state.saberSonDone = true
+                        runtime.state.saberRelicGranted = true
+                        runtime.state.saberProgressAt = now
+                        runtime.state.status = "Saber: the Rich Man granted the relic"
+                    elseif called and result == 0 then
+                        runtime.state.status = "Saber: the Rich Man still wants the Mob Leader"
+                    else
+                        runtime.state.status = "Saber: the Rich Man did not answer yet"
+                    end
+                else
+                    runtime.state.status = "Saber: waiting for the granted relic"
+                end
+            end
+        else
+            runtime.state.status = "Saber: the Rich Man was not found"
+        end
+        return false
+    end
+    runtime.state.saberSonDone = true
+    runtime.state.saberRelicGranted = true
+
+    -- PlaceRelic is the official server action for the door. A truthy reply
+    -- is only the acceptance; UsedRelic in the next progress query is the
+    -- confirmed completion.
+    if not progress.UsedRelic then
+        local jungle = saberPart("Map/Jungle")
+        local door = nil
+        if jungle then
+            for _, child in ipairs(jungle:GetChildren()) do
+                if child.Name == "Final" and not child:FindFirstChild("Invis") then
+                    door = child
+                    break
+                end
+            end
+        end
+        runtime.state.saberAt = "the relic in the Jungle door"
+        if relic and door then
+            local doorPart = anchorOf(door)
+            if doorPart and moveToPart(doorPart, 9) then
+                local called, result = callProgress("PlaceRelic")
+                runtime.state.saberPlaceRequestAt = now
+                if called and result then
+                    runtime.state.saberPlaceAccepted = true
+                    runtime.state.status = "Saber: PlaceRelic was accepted, waiting for the server"
+                elseif called then
+                    runtime.state.saberPlaceAccepted = false
+                    runtime.state.status = "Saber: the server refused PlaceRelic"
+                else
+                    runtime.state.status = "Saber: PlaceRelic did not reach the server"
+                end
+            end
+        elseif not relic then
+            runtime.state.status = "Saber: waiting for the relic"
+        else
+            runtime.state.status = "Saber: the Jungle door is not loaded"
+        end
+        return false
+    end
+
+    -- The Saber Expert is behind the opened door. KilledShanks is the server
+    -- proof that this boss died; merely disappearing is not enough.
+    if not progress.KilledShanks then
+        useBoss("Saber Expert", "the Saber Expert behind the Jungle door")
+        local mob = findMob("Saber Expert")
+        if mob then
+            watchBoss(mob)
+            runtime.state.status = "Saber: fighting the Saber Expert"
+        else
+            local spawn = findSpawn("Saber Expert")
+            local anchor = spawn and anchorOf(spawn)
+            if anchor and (root.Position - anchor.Position).Magnitude > 700 then
+                runtime.state.status = "Saber: flying to the Saber Expert"
+                flyTo(anchor.Position)
+                if not runtime.isCurrent() or runtime.characterEpoch ~= epoch
+                    or LocalPlayer.Character ~= char then return false end
+            else
+                runtime.state.status = "Saber: waiting for the Saber Expert"
+            end
+        end
+        return false
+    end
+    runtime.state.saberTarget = nil
+    runtime.state.saberAt = "the Saber reward"
+    runtime.state.status = "Saber: waiting for the Saber"
+    return false
 end
 
-local saberIndex = 1
-task.spawn(function()
-    while true do
+table.insert(runtime.tasks, task.spawn(function()
+    while runtime.running and FarmRuntime.current == runtime do
         task.wait(1)
-        state.questing = CONFIG.AutoSaber and state.enabled
-        if CONFIG.AutoSaber and state.enabled then
-            state.blockAt = tick()
+        if not runtime.isCurrent() then return end
+        if runtime.config.AutoSaber and runtime.state.enabled then
+            if not runtime.state.saberActive then
+                runtime.state.saberActive = true
+                runtime.state.saberLockAt = tick()
+                runtime.state.saberProgressAt = tick()
+            end
+
             -- The quest is over when the Saber itself is in hand: the steps can
             -- say one thing or another, the tool is the proof.
             local hasSaber = false
@@ -4165,9 +5223,9 @@ task.spawn(function()
             local backpack = LocalPlayer:FindFirstChild("Backpack")
             for _, folder in ipairs({char, backpack}) do
                 if folder then
-                    for _, t in ipairs(folder:GetChildren()) do
-                        if t:IsA("Tool") and t.Name:lower():find("saber", 1, true)
-                            and not t.Name:lower():find("expert", 1, true) then
+                    for _, tool in ipairs(folder:GetChildren()) do
+                        if tool:IsA("Tool") and tool.Name:lower():find("saber", 1, true)
+                            and not tool.Name:lower():find("expert", 1, true) then
                             hasSaber = true
                         end
                     end
@@ -4175,39 +5233,24 @@ task.spawn(function()
             end
             if hasSaber then
                 dbg("Saber obtained, the quest is over")
-                CONFIG.AutoSaber = false
-            end
-            local root = getRoot()
-            if root then
-                -- a step that made no progress for half a minute is allowed to
-                -- fly to its island again
-                if state.saberIndex ~= saberIndex then
-                    state.saberIndex, state.saberIndexAt = saberIndex, tick()
-                elseif state.saberIndexAt and tick() - state.saberIndexAt > 30 then
-                    state.saberFlown = {}
-                    state.saberIndexAt = tick()
-                end
-                local step = SABER_STEPS[saberIndex]
-                if step then
-                    if not state.saberAt or state.saberAt ~= step.note then
-                        state.saberAt = step.note
-                        dbg("Saber quest step: " .. step.note)
-                    end
-                    if saberStep(step, root) then
-                        dbg("Saber quest done: " .. step.note)
-                        state.saberTarget = nil
-                        state.saberAt = nil
-                        saberIndex = saberIndex + 1
-                        if saberIndex > #SABER_STEPS then
-                            dbg("Saber quest finished")
-                            CONFIG.AutoSaber = false
-                        end
+                runtime.config.AutoSaber = false
+                runtime.resetSaberState()
+            else
+                local root = getRoot()
+                if root and runtime.config.AutoSaber then
+                    local ok, err = pcall(saberStep, root)
+                    if not runtime.isCurrent() then return end
+                    if not ok then
+                        dbg("Saber step failed: " .. tostring(err))
+                        runtime.state.saberTarget = nil
                     end
                 end
             end
+        else
+            runtime.resetSaberState()
         end
     end
-end)
+end))
 
 -- ================= AUTO BUY STYLES =================
 -- Every style has its own teacher and its own requirements, so the list is
@@ -4215,24 +5258,30 @@ end)
 -- no requirements first. A style the game refuses is simply tried again on
 -- the next round.
 local styleBuyIndex = 0
-task.spawn(function()
-    while true do
+table.insert(runtime.tasks, task.spawn(function()
+    while runtime.running and FarmRuntime.current == runtime do
         task.wait(5)
-        if CONFIG.AutoBuyStyles and state.enabled and not state.shopping and not state.flying then
-            state.blockAt = tick()
+        if not runtime.isCurrent() then return end
+        if runtime.config.AutoBuyStyles and runtime.state.enabled and not runtime.state.shopping
+            and not runtime.state.shopInFlight and not runtime.state.flying then
+            runtime.state.blockAt = tick()
             styleBuyIndex = styleBuyIndex % #STYLE_SHOP + 1
             local style = STYLE_SHOP[styleBuyIndex]
             dbg("Auto buy style: " .. style.name)
-            buyStyle(style)
+            local ok, err = pcall(buyStyle, style)
+            if not runtime.isCurrent() then return end
+            if not ok then dbg("Auto buy failed: " .. tostring(err)) end
             task.wait(20)
+            if not runtime.isCurrent() then return end
         end
     end
-end)
+end))
 
-task.spawn(function()
-    while true do
+table.insert(runtime.tasks, task.spawn(function()
+    while runtime.running and FarmRuntime.current == runtime do
         task.wait(1)
-        if CONFIG.AutoBuso and state.enabled then
+        if not runtime.isCurrent() then return end
+        if runtime.config.AutoBuso and runtime.state.enabled then
             local ok, err = pcall(function()
                 local char = LocalPlayer.Character
                 local hasBuso = false
@@ -4254,32 +5303,34 @@ task.spawn(function()
                     end
                 end
             end)
+            if not runtime.isCurrent() then return end
             if not ok then dbg("The haki check failed: " .. tostring(err)) end
         end
     end
-end)
+end))
 
-task.spawn(function()
-    while true do
+table.insert(runtime.tasks, task.spawn(function()
+    while runtime.running and FarmRuntime.current == runtime do
         task.wait(1)
+        if not runtime.isCurrent() then return end
         raiseSimulationRadius()
-        if CONFIG.AntiAfk then
-            state.afkTimer = state.afkTimer + 1
-            if state.afkTimer >= (CONFIG.AntiAfkInterval or 120) then
-                state.afkTimer = 0
+        if runtime.config.AntiAfk then
+            runtime.state.afkTimer = runtime.state.afkTimer + 1
+            if runtime.state.afkTimer >= (runtime.config.AntiAfkInterval or 120) then
+                runtime.state.afkTimer = 0
                 local cam = Workspace.CurrentCamera
                 if cam then
-                    state.afkSign = -state.afkSign
+                    runtime.state.afkSign = -runtime.state.afkSign
                     pcall(function()
-                        cam.CFrame = cam.CFrame * CFrame.Angles(0, 0.01 * state.afkSign, 0)
+                        cam.CFrame = cam.CFrame * CFrame.Angles(0, 0.01 * runtime.state.afkSign, 0)
                     end)
                 end
             end
         else
-            state.afkTimer = 0
+            runtime.state.afkTimer = 0
         end
     end
-end)
+end))
 
 -- ================= GUI HELPERS =================
 -- The panel is built inside its own function on purpose: the top level of a
@@ -4293,8 +5344,25 @@ local gui = Instance.new("ScreenGui")
 gui.Name = "CustomFarmGui"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+runtime.gui = gui
+
+local function spawnTracked(fn)
+    if not runtime.running or FarmRuntime.current ~= runtime then return end
+    table.insert(runtime.tasks, task.spawn(function()
+        if not runtime.running or FarmRuntime.current ~= runtime then return end
+        local ok, err = pcall(fn)
+        if not runtime.isCurrent() then return end
+        if not ok and runtime.running and FarmRuntime.current == runtime then
+            dbg("Background task failed: " .. tostring(err))
+        end
+    end))
+end
 if not pcall(function() gui.Parent = game:GetService("CoreGui") end) then
     gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end
+if not runtime.isCurrent() then
+    gui:Destroy()
+    return
 end
 
 local main = Instance.new("Frame")
@@ -4339,6 +5407,7 @@ closeBtn.Font = THEME.fontBold; closeBtn.TextSize = 12
 closeBtn.AutoButtonColor = false; closeBtn.Parent = titleBar; corner(closeBtn, 6)
 local setBotEnabled
 closeBtn.MouseButton1Click:Connect(function()
+    if not runtime.isCurrent() then return end
     if setBotEnabled then setBotEnabled(false) end
     gui.Enabled = false
 end)
@@ -4416,7 +5485,10 @@ for i, name in ipairs(TABS) do
     b.Font = THEME.fontBold; b.TextSize = 12
     b.AutoButtonColor = true; b.Parent = tabBar
     corner(b, 6); stroke(b)
-    b.MouseButton1Click:Connect(function() showTab(i) end)
+    b.MouseButton1Click:Connect(function()
+        if not runtime.isCurrent() then return end
+        showTab(i)
+    end)
     tabButtons[i] = b
     newPage(name)
 end
@@ -4425,6 +5497,7 @@ showTab(1)
 local expandedH, collapsedH = 540, 34
 local minimized = false
 minBtn.MouseButton1Click:Connect(function()
+    if not runtime.isCurrent() then return end
     minimized = not minimized
     TweenService:Create(main, TweenInfo.new(0.18), {
         Size = minimized and UDim2.new(0,320,0,collapsedH) or UDim2.new(0,320,0,expandedH)
@@ -4485,6 +5558,7 @@ local function makeToggle(text, default, cb)
 
     local v = default
     local function set(newV)
+        if not runtime.isCurrent() then return end
         if newV == v then return end
         v = newV
         TweenService:Create(switch, TweenInfo.new(0.15), {
@@ -4531,6 +5605,7 @@ local function makeSlider(text, mn, mx, def, fmt, cb)
 
     local v = def
     local function setFromInput(i)
+        if not runtime.isCurrent() then return end
         local width = bar.AbsoluteSize.X
         if width <= 0 then return end
         local rel = math.clamp((i.Position.X - bar.AbsolutePosition.X) / width, 0, 1)
@@ -4540,13 +5615,18 @@ local function makeSlider(text, mn, mx, def, fmt, cb)
     end
 
     hit.InputBegan:Connect(function(i)
+        if not runtime.isCurrent() then return end
         if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
             setFromInput(i)
             local m, e, f
             local function cleanup()
-                m:Disconnect(); e:Disconnect(); f:Disconnect()
+                if m then m:Disconnect() end
+                if e then e:Disconnect() end
+                if f then f:Disconnect() end
+                m, e, f = nil, nil, nil
             end
             m = UserInputService.InputChanged:Connect(function(x)
+                if not runtime.running or FarmRuntime.current ~= runtime then return end
                 if x.UserInputType == Enum.UserInputType.MouseMovement or x.UserInputType == Enum.UserInputType.Touch then
                     setFromInput(x)
                 end
@@ -4557,6 +5637,9 @@ local function makeSlider(text, mn, mx, def, fmt, cb)
                 end
             end)
             f = UserInputService.WindowFocusReleased:Connect(cleanup)
+            table.insert(runtime.inputConnections, m)
+            table.insert(runtime.inputConnections, e)
+            table.insert(runtime.inputConnections, f)
         end
     end)
 end
@@ -4598,6 +5681,7 @@ local function makeSegment(text, options, default, cb)
         corner(b, 4)
         local lastPick = 0
         local function choose()
+            if not runtime.isCurrent() then return end
             local now = tick()
             if now - lastPick < 0.15 then return end
             lastPick = now
@@ -4655,11 +5739,14 @@ local function makeButton(text, cb)
     corner(btn, 6); stroke(btn)
 
     btn.MouseButton1Click:Connect(function()
+        if not runtime.isCurrent() then return end
         cb()
         pcall(function()
             TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3 = THEME.accent}):Play()
         end)
-        task.delay(0.15, function()
+        spawnTracked(function()
+            task.wait(0.15)
+            if not runtime.isCurrent() then return end
             pcall(function()
                 TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = THEME.panel}):Play()
             end)
@@ -4671,50 +5758,57 @@ end
 -- ===== BUILD =====
 showTab(1) -- HOME
 makeHeader("MODULES")
-setBotEnabled = makeToggle("Bot Enabled", state.enabled, function(v)
-    state.enabled = v
+setBotEnabled = makeToggle("Bot Enabled", runtime.state.enabled, function(v)
+    runtime.state.enabled = v
+    runtime.resetTransient(v and "bot enabled" or "bot disabled")
     if not v then
-        state.farming = false
-        state.fruit = nil
-        state.fruitStart = 0
-        state.fruitTries = 0
-        stopTween()
+        runtime.state.farming = false
+        runtime.state.fruit = nil
+        runtime.state.fruitStart = 0
+        runtime.state.fruitTries = 0
+        runtime.stopTween()
+        if runtime.releaseBringMobs then runtime.releaseBringMobs() end
+        restoreHitbox()
+    elseif runtime.config.AutoSaber then
+        runtime.state.saberActive = true
+        runtime.state.saberLockAt = tick()
+        runtime.state.saberProgressAt = tick()
     end
 end)
-makeToggle("Auto Quest",    CONFIG.AutoQuest,    function(v) CONFIG.AutoQuest    = v end)
-makeToggle("Auto Farm",     CONFIG.AutoFarm,     function(v) CONFIG.AutoFarm     = v end)
-makeToggle("Fruit Sniper",  CONFIG.FruitSniper,  function(v) CONFIG.FruitSniper  = v end)
-makeToggle("Eat Fruit",     CONFIG.EatFruit,     function(v) CONFIG.EatFruit     = v end)
-makeToggle("Turn In Quest", CONFIG.QuestTurnIn,  function(v) CONFIG.QuestTurnIn  = v end)
-makeToggle("Anti-AFK",      CONFIG.AntiAfk,      function(v) CONFIG.AntiAfk      = v end)
-local setDebug = makeToggle("Debug Output (F9)", CONFIG.Debug, function(v) CONFIG.Debug = v end)
+makeToggle("Auto Quest",    runtime.config.AutoQuest,    function(v) runtime.config.AutoQuest    = v end)
+makeToggle("Auto Farm",     runtime.config.AutoFarm,     function(v) runtime.config.AutoFarm     = v end)
+makeToggle("Fruit Sniper",  runtime.config.FruitSniper,  function(v) runtime.config.FruitSniper  = v end)
+makeToggle("Eat Fruit",     runtime.config.EatFruit,     function(v) runtime.config.EatFruit     = v end)
+makeToggle("Turn In Quest", runtime.config.QuestTurnIn,  function(v) runtime.config.QuestTurnIn  = v end)
+makeToggle("Anti-AFK",      runtime.config.AntiAfk,      function(v) runtime.config.AntiAfk      = v end)
+local setDebug = makeToggle("Debug Output (F9)", runtime.config.Debug, function(v) runtime.config.Debug = v end)
 makeHint("✕ stops the bot  •  RightShift shows/hides this panel")
 
 makeHeader("FRUIT")
-makeToggle("Auto Store", CONFIG.AutoStore, function(v) CONFIG.AutoStore = v end)
-makeSlider("Store From", 1, 10, CONFIG.StoreFruitMin,
-    function(v) return v.." fruits" end, function(v) CONFIG.StoreFruitMin = v end)
-makeSlider("Scan Radius", 500, 10000, CONFIG.FruitScanRadius,
-    function(v) return tostring(v) end, function(v) CONFIG.FruitScanRadius = v end)
+makeToggle("Auto Store", runtime.config.AutoStore, function(v) runtime.config.AutoStore = v end)
+makeSlider("Store From", 1, 10, runtime.config.StoreFruitMin,
+    function(v) return v.." fruits" end, function(v) runtime.config.StoreFruitMin = v end)
+makeSlider("Scan Radius", 500, 10000, runtime.config.FruitScanRadius,
+    function(v) return tostring(v) end, function(v) runtime.config.FruitScanRadius = v end)
 
 showTab(2) -- MOVE
 makeHeader("MOVEMENT")
-makeSegment("Mode", {"Walk","Tween","Teleport"}, CONFIG.MovementMode,
-    function(v) CONFIG.MovementMode = v end)
-makeSlider("Move Speed", 50, 500, CONFIG.MoveSpeed,
-    function(v) return v.." st/s" end, function(v) CONFIG.MoveSpeed = v end)
-makeSlider("Hover Height", 0, 60, CONFIG.HoverHeight,
-    function(v) return v.." studs" end, function(v) CONFIG.HoverHeight = v end)
-makeToggle("Short Warp", CONFIG.WarpClose, function(v) CONFIG.WarpClose = v end)
-makeSlider("Warp Distance", 20, 200, CONFIG.WarpDistance,
-    function(v) return v.." studs" end, function(v) CONFIG.WarpDistance = v end)
-makeSlider("Void Guard Y", -1000, -50, CONFIG.SafeY,
-    function(v) return tostring(v).." studs" end, function(v) CONFIG.SafeY = v end)
+makeSegment("Mode", {"Walk","Tween","Teleport"}, runtime.config.MovementMode,
+    function(v) runtime.config.MovementMode = v end)
+makeSlider("Move Speed", 50, 500, runtime.config.MoveSpeed,
+    function(v) return v.." st/s" end, function(v) runtime.config.MoveSpeed = v end)
+makeSlider("Hover Height", 0, 60, runtime.config.HoverHeight,
+    function(v) return v.." studs" end, function(v) runtime.config.HoverHeight = v end)
+makeToggle("Short Warp", runtime.config.WarpClose, function(v) runtime.config.WarpClose = v end)
+makeSlider("Warp Distance", 20, 200, runtime.config.WarpDistance,
+    function(v) return v.." studs" end, function(v) runtime.config.WarpDistance = v end)
+makeSlider("Void Guard Y", -1000, -50, runtime.config.SafeY,
+    function(v) return tostring(v).." studs" end, function(v) runtime.config.SafeY = v end)
 
 makeHeader("WORLD (SEA)")
-makeButton("Go to Sea 1", function() task.spawn(function() travelToWorld(1) end) end)
-makeButton("Go to Sea 2", function() task.spawn(function() travelToWorld(2) end) end)
-makeButton("Go to Sea 3", function() task.spawn(function() travelToWorld(3) end) end)
+makeButton("Go to Sea 1", function() spawnTracked(function() travelToWorld(1) end) end)
+makeButton("Go to Sea 2", function() spawnTracked(function() travelToWorld(2) end) end)
+makeButton("Go to Sea 3", function() spawnTracked(function() travelToWorld(3) end) end)
 makeHint("The seas are separate places: this uses the travel of the game")
 
 makeHeader("FLY TO ISLAND (tween)")
@@ -4732,8 +5826,8 @@ rebuildIslands = function()
         local target = island.pos
         local islandName = island.name
         table.insert(islandButtons, makeButton("Go: " .. islandName, function()
-            state.status = "Flying to " .. islandName
-            task.spawn(function()
+            runtime.state.status = "Flying to " .. islandName
+            spawnTracked(function()
                 if not specialTravel(islandName) then flyTo(target) end
             end)
         end))
@@ -4747,77 +5841,89 @@ end
 rebuildIslands()
 
 makeHeader("BRING MOB")
-makeToggle("Bring Mob", CONFIG.BringMob, function(v) CONFIG.BringMob = v end)
-makeSlider("Bring Mob Count", 0, 10, CONFIG.BringMobCount,
+makeToggle("Bring Mob", runtime.config.BringMob, function(v) runtime.config.BringMob = v end)
+makeSlider("Bring Mob Count", 0, 10, runtime.config.BringMobCount,
     function(v) return v == 0 and "All mobs of the kind" or (v.." mobs") end,
-    function(v) CONFIG.BringMobCount = v end)
+    function(v) runtime.config.BringMobCount = v end)
+makeSlider("Bring Mob Range", 20, 300, runtime.config.BringMobRange,
+    function(v) return v.." studs" end,
+    function(v) runtime.config.BringMobRange = v end)
 
 showTab(3) -- FIGHT
 makeHeader("COMBAT")
-makeSegment("Weapon", {"Melee", "Sword", "Fruit", "Gun"}, CONFIG.WeaponMode,
-    function(v) CONFIG.WeaponMode = v end)
-makeToggle("Auto Attack", CONFIG.AutoAttack, function(v) CONFIG.AutoAttack = v end)
-makeToggle("Fast Attack", CONFIG.FastAttack, function(v) CONFIG.FastAttack = v end)
-makeToggle("Remote Attack", CONFIG.RemoteAttack, function(v) CONFIG.RemoteAttack = v end)
-makeToggle("AOE (all mobs in reach)", CONFIG.Aoe, function(v) CONFIG.Aoe = v end)
-makeSlider("AOE Range", 40, 200, CONFIG.AoeRange,
-    function(v) return v.." studs" end, function(v) CONFIG.AoeRange = v end)
-makeToggle("Auto Buso (Haki)", CONFIG.AutoBuso, function(v) CONFIG.AutoBuso = v end)
-makeToggle("Big Hitbox", CONFIG.BigHitbox, function(v) CONFIG.BigHitbox = v end)
-makeSlider("Hitbox Size", 4, 40, CONFIG.HitboxSize,
-    function(v) return tostring(v) end, function(v) CONFIG.HitboxSize = v end)
-makeSlider("Swing Reach", 0, 200, CONFIG.HitboxMagnitude,
-    function(v) return v.." studs" end, function(v) CONFIG.HitboxMagnitude = v end)
-makeSlider("Head Hover", 0, 8, CONFIG.HeadHover,
-    function(v) return v.." studs" end, function(v) CONFIG.HeadHover = v end)
+makeSegment("Weapon", {"Melee", "Sword", "Fruit", "Gun"}, runtime.config.WeaponMode,
+    function(v) runtime.config.WeaponMode = v end)
+makeToggle("Auto Attack", runtime.config.AutoAttack, function(v) runtime.config.AutoAttack = v end)
+makeToggle("Fast Attack", runtime.config.FastAttack, function(v) runtime.config.FastAttack = v end)
+makeToggle("Remote Attack", runtime.config.RemoteAttack, function(v) runtime.config.RemoteAttack = v end)
+makeToggle("AOE (all mobs in reach)", runtime.config.Aoe, function(v) runtime.config.Aoe = v end)
+makeSlider("AOE Range", 40, 200, runtime.config.AoeRange,
+    function(v) return v.." studs" end, function(v) runtime.config.AoeRange = v end)
+makeToggle("Auto Buso (Haki)", runtime.config.AutoBuso, function(v) runtime.config.AutoBuso = v end)
+makeToggle("Big Hitbox", runtime.config.BigHitbox, function(v) runtime.config.BigHitbox = v end)
+makeSlider("Hitbox Size", 4, 40, runtime.config.HitboxSize,
+    function(v) return tostring(v) end, function(v) runtime.config.HitboxSize = v end)
+makeSlider("Swing Reach", 0, 200, runtime.config.HitboxMagnitude,
+    function(v) return v.." studs" end, function(v) runtime.config.HitboxMagnitude = v end)
+makeSlider("Head Hover", 0, 8, runtime.config.HeadHover,
+    function(v) return v.." studs" end, function(v) runtime.config.HeadHover = v end)
 makeHint("Melee keeps its real, short reach - guns and fruits reach 70 studs")
-makeSlider("Attack Cooldown", 5, 100, math.floor(CONFIG.AttackCooldown*100),
+makeHint("Swing cadence comes from the weapon animation; this adds extra delay")
+makeSlider("Extra Cooldown", 0, 100, math.floor((runtime.config.AttackCooldown or 0)*100),
     function(v) return string.format("%.2fs", v/100) end,
-    function(v) CONFIG.AttackCooldown = v/100 end)
+    function(v) runtime.config.AttackCooldown = v/100 end)
 
 makeHeader("AUTO QUESTS")
-makeToggle("Auto Saber (First Sea puzzle)", CONFIG.AutoSaber,
-    function(v) CONFIG.AutoSaber = v end)
+makeToggle("Auto Saber (First Sea puzzle)", runtime.config.AutoSaber,
+    function(v)
+        runtime.config.AutoSaber = v
+        runtime.resetSaberState()
+        if v then
+            runtime.state.saberActive = true
+            runtime.state.saberLockAt = tick()
+            runtime.state.saberProgressAt = tick()
+        end
+    end)
 makeHint("Does the Saber puzzle step by step: buttons, torch, cup, NPCs, bosses")
 
 makeHeader("BOSS FARM")
-makeToggle("Farm Bosses", CONFIG.BossFarm, function(v) CONFIG.BossFarm = v end)
-makeSlider("Boss Range", 500, 8000, CONFIG.BossRange,
-    function(v) return v.." studs" end, function(v) CONFIG.BossRange = v end)
+makeToggle("Farm Bosses", runtime.config.BossFarm, function(v) runtime.config.BossFarm = v end)
+makeSlider("Boss Range", 500, 8000, runtime.config.BossRange,
+    function(v) return v.." studs" end, function(v) runtime.config.BossRange = v end)
 makeHint("Bosses are only chased when the current quest actually wants a boss")
 
 makeHeader("MELEE SHOP (buy)")
-makeToggle("Auto Buy Styles (in order)", CONFIG.AutoBuyStyles,
-    function(v) CONFIG.AutoBuyStyles = v end)
+makeToggle("Auto Buy Styles (in order)", runtime.config.AutoBuyStyles,
+    function(v) runtime.config.AutoBuyStyles = v end)
 makeHint("Walks to the teacher of each style in turn and buys it")
 -- The buy is asked for right away: no walk to the teacher of the style.
 for _, style in ipairs(STYLE_SHOP) do
     makeButton("Buy " .. style.name, function()
-        state.status = "Buying " .. style.name
-        task.spawn(function() buyStyle(style) end)
+        runtime.state.status = "Buying " .. style.name
+        spawnTracked(function() buyStyle(style) end)
     end)
 end
 makeHeader("ABILITIES (buy)")
 makeButton("Buy Buso Haki", function()
-    task.spawn(function() buyAbility("BuyHaki", "Buso") end)
+    spawnTracked(function() buyAbility("BuyHaki", "Buso") end)
 end)
 makeButton("Buy Geppo (Skyjump)", function()
-    task.spawn(function() buyAbility("BuyHaki", "Geppo") end)
+    spawnTracked(function() buyAbility("BuyHaki", "Geppo") end)
 end)
 makeButton("Buy Soru", function()
-    task.spawn(function() buyAbility("BuyHaki", "Soru") end)
+    spawnTracked(function() buyAbility("BuyHaki", "Soru") end)
 end)
 makeButton("Buy Observation Haki", function()
-    task.spawn(function() buyAbility("KenTalk", "Buy") end)
+    spawnTracked(function() buyAbility("KenTalk", "Buy") end)
 end)
 
 showTab(4) -- STATS
 makeHeader("STATS")
-makeToggle("Auto Stats", CONFIG.AutoStats, function(v) CONFIG.AutoStats = v end)
-makeSegment("Stat", {"Melee","Sword","Gun","Fruit","Defense","All"}, CONFIG.AutoStatTarget,
-    function(v) CONFIG.AutoStatTarget = v end)
-makeSlider("Stat Wait", 1, 15, CONFIG.AutoStatWait,
-    function(v) return v.."s" end, function(v) CONFIG.AutoStatWait = v end)
+makeToggle("Auto Stats", runtime.config.AutoStats, function(v) runtime.config.AutoStats = v end)
+makeSegment("Stat", {"Melee","Sword","Gun","Fruit","Defense","All"}, runtime.config.AutoStatTarget,
+    function(v) runtime.config.AutoStatTarget = v end)
+makeSlider("Stat Wait", 1, 15, runtime.config.AutoStatWait,
+    function(v) return v.."s" end, function(v) runtime.config.AutoStatWait = v end)
 
 showTab(1)
 
@@ -4856,44 +5962,50 @@ infoLabel.Font = THEME.fontBold; infoLabel.TextSize = 11
 infoLabel.TextXAlignment = Enum.TextXAlignment.Left
 infoLabel.Parent = footer
 
-task.spawn(function()
-    while gui.Parent do
-        statusLabel.Text = state.enabled and state.status or "Stopped"
-        debugLabel.Text = state.debugLine == "" and "Ready" or state.debugLine
+table.insert(runtime.tasks, task.spawn(function()
+    while gui.Parent and runtime.running and FarmRuntime.current == runtime do
+        statusLabel.Text = runtime.state.enabled and runtime.state.status or "Stopped"
+        debugLabel.Text = runtime.state.debugLine == "" and "Ready" or runtime.state.debugLine
         infoLabel.Text = string.format("Lv %d • Fruits: %d • Quest: %s • Spd %s",
-            getMyLevel(), state.fruitsFound, questProgressText(),
-            tostring(state.attackSpeed))
+            getMyLevel(), runtime.state.fruitsFound, questProgressText(),
+            tostring(runtime.state.attackSpeed))
         task.wait(0.4)
+        if not runtime.isCurrent() then return end
     end
-end)
+end))
 
 local dragging, dragInput, dragStart, startPos
 titleBar.InputBegan:Connect(function(i)
+    if not runtime.running or FarmRuntime.current ~= runtime then return end
     if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
         dragging = true; dragStart = i.Position; startPos = main.Position
-        i.Changed:Connect(function()
+        local changed = i.Changed:Connect(function()
             if i.UserInputState == Enum.UserInputState.End then dragging = false end
         end)
+        table.insert(runtime.inputConnections, changed)
     end
 end)
 titleBar.InputChanged:Connect(function(i)
+    if not runtime.running or FarmRuntime.current ~= runtime then return end
     if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
         dragInput = i
     end
 end)
-UserInputService.InputChanged:Connect(function(i)
+table.insert(runtime.inputConnections, UserInputService.InputChanged:Connect(function(i)
+    if not runtime.running or FarmRuntime.current ~= runtime then return end
     if dragging and i == dragInput then
         local d = i.Position - dragStart
         main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
                                   startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end
-end)
+end))
 
-UserInputService.InputBegan:Connect(function(i, gpe)
+table.insert(runtime.inputConnections, UserInputService.InputBegan:Connect(function(i, gpe)
+    if not runtime.running or FarmRuntime.current ~= runtime then return end
     if gpe then return end
     if i.KeyCode == Enum.KeyCode.RightShift then gui.Enabled = not gui.Enabled end
-    if i.KeyCode == Enum.KeyCode.F9 and setDebug then setDebug(not CONFIG.Debug) end
-end)
+    if i.KeyCode == Enum.KeyCode.F9 and setDebug then setDebug(not runtime.config.Debug) end
+end))
 
 end
 
