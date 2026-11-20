@@ -65,7 +65,7 @@ CONFIG = {
     WarpClose       = true,
     WarpDistance    = 60,
     HoverHeight     = 7,
-    Dodge           = false,
+    Dodge           = true,
     DodgeRadius     = 14,
     DodgeSpeed      = 90,
     FruitScanRadius = 5000,
@@ -2109,19 +2109,47 @@ end
 
 local function attackAnimLength(tool)
     local combatUtil = combatUtilModule()
-    if not combatUtil or not tool then return 0.5 end
-    local length = 0.5
+    if not combatUtil or not tool then return 0.5, 1 end
+    local length, combo = 0.5, 1
     pcall(function()
         local weaponName = combatUtil:GetWeaponName(tool)
-        local cache = combatUtil:GetMovesetAnimCache(weaponName)
+        local weaponData = combatUtil:GetWeaponData(weaponName)
+        local basic = weaponData and weaponData.Moveset and weaponData.Moveset.Basic
+        local comboCount = (basic and #basic) or 1
+        if comboCount < 1 then comboCount = 1 end
+
+        -- The live combat controller sends the current basic-move index with
+        -- RegisterAttack. It cycles through the number of moves in the weapon
+        -- data, rather than always sending a fixed value.
+        combo = ((state.attackCombo or 0) % comboCount) + 1
+        state.attackCombo = combo
+
+        -- CombatUtil caches loaded animation tracks by Humanoid, not by the
+        -- weapon name. The old lookup always missed and sent the fallback
+        -- length for every swing.
+        local hum = getHumanoid()
+        local cache = combatUtil:GetMovesetAnimCache(hum)
         local pure = combatUtil:GetPureWeaponName(weaponName)
-        local track = cache and cache[pure .. "-basic1"]
+        local prefix = pure .. "-basic"
+        local track = cache and cache[prefix .. combo]
+        if not track and combo ~= 1 then
+            combo = 1
+            track = cache and cache[prefix .. combo]
+        end
+        if not track then
+            for key, value in pairs(cache or {}) do
+                if startsWith(key, prefix) then
+                    track = value
+                    break
+                end
+            end
+        end
         if track then
             local speed = track:GetAttribute("SpeedMult") or 1
             if track.Length and speed > 0 then length = track.Length / speed end
         end
     end)
-    return length
+    return length, combo
 end
 
 local function canAttack(tool)
@@ -2139,16 +2167,17 @@ end
 
 local function hitPartOf(mob)
     if not mob then return nil end
-    -- spy uses LeftLowerArm / RightHand
-    return mob:FindFirstChild("LeftLowerArm")
-        or mob:FindFirstChild("RightHand")
-        or mob:FindFirstChild("LeftHand")
-        or mob:FindFirstChild("RightUpperArm")
-        or mob:FindFirstChild("Head")
+    -- the game registers a hit against any body part of the rig; the head is
+    -- what the public hit scripts send, the root is the fallback
+    return mob:FindFirstChild("Head")
         or mob:FindFirstChild("HumanoidRootPart")
         or anchorOf(mob)
 end
 
+-- Every mob close to the player goes into one swing. Like the hub, each mob
+-- goes in as a pair of its rig and the part that was hit, and the target is
+-- the first one: the game takes that part on its own and the whole list with
+-- it, so a single swing lands on all of them.
 local function aoePairs(root, target)
     local range = CONFIG.AoeRange or 80
     local out, seen = {}, {}
@@ -2168,142 +2197,198 @@ local function aoePairs(root, target)
     return out
 end
 
+-- Net is a ModuleScript, but the remotes must be obtained through the module
+-- itself. RegisterHit is a virtual remote in the current game: firing its raw
+-- child skips the virtual-remote encoding and the server silently drops every
+-- hit. Requiring Net returns the wrapper that performs that encoding.
 local function netFolder()
-    if state.netCache and state.netCache.Parent then return state.netCache end
+    if state.netModule then return state.netModule end
     local modules = ReplicatedStorage:FindFirstChild("Modules")
-    state.netCache = modules and modules:FindFirstChild("Net")
-    return state.netCache
+    local module = modules and modules:FindFirstChild("Net")
+    if not module then return nil end
+    state.netModuleInstance = module
+    local ok, net = pcall(require, module)
+    if ok and type(net) == "table" then
+        state.netModule = net
+        return net
+    end
+    return nil
 end
 
 local function hitRemote()
-    if state.hitRemoteCache and state.hitRemoteCache.Parent then
-        return state.hitRemoteCache
-    end
+    if state.hitRemoteCache then return state.hitRemoteCache end
     local net = netFolder()
-    state.hitRemoteCache = net and net:FindFirstChild("RE/RegisterHit")
-    return state.hitRemoteCache
+    if net then
+        local ok, remote = pcall(function() return net:RemoteEvent("RegisterHit", true) end)
+        if ok and remote then
+            state.hitRemoteCache = remote
+            return remote
+        end
+    end
+
+    -- A raw RegisterHit is only safe when the game has not marked it virtual.
+    local module = state.netModuleInstance
+    local raw = module and module:FindFirstChild("RE/RegisterHit")
+    if raw and not raw:GetAttribute("Virtual") then
+        state.hitRemoteCache = raw
+        return raw
+    end
+    return nil
 end
 
 local function attackRemote()
-    if state.attackRemoteCache and state.attackRemoteCache.Parent then
-        return state.attackRemoteCache
-    end
+    if state.attackRemoteCache then return state.attackRemoteCache end
     local net = netFolder()
-    state.attackRemoteCache = net and net:FindFirstChild("RE/RegisterAttack")
-    return state.attackRemoteCache
+    if net then
+        local ok, remote = pcall(function() return net:RemoteEvent("RegisterAttack") end)
+        if ok and remote then
+            state.attackRemoteCache = remote
+            return remote
+        end
+    end
+    local module = state.netModuleInstance
+    local raw = module and module:FindFirstChild("RE/RegisterAttack")
+    if raw and not raw:GetAttribute("Virtual") then
+        state.attackRemoteCache = raw
+        return raw
+    end
+    return nil
 end
 
-local function getSendHits()
-    if state.sendHitsFn then return state.sendHitsFn end
-    pcall(function()
-        if getsenv then
-            local ps = LocalPlayer:FindFirstChild("PlayerScripts")
-            if ps then
-                for _, ls in ipairs(ps:GetChildren()) do
-                    if ls:IsA("LocalScript") then
-                        local env = getsenv(ls)
-                        if env then
-                            local fn = (env._G and env._G.SendHitsToServer) or env.SendHitsToServer
-                            if type(fn) == "function" then
-                                state.sendHitsFn = fn
-                                return
-                            end
-                        end
-                    end
+-- RegisterHit uses a small session token. The game creates the token inside
+-- one dedicated combat coroutine, sends it once as a handshake, and then
+-- sends that same token with every hit. A token made in an unrelated thread
+-- is not accepted. This fallback mirrors the game exactly and is only used
+-- when the game's own SendHitsToServer function is unavailable.
+local function hitSessionId()
+    local hit = hitRemote()
+    if not hit then return nil end
+    if state.hitSessionId and state.hitThread and state.hitThreadRemote == hit then
+        return state.hitSessionId
+    end
+
+    state.hitSessionId = nil
+    state.hitThread = nil
+    state.hitThreadRemote = hit
+    local thread = coroutine.create(function()
+        local token = tostring(LocalPlayer.UserId):sub(2, 4)
+            .. tostring(coroutine.running()):sub(11, 15)
+        state.hitSessionId = token
+
+        -- Handshake: the server learns the token before the first hit.
+        local ok, err = pcall(function() hit:FireServer(token) end)
+        if not ok then
+            dbg("Hit handshake failed: " .. tostring(err))
+        end
+
+        while true do
+            local part, list = coroutine.yield()
+            if part then
+                local sent
+                sent, err = pcall(function()
+                    hit:FireServer(part, list, nil, token)
+                end)
+                if not sent then
+                    dbg("Hit remote failed: " .. tostring(err))
                 end
             end
         end
-        if getrenv then
-            local env = getrenv()
-            local fn = env and env._G and env._G.SendHitsToServer
-            if type(fn) == "function" then state.sendHitsFn = fn end
-        end
     end)
-    return state.sendHitsFn
+
+    state.hitThread = thread
+    local ok, err = coroutine.resume(thread)
+    if not ok then
+        state.hitThread = nil
+        state.hitThreadRemote = nil
+        dbg("Hit session failed: " .. tostring(err))
+        return nil
+    end
+    return state.hitSessionId
 end
 
--- Multi-path attack. Server often ignores raw RegisterHit without the
--- game's own SendHitsToServer / LeftClickRemote path.
 local function remoteAttack(target, tool)
+    local regAttack = attackRemote()
+    if not regAttack then return false end
+    local hit = hitRemote()
+    if not hit then return false end
     local root = getRoot()
     local pairs_ = aoePairs(root, target)
     if #pairs_ == 0 then return false end
+
     local primary = pairs_[1][2]
-    local mob = pairs_[1][1]
     if not primary then return false end
 
-    state.aoeCount = #pairs_
-    state.attackCombo = ((state.attackCombo or 1) % 4) + 1
-    local combo = state.attackCombo
-    local animLen = attackAnimLength(tool)
-    if type(animLen) ~= "number" or animLen <= 0 then animLen = 0.4 end
-    local fired = false
-
-    -- 1) game-internal sender (most reliable when executor has getsenv)
-    local send = getSendHits()
-    if send then
-        local ok = pcall(function() send(primary, pairs_) end)
-        if ok then fired = true end
-    end
-
-    -- 2) RegisterAttack — spy shape (animLen, combo)
-    local regAttack = attackRemote()
-    if regAttack then
-        pcall(function() regAttack:FireServer(animLen, combo) end)
-        pcall(function() regAttack:FireServer(animLen) end)
-        fired = true
-    else
-        dbg("RegisterAttack remote missing")
-    end
-
-    -- 3) RegisterHit — try both list shapes from spy samples
-    local hit = hitRemote()
-    if hit then
-        state.attackId = (state.attackId or math.floor(tick() * 1000) % 0xFFFFFF) + 1
-        local id = string.format("%08x", state.attackId % 0xFFFFFFFF)
-        pcall(function() hit:FireServer(primary, {}, nil, id) end)
-        pcall(function() hit:FireServer(primary, pairs_, nil, id) end)
-        pcall(function() hit:FireServer(primary, pairs_) end)
-        fired = true
-    else
-        dbg("RegisterHit remote missing")
-    end
-
-    -- 4) tool LeftClickRemote
-    pcall(function()
-        local left = tool and tool:FindFirstChild("LeftClickRemote")
-        if left and root then
-            left:FireServer((primary.Position - root.Position).Unit, combo)
-            fired = true
-        end
+    -- RegisterAttack takes the real animation length and the current basic
+    -- combo index. The old fixed second argument did not match the live
+    -- combat controller.
+    local animLength, combo = attackAnimLength(tool)
+    local attackOk = pcall(function()
+        regAttack:FireServer(animLength, combo)
     end)
+    state.aoeCount = #pairs_
 
-    if not send and not state.warnedNoSendHits then
-        state.warnedNoSendHits = true
-        dbg("SendHitsToServer not found (needs getsenv) — raw remotes may not damage")
+    -- The first part is sent separately. The second argument contains the
+    -- remaining {rig, hitPart} pairs, exactly like CombatUtil does.
+    local others = {}
+    for i = 2, #pairs_ do others[#others + 1] = pairs_[i] end
+
+    local hitOk = false
+    -- CombatUtil installs this function on ReplicatedStorage.Global. It owns
+    -- the encrypted remote wrapper, the session handshake and the combat
+    -- thread, so using it is both the safest and the most compatible path.
+    local globalOk, global = pcall(require, ReplicatedStorage:FindFirstChild("Global"))
+    if globalOk and type(global) == "table"
+        and type(global.SendHitsToServer) == "function" then
+        hitOk = pcall(global.SendHitsToServer, primary, others)
     end
-    return fired
+
+    -- Fallback for builds where the global helper is not installed yet.
+    if not hitOk then
+        local token = hitSessionId()
+        if token and state.hitThread then
+            local resumed = coroutine.resume(state.hitThread, primary, others)
+            hitOk = resumed
+        end
+    end
+
+    state.lastRemoteAttackAt = tick()
+    return attackOk and hitOk
 end
 
 local function doAttack(tool, target)
     if not tool then return false end
     local char = LocalPlayer.Character
+    -- The stun of this game is a client value that can stay up while the mobs
+    -- are around: refusing to swing on it is what made the farm hit nothing.
+    -- It is zeroed here instead, the way the hubs do it.
     local stun = char and char:FindFirstChild("Stun")
     if stun then
         pcall(function()
-            if stun:IsA("BoolValue") then stun.Value = false else stun.Value = 0 end
+            if stun:IsA("BoolValue") then
+                stun.Value = false
+            else
+                stun.Value = 0
+            end
         end)
     end
     if CONFIG.FastAttack then fastAttack() end
-
+    -- The combat-state helper of the game is not a gate here: the cooldown of
+    -- the script and the stun above already decide. A helper that reports a
+    -- stale "cannot attack" is what left the bot swinging at nothing.
     local remote = false
     if CONFIG.RemoteAttack then
         remote = remoteAttack(target, tool)
+        -- When the remote path is ready it is the complete attack. Activating
+        -- the tool as well would register a second attack and a second combo
+        -- step, which can make the server discard one of the two packets.
+        if remote then return true end
     else
         state.aoeCount = 1
     end
+    -- a fruit in hand is eaten by its activation, never used as a swing
     if isFruit(tool) then return remote end
-
+    -- The normal tool activation remains the fallback for a missing or
+    -- rejected remote path.
     local ok = pcall(function() tool:Activate() end)
     return ok or remote
 end
