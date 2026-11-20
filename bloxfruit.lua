@@ -162,7 +162,7 @@ CONFIG = {
     -- Fast Attack sends the normal RegisterAttack/RegisterHit flow at this
     -- cadence. Health feedback backs it off automatically when the server
     -- refuses a hit, so a quick cadence never turns into false confirmations.
-    FastAttackInterval = 0.4,
+    FastAttackInterval = 0.25,
     FastAttackFeedback = 0.55,
     RemoteAttack    = true,
     HitboxMagnitude = 120,
@@ -343,7 +343,7 @@ state = {
     attackConfirmSeq = 0,
     attackPending = {},
     attackHealthSeen = setmetatable({}, {__mode = "k"}),
-    attackCadence = 0.4,
+    attackCadence = 0.25,
     attackMisses = 0,
     attackLastConfirmedAt = 0,
     aoeCount      = 0,
@@ -3366,20 +3366,40 @@ runtime.startAttackConfirmation = function(watched, target, deadline, startedAt,
     s.aoeCount = 0
     s.aoeConfirmed = 0
 
-    task.spawn(function()
-        while tick() < deadline do
-            runtime.pollAttackDamage()
-            if record.fullConfirmed then break end
-            task.wait(0.02)
-            if not runtime.operationValid(operationEpoch, epoch, char) then return end
-        end
+    record.deadline = deadline
+    record.epoch = epoch
+    record.operationEpoch = operationEpoch
+    record.char = char
 
-        runtime.pollAttackDamage()
-        runtime.removeAttackRecord(record)
-        if record.id == s.attackConfirmSeq then
-            runtime.publishAttackConfirmation(record)
-        end
-    end)
+    -- One watcher serves every pending swing. A thread per swing polled at
+    -- 50 Hz for up to 2.5 s each, so the faster the cadence the more threads
+    -- ran at once, and that load slowed the swing loop itself.
+    if not runtime.attackWatcher then
+        runtime.attackWatcher = true
+        local thread = task.spawn(function()
+            while true do
+                task.wait(0.02)
+                if not runtime.isCurrent() then break end
+                runtime.pollAttackDamage()
+                local list = runtime.state.attackPending or {}
+                if #list == 0 then break end
+                local nowT = tick()
+                for index = #list, 1, -1 do
+                    local rec = list[index]
+                    if not runtime.operationValid(rec.operationEpoch, rec.epoch, rec.char) then
+                        table.remove(list, index)
+                    elseif rec.deadline and nowT >= rec.deadline then
+                        table.remove(list, index)
+                        if rec.id == runtime.state.attackConfirmSeq then
+                            runtime.publishAttackConfirmation(rec)
+                        end
+                    end
+                end
+            end
+            runtime.attackWatcher = nil
+        end)
+        table.insert(runtime.tasks, thread)
+    end
 end
 
 local function doAttack(tool, target)
@@ -3460,7 +3480,7 @@ local function doAttack(tool, target)
     if officialDelay < 0.05 then officialDelay = 0.05 end
 
     local fastTarget = tonumber(runtime.config.FastAttackInterval) or 0.4
-    if fastTarget < 0.15 then fastTarget = 0.15 end
+    if fastTarget < 0.08 then fastTarget = 0.08 end
     if fastTarget > 1.5 then fastTarget = 1.5 end
     local delay = officialDelay + extraDelay
     local reportedLength = animLength
@@ -5424,7 +5444,7 @@ local function step()
     elseif runtime.state.hitboxPart then
         restoreHitbox()
     end
-    if (not runtime.state.attackNextAt or now >= runtime.state.attackNextAt)
+    if (not runtime.state.attackNextAt or tick() >= runtime.state.attackNextAt)
         and swingFlat <= reach then
         if not tool then dbg("No weapon in backpack!"); return end
         if doAttack(tool, swingTarget) then
@@ -5494,7 +5514,7 @@ table.insert(runtime.tasks, task.spawn(function()
                 restoreHitbox()
             end
         end
-        task.wait(0.05)
+        task.wait(0.03)
         if not runtime.isCurrent() then return end
     end
 end))
@@ -6903,7 +6923,7 @@ makeToggle("Fast Attack", runtime.config.FastAttack, function(v)
     runtime.config.FastAttack = v
     if v then runtime.state.attackCadence = runtime.config.FastAttackInterval end
 end)
-makeSlider("Fast Swing", 200, 1000, math.floor((runtime.config.FastAttackInterval or 0.4) * 1000),
+makeSlider("Fast Swing", 80, 1000, math.floor((runtime.config.FastAttackInterval or 0.25) * 1000),
     function(v) return string.format("%.2fs", v/1000) end,
     function(v)
         runtime.config.FastAttackInterval = v/1000
